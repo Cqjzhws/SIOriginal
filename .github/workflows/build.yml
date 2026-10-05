@@ -23,7 +23,7 @@ jobs:
         clang -dynamiclib -O2 -arch arm64 \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -target arm64-apple-ios14.0 \
-          -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
+          -framework UIKit -framework QuartzCore -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
           -fobjc-arc \
           -install_name /Library/MobileSubstrate/DynamicLibraries/SIOriginal.dylib \
           -o SIOriginal.dylib \
