@@ -482,7 +482,7 @@ static int LayerIndexForBoost(double b) {
     _segMode = [[UISegmentedControl alloc] initWithItems:@[ @"加速", @"慢放", @"瞬切" ]];
     _segMode.selectedSegmentIndex = (mode >= 0 && mode <= 2) ? mode : 0;
     [_segMode addTarget:self action:@selector(modeChanged) forControlEvents:UIControlEventValueChanged];
-    SIOSettingRow *r2 = [[SIOSettingRow alloc] initWithTitle:@"运行模式" icon:"gearshape.fill" iconColor:[UIColor systemBlueColor] control:_segMode];
+    SIOSettingRow *r2 = [[SIOSettingRow alloc] initWithTitle:@"运行模式" icon:@"gearshape.fill" iconColor:[UIColor systemBlueColor] control:_segMode];
     [card1 addRow:r2 isLast:NO];
     
     _sliderLabel = [self label:[NSString stringWithFormat:@"×%.1f", speed] size:15 dim:YES];
@@ -493,7 +493,7 @@ static int LayerIndexForBoost(double b) {
     _slider.value = speed;
     [_slider addTarget:self action:@selector(sliderChanged) forControlEvents:UIControlEventValueChanged];
     [_slider.widthAnchor constraintEqualToConstant:120].active = YES;
-    SIOSettingRow *r3 = [[SIOSettingRow alloc] initWithTitle:@"加速倍率" icon:"speedometer" iconColor:[UIColor systemGreenColor] control:_slider];
+    SIOSettingRow *r3 = [[SIOSettingRow alloc] initWithTitle:@"加速倍率" icon:@"speedometer" iconColor:[UIColor systemGreenColor] control:_slider];
     [card1 addRow:r3 isLast:NO];
     
     _sliderSlowLabel = [self label:[NSString stringWithFormat:@"×%.1f", slowFactor] size:15 dim:YES];
@@ -504,7 +504,7 @@ static int LayerIndexForBoost(double b) {
     _sliderSlow.value = slowFactor;
     [_sliderSlow addTarget:self action:@selector(slowSliderChanged) forControlEvents:UIControlEventValueChanged];
     [_sliderSlow.widthAnchor constraintEqualToConstant:120].active = YES;
-    SIOSettingRow *r4 = [[SIOSettingRow alloc] initWithTitle:@"慢放倍率" icon:"tortoise.fill" iconColor:[UIColor systemOrangeColor] control:_sliderSlow];
+    SIOSettingRow *r4 = [[SIOSettingRow alloc] initWithTitle:@"慢放倍率" icon:@"tortoise.fill" iconColor:[UIColor systemOrangeColor] control:_sliderSlow];
     [card1 addRow:r4 isLast:YES];
     
     [mainStack addArrangedSubview:card1];
@@ -560,7 +560,7 @@ static int LayerIndexForBoost(double b) {
     _segLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
     _segLayer.selectedSegmentIndex = LayerIndexForBoost([cfg[@"LayerBoost"] doubleValue]);
     [_segLayer addTarget:self action:@selector(layerChanged) forControlEvents:UIControlEventValueChanged];
-    SIOSettingRow *rLayer = [[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:"layers.fill" iconColor:[UIColor systemCyanColor] control:_segLayer];
+    SIOSettingRow *rLayer = [[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:[UIColor systemCyanColor] control:_segLayer];
     [card3 addRow:rLayer isLast:NO];
     
     _layerLabel = [self label:@"" size:12 dim:YES];
