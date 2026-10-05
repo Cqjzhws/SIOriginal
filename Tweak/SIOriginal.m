@@ -568,7 +568,7 @@ static void   (*o_UV_setAnimDelay)(Class, SEL, double);
 static void   (*o_refresh_begin)(id, SEL);
 static void   (*o_refresh_end)(id, SEL, BOOL);
 static void   (*o_navBar_setLargeTitle)(id, SEL, BOOL);
-static void   (*o_pageVC_setVC)(id, SEL, NSArray *, UIViewController *, UINavigationControllerDirection);
+static void   (*o_pageVC_setVC)(id, SEL, NSArray *, UIViewController *, UIPageViewControllerNavigationDirection);
 static void   (*o_docInteract_present)(id, SEL, BOOL);
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
@@ -1044,7 +1044,7 @@ static void sio_navBar_setLargeTitle(id self, SEL _cmd, BOOL large) {
 // UIPageViewController：页面切换动画
 // setViewControllers:direction:animated:completion: 的动画时长接管
 static void sio_pageVC_setVC(id self, SEL _cmd, NSArray *vcs, UIViewController *ref,
-                              UINavigationControllerDirection dir) {
+                              UIPageViewControllerNavigationDirection dir) {
     SIO_REQUIRE_ORIG(o_pageVC_setVC);
     if (SIO_blocked()) { o_pageVC_setVC(self, _cmd, vcs, ref, dir); return; }
     [CATransaction begin];
@@ -1981,7 +1981,7 @@ static void _fbg_onInterruption(NSNotification *note) {
     __block void (^attempt)(void);
     attempt = ^{
         typeof(self) me = weakSelf;
-        if (!me) return;
+        if (!me) { attempt = nil; return; }
         UIWindowScene *target = nil;
         for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
             if ([sc isKindOfClass:[UIWindowScene class]]) { target = (UIWindowScene *)sc; break; }
@@ -1992,9 +1992,12 @@ static void _fbg_onInterruption(NSNotification *note) {
             [me makeKeyAndVisible];
             [me startDockClock];
             [me refreshState];
+            attempt = nil;
         } else if (++tries < 20) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), attempt);
+        } else {
+            attempt = nil;
         }
     };
     dispatch_async(dispatch_get_main_queue(), attempt);
