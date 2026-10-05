@@ -1,0 +1,9 @@
+Package: com.local.sioriginal
+Name: SIOriginal
+Version: 1.8.18
+Architecture: iphoneos-arm
+Description: 动画加速 Tweak v1.8.18：系统级增强（UIRefreshControl/UINavigationBar 大标题/UIPageViewController/UIDocumentInteractionController hook）；显式动画额外倍率 LayerBoost（转圈/进度/旋转单独加速）；CAAnimation 幂等缩放标记（修双重缩放）；App 级配置覆盖；列表 hook 硬保护名单；微信预览放大态守卫；真后台保活引擎；纯 runtime 无 substrate，TrollFools 可注入
+Maintainer: local
+Author: local
+Section: Tweaks
+Depends: firmware (>= 14.0)

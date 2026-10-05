@@ -1,0 +1,78 @@
+name: Build IPA & Dylib
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Install ldid
+      run: |
+        brew install ldid
+        
+    - name: Build dylib
+      run: |
+        clang -dynamiclib -O2 -arch arm64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -target arm64-apple-ios14.0 \
+          -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
+          -fobjc-arc \
+          -install_name /Library/MobileSubstrate/DynamicLibraries/SIOriginal.dylib \
+          -o SIOriginal.dylib \
+          Tweak/SIOriginal.m
+        
+        ldid -Sentitlements.plist SIOriginal.dylib
+        
+    - name: Build App
+      run: |
+        # 编译 .app
+        APP_DIR="Payload/SIOriginal.app"
+        mkdir -p "$APP_DIR"
+        
+        clang -O2 -arch arm64 \
+          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -target arm64-apple-ios14.0 \
+          -framework UIKit -framework CoreGraphics -framework Foundation \
+          -fobjc-arc \
+          -o "$APP_DIR/SIOriginal" \
+          App/main.m
+        
+        # 复制资源
+        cp App/Info.plist "$APP_DIR/"
+        cp App/AppIcon.png "$APP_DIR/" 2>/dev/null || true
+        cp App/Icon-60@2x.png "$APP_DIR/" 2>/dev/null || true
+        cp App/Icon-60@3x.png "$APP_DIR/" 2>/dev/null || true
+        cp App/Icon-76@2x.png "$APP_DIR/" 2>/dev/null || true
+        cp App/Icon-83.5@2x.png "$APP_DIR/" 2>/dev/null || true
+        
+        # 签名
+        ldid -Sentitlements.plist "$APP_DIR/SIOriginal"
+        
+        # 打包 IPA
+        zip -r SIOriginal.ipa Payload
+        
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: SIOriginal-Build
+        path: |
+          SIOriginal.dylib
+          SIOriginal.ipa
+          
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          SIOriginal.dylib
+          SIOriginal.ipa
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
