@@ -2729,11 +2729,12 @@ static BOOL _fbg_avEnsure(void) {
             Class p = objc_getClass("AVAudioPlayer");
             Class s = objc_getClass("AVAudioSession");
             // 字符串常量从框架句柄解析（RTLD_LOCAL 下不能依赖 RTLD_DEFAULT 全局域）
-            NSString **cat = (NSString **)dlsym(h, "AVAudioSessionCategoryPlayback");
-            NSString **ni  = (NSString **)dlsym(h, "AVAudioSessionInterruptionNotification");
-            NSString **nr  = (NSString **)dlsym(h, "AVAudioSessionRouteChangeNotification");
-            NSString **kt  = (NSString **)dlsym(h, "AVAudioSessionInterruptionTypeKey");
-            NSString **ko  = (NSString **)dlsym(h, "AVAudioSessionInterruptionOptionKey");
+            // ARC 要求指向 ObjC 对象的指针显式声明所有权，故加 __strong
+            NSString *__strong *cat = (NSString *__strong *)dlsym(h, "AVAudioSessionCategoryPlayback");
+            NSString *__strong *ni  = (NSString *__strong *)dlsym(h, "AVAudioSessionInterruptionNotification");
+            NSString *__strong *nr  = (NSString *__strong *)dlsym(h, "AVAudioSessionRouteChangeNotification");
+            NSString *__strong *kt  = (NSString *__strong *)dlsym(h, "AVAudioSessionInterruptionTypeKey");
+            NSString *__strong *ko  = (NSString *__strong *)dlsym(h, "AVAudioSessionInterruptionOptionKey");
             if (!p || !s || !cat || !*cat || !ni || !*ni || !nr || !*nr ||
                 !kt || !*kt || !ko || !*ko) {
                 NSLog(@"[FUBG] AVFoundation symbols incomplete, audio engine disabled");
