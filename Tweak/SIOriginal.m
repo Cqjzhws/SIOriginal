@@ -1509,6 +1509,35 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     SIO_REQUIRE_ORIG(o_layer_addAnim);
+    // v2.0.0：UIActivityIndicatorView 的转圈动画是无限重复的 transform.rotation，
+    // 加速后转速过高会产生频闪/视觉倒退，用户感知为"转圈变慢"。直接跳过不缩放。
+    if (anim && [anim isKindOfClass:[CAAnimation class]]) {
+        CALayer *layer = (CALayer *)self;
+        id delegate = [layer delegate];
+        BOOL isSpinner = NO;
+        if (delegate) {
+            Class c = [delegate class];
+            NSString *n = NSStringFromClass(c);
+            if ([n containsString:@"ActivityIndicator"] ||
+                [delegate isKindOfClass:[UIActivityIndicatorView class]]) {
+                isSpinner = YES;
+            } else {
+                UIView *v = (UIView *)delegate;
+                while (v) {
+                    if ([v isKindOfClass:[UIActivityIndicatorView class]]) { isSpinner = YES; break; }
+                    v = v.superview;
+                }
+            }
+        }
+        if (isSpinner) {
+            // 重置为标准 1 秒/圈，覆盖 setDuration: 路径可能已做的缩放
+            if (o_CAAnim_setDuration) {
+                o_CAAnim_setDuration(anim, @selector(setDuration:), 1.0);
+            }
+            o_layer_addAnim(self, _cmd, anim, key);
+            return;
+        }
+    }
     // CAAnimation setDuration 基类 hook 已覆盖绝大多数情况，这里只兜底
     // 「App 从未调用 setDuration:、动画保持类默认时长」的动画（如 0.25s 默认值）。
     //
