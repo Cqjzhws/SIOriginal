@@ -581,11 +581,11 @@ static void SIO_showInjectToast(int attempt) {
         } else if (!gEnabled) {
             msg = @"SIOriginal 已注入 · 总开关已关闭";
         } else {
-            const char *modeName = (gMode == 2) ? "瞬切" : (gMode == 1) ? "慢放" : "加速";
-            double mval = (gMode == 1) ? gSlowFactor : (gMode == 2 ? 0 : gSpeed);
-            msg = [NSString stringWithFormat:@"SIOriginal 已注入 · %s%s",
-                   modeName, gMode == 2 ? "" :
-                   [[NSString stringWithFormat:@" ×%.1f", mval] UTF8String]];
+            NSString *modeName = (gMode == 2) ? @"瞬切" : (gMode == 1) ? @"慢放" : @"加速";
+            msg = (gMode == 2)
+                ? [NSString stringWithFormat:@"SIOriginal 已注入 · %@", modeName]
+                : [NSString stringWithFormat:@"SIOriginal 已注入 · %@ ×%.1f",
+                   modeName, (gMode == 1) ? gSlowFactor : gSpeed];
         }
         if (!SIO_showToast(msg, NO)) SIO_showInjectToast(attempt + 1);
     });
@@ -1483,7 +1483,8 @@ static void SIOriginalInit(void) {
     // v1.8.19：修正 spring ABI 错位、3 个错误选择器、swizzle 继承污染；dylib 改为无 entitlement ad-hoc 签名
     // v2.0.1：落实 LongPress/Notify 两个假功能、FastScroll/FastTap setter 强黏、转圈平滑加速
     // v2.0.2：启动注入确认 toast（消除「是否生效」盲区）；双架构 arm64+arm64e
-    NSLog(@"[SIOriginal] v2.0.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.3：修复 toast 中文乱码（C 字符串 %s → NSString %@）
+    NSLog(@"[SIOriginal] v2.0.3 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
           gLongPress, gLongPressDuration, gNotify, gHasAppOverride, gListHardGuarded);

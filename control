@@ -1,6 +1,6 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.0.2
+Version: 2.0.3
 Architecture: iphoneos-arm64
 Description: 动画加速 Tweak v2.0.2 Max：启动注入确认 toast（消除「是否生效」盲区）；构建 arm64+arm64e 双架构（A12+ 设备兼容）；v2.0.1 修复 LongPress/Notify 假功能、FastScroll/FastTap setter 强黏、转圈平滑加速、崩溃修复；保留 v1.8.19 全部安全修复
 Maintainer: local
