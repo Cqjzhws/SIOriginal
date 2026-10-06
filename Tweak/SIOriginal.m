@@ -802,6 +802,8 @@ static void   (*o_docInteract_present)(id, SEL, BOOL);
 // v2.0.4：加载图标 / 隐式动画盲区
 static NSTimeInterval (*o_CATransaction_getDur)(id, SEL);
 static void   (*o_indicator_start)(id, SEL);
+// v2.0.5：下拉刷新转圈加强（UIRefreshControl didMoveToWindow）
+static void   (*o_refresh_didMove)(id, SEL);
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
@@ -1344,6 +1346,19 @@ static void sio_indicator_start(id self, SEL _cmd) {
     [CATransaction commit];
 }
 
+// ==================== v2.0.5：下拉刷新转圈加强 ====================
+// UIRefreshControl didMoveToWindow：添加到窗口时强制设置事务时长
+// 解决下拉刷新转圈动画时长未缩放的问题（转圈是内部 CABasicAnimation，
+// 不走 beginRefreshing/endRefreshing 的 CATransaction 包裹）
+static void sio_refresh_didMove(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_refresh_didMove);
+    if (SIO_blocked()) { o_refresh_didMove(self, _cmd); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.3));
+    o_refresh_didMove(self, _cmd);
+    [CATransaction commit];
+}
+
 #pragma mark - 安装
 
 __attribute__((constructor))
@@ -1510,7 +1525,8 @@ static void SIOriginalInit(void) {
     // v2.0.2：启动注入确认 toast（消除「是否生效」盲区）；双架构 arm64+arm64e
     // v2.0.3：修复 toast 中文乱码（C 字符串 %s → NSString %@）
     // v2.0.4：补 SwiftUI/CALayer 隐式动画盲区（CATransaction getter + UIActivityIndicatorView startAnimating）
-    NSLog(@"[SIOriginal] v2.0.4 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.5：下拉刷新转圈加强（UIRefreshControl didMoveToWindow 强制设置事务时长）
+    NSLog(@"[SIOriginal] v2.0.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
           gLongPress, gLongPressDuration, gNotify, gHasAppOverride, gListHardGuarded);
@@ -1930,6 +1946,9 @@ static void SIO_installiOS16Extras(void) {
                             (IMP)sio_refresh_begin, (IMP *)&o_refresh_begin);
         SIO_swizzleInstance(refresh, @selector(endRefreshing),
                             (IMP)sio_refresh_end, (IMP *)&o_refresh_end);
+        // v2.0.5：下拉刷新转圈加强（添加到窗口时强制设置事务时长）
+        SIO_swizzleInstance(refresh, @selector(didMoveToWindow),
+                            (IMP)sio_refresh_didMove, (IMP *)&o_refresh_didMove);
     }
 
     // setLargeTitleDisplayMode: 是 UINavigationItem（iOS 11+）的属性，不在 UINavigationBar 上
