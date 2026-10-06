@@ -1,5 +1,5 @@
 // SIOriginal — 配置 App（TrollStore 安装）
-// v1.8.19：修复 iOS 14 上 systemCyanColor/systemMintColor 崩溃；随 tweak ABI 修复同步发版
+// v2.0.0 Max：底部 Tab 栏 UI（引擎/手感/系统/高级），新增 Floor / TransitionBoost / LongPress
 #import <UIKit/UIKit.h>
 #import <spawn.h>
 #import <sys/wait.h>
@@ -26,9 +26,6 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 
-// v1.8.19：systemCyanColor / systemMintColor 是 iOS 15+ API，在 iOS 14 上调用会
-// unrecognized selector 直接崩溃（README 声明支持 iOS 14）。用 @available 守卫，
-// 旧系统回退到等价的 RGB 颜色。
 static UIColor *SIOCyanColor(void) {
     if (@available(iOS 15.0, *)) return [UIColor systemCyanColor];
     return [UIColor colorWithRed:0.0 green:0.75 blue:0.83 alpha:1.0];
@@ -38,12 +35,10 @@ static UIColor *SIOMintColor(void) {
     return [UIColor colorWithRed:0.0 green:0.72 blue:0.65 alpha:1.0];
 }
 
-// 列表 hook 硬保护名单（配置 App 侧）。命中则列表加速开关强制关闭并提示。
-// v1.8.19：移除 com.sfic.knight（顺丰同城骑士），改由用户黑名单/覆盖自行控制。
 static NSArray *HardGuardBundles(void) {
     static NSArray *a;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = @[]; });
+    dispatch_once(&once, ^{ a = @[ @"com.apple.springboard" ]; });
     return a;
 }
 
@@ -145,18 +140,23 @@ static void Respring(void) {
 static NSMutableDictionary *ReadConfig(void) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
-    if (!d[@"Enabled"])    d[@"Enabled"]    = @YES;
-    if (!d[@"Mode"])       d[@"Mode"]       = @2;
-    if (!d[@"Speed"])      d[@"Speed"]      = @5.0;
-    if (!d[@"SlowFactor"]) d[@"SlowFactor"] = @2.0;
-    if (!d[@"Spring"])     d[@"Spring"]     = @YES;
-    if (!d[@"Extra"])      d[@"Extra"]      = @YES;
-    if (!d[@"ListAccel"])  d[@"ListAccel"]  = @NO;
-    if (!d[@"ZoomAccel"])  d[@"ZoomAccel"]  = @NO;
-    if (!d[@"FastScroll"]) d[@"FastScroll"] = @NO;
-    if (!d[@"FastTap"])    d[@"FastTap"]    = @NO;
-    if (!d[@"LayerBoost"]) d[@"LayerBoost"] = @1.0;
-    if (!d[@"Blacklist"])  d[@"Blacklist"]  = @[ @"com.tencent.wework" ];
+    if (!d[@"Enabled"])          d[@"Enabled"]          = @YES;
+    if (!d[@"Mode"])             d[@"Mode"]             = @0;
+    if (!d[@"Speed"])            d[@"Speed"]            = @5.0;
+    if (!d[@"SlowFactor"])       d[@"SlowFactor"]       = @2.0;
+    if (!d[@"Spring"])           d[@"Spring"]           = @YES;
+    if (!d[@"Extra"])            d[@"Extra"]            = @YES;
+    if (!d[@"ListAccel"])        d[@"ListAccel"]        = @NO;
+    if (!d[@"ZoomAccel"])        d[@"ZoomAccel"]        = @NO;
+    if (!d[@"FastScroll"])       d[@"FastScroll"]       = @YES;
+    if (!d[@"FastTap"])          d[@"FastTap"]          = @YES;
+    if (!d[@"LongPress"])        d[@"LongPress"]        = @YES;
+    if (!d[@"LongPressDuration"])d[@"LongPressDuration"]= @0.30;
+    if (!d[@"Floor"])            d[@"Floor"]            = @0.02;
+    if (!d[@"LayerBoost"])       d[@"LayerBoost"]       = @1.0;
+    if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @1.0;
+    if (!d[@"Notify"])           d[@"Notify"]           = @YES;
+    if (!d[@"Blacklist"])        d[@"Blacklist"]        = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
     if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
@@ -172,7 +172,8 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
     if (!merged) merged = [NSMutableDictionary dictionary];
     NSArray *sioKeys = @[ @"Enabled", @"Mode", @"Speed", @"SlowFactor",
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist", @"ZoomAccel",
-                          @"FastScroll", @"FastTap", @"LayerBoost",
+                          @"FastScroll", @"FastTap", @"LongPress", @"LongPressDuration",
+                          @"Floor", @"LayerBoost", @"TransitionBoost", @"Notify",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
@@ -187,7 +188,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
 }
 
 static NSString *ModeText(int m) {
-    return m == 1 ? @"慢放" : (m == 2 ? @"瞬切 0.01s" : @"加速");
+    return m == 1 ? @"慢放" : (m == 2 ? @"瞬切" : @"加速");
 }
 
 static NSString * const AxPath = @"/var/mobile/Library/Preferences/com.apple.Accessibility.plist";
@@ -262,6 +263,51 @@ static int LayerIndexForBoost(double b) {
     return 0;
 }
 
+static double FloorForIndex(int i) {
+    switch (i) {
+        case 0:  return 0.005;
+        case 1:  return 0.01;
+        case 2:  return 0.02;
+        case 3:  return 0.05;
+        default: return 0.02;
+    }
+}
+static int FloorIndexForValue(double v) {
+    if (v < 0.0075) return 0;
+    if (v < 0.015)  return 1;
+    if (v < 0.035)  return 2;
+    return 3;
+}
+
+static double TransitionBoostForIndex(int i) {
+    switch (i) {
+        case 1:  return 1.5;
+        case 2:  return 2.0;
+        case 3:  return 3.0;
+        default: return 1.0;
+    }
+}
+static int TransitionBoostIndexForValue(double v) {
+    if (v > 1.2 && v < 1.8)  return 1;
+    if (v > 1.8 && v < 2.5)  return 2;
+    if (v >= 2.5)            return 3;
+    return 0;
+}
+
+static double LongPressDurationForIndex(int i) {
+    switch (i) {
+        case 0:  return 0.20;
+        case 1:  return 0.30;
+        case 2:  return 0.40;
+        default: return 0.30;
+    }
+}
+static int LongPressDurationIndexForValue(double v) {
+    if (v < 0.25) return 0;
+    if (v < 0.35) return 1;
+    return 2;
+}
+
 #pragma mark - 现代化卡片容器
 
 @interface SIOCardView : UIView
@@ -274,13 +320,11 @@ static int LayerIndexForBoost(double b) {
         self.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
         self.layer.cornerRadius = 12;
         self.layer.masksToBounds = YES;
-        
         _stack = [[UIStackView alloc] init];
         _stack.axis = UILayoutConstraintAxisVertical;
         _stack.spacing = 0;
         _stack.translatesAutoresizingMaskIntoConstraints = NO;
         [self addSubview:_stack];
-        
         [NSLayoutConstraint activateConstraints:@[
             [_stack.topAnchor constraintEqualToAnchor:self.topAnchor],
             [_stack.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
@@ -290,7 +334,6 @@ static int LayerIndexForBoost(double b) {
     }
     return self;
 }
-
 - (void)addRow:(UIView *)row isLast:(BOOL)isLast {
     if (self.stack.arrangedSubviews.count > 0) {
         UIView *sep = [[UIView alloc] init];
@@ -316,23 +359,19 @@ static int LayerIndexForBoost(double b) {
 - (instancetype)initWithTitle:(NSString *)title icon:(NSString *)iconName iconColor:(UIColor *)color control:(UIView *)ctrl {
     if (self = [super init]) {
         self.backgroundColor = [UIColor clearColor];
-        
         _iconView = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:iconName]];
         _iconView.tintColor = color;
         _iconView.contentMode = UIViewContentModeScaleAspectFit;
         _iconView.translatesAutoresizingMaskIntoConstraints = NO;
-        
         _titleLabel = [[UILabel alloc] init];
         _titleLabel.text = title;
         _titleLabel.font = [UIFont systemFontOfSize:16];
         _titleLabel.textColor = [UIColor labelColor];
         _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-        
         UIView *content = [[UIView alloc] init];
         content.translatesAutoresizingMaskIntoConstraints = NO;
         [content addSubview:_iconView];
         [content addSubview:_titleLabel];
-        
         [NSLayoutConstraint activateConstraints:@[
             [_iconView.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:16],
             [_iconView.centerYAnchor constraintEqualToAnchor:content.centerYAnchor],
@@ -342,13 +381,11 @@ static int LayerIndexForBoost(double b) {
             [_titleLabel.centerYAnchor constraintEqualToAnchor:content.centerYAnchor],
             [content.heightAnchor constraintEqualToConstant:50],
         ]];
-        
         UIStackView *h = [[UIStackView alloc] initWithArrangedSubviews:@[content, ctrl ?: [UIView new]]];
         h.axis = UILayoutConstraintAxisHorizontal;
         h.alignment = UIStackViewAlignmentCenter;
         h.spacing = 12;
         h.translatesAutoresizingMaskIntoConstraints = NO;
-        
         [self addSubview:h];
         [NSLayoutConstraint activateConstraints:@[
             [h.topAnchor constraintEqualToAnchor:self.topAnchor],
@@ -356,7 +393,6 @@ static int LayerIndexForBoost(double b) {
             [h.trailingAnchor constraintEqualToAnchor:self.trailingAnchor constant:-16],
             [h.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
         ]];
-        
         _control = ctrl;
     }
     return self;
@@ -373,14 +409,12 @@ static int LayerIndexForBoost(double b) {
 - (instancetype)initWithTitle:(NSString *)title subtitle:(NSString *)subtitle {
     if (self = [super init]) {
         self.backgroundColor = [UIColor clearColor];
-        
         _titleLabel = [[UILabel alloc] init];
-        _titleLabel.text = [title uppercaseString];
+        _titleLabel.text = title;
         _titleLabel.font = [UIFont systemFontOfSize:13];
         _titleLabel.textColor = [UIColor secondaryLabelColor];
         _titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
         [self addSubview:_titleLabel];
-        
         if (subtitle) {
             UILabel *sub = [[UILabel alloc] init];
             sub.text = subtitle;
@@ -389,7 +423,6 @@ static int LayerIndexForBoost(double b) {
             sub.numberOfLines = 0;
             sub.translatesAutoresizingMaskIntoConstraints = NO;
             [self addSubview:sub];
-            
             [NSLayoutConstraint activateConstraints:@[
                 [_titleLabel.topAnchor constraintEqualToAnchor:self.topAnchor constant:8],
                 [_titleLabel.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:16],
@@ -412,269 +445,434 @@ static int LayerIndexForBoost(double b) {
 
 #pragma mark - 主视图控制器
 
+typedef NS_ENUM(NSInteger, SIOTabType) {
+    SIOTabEngine = 0,
+    SIOTabFeel,
+    SIOTabSystem,
+    SIOTabAdvanced,
+};
+
 @interface SIOVC : UIViewController
+- (instancetype)initWithTab:(SIOTabType)tab;
 @end
 
-@implementation SIOVC {
-    UISwitch *_swEnabled, *_swSpring, *_swExtra, *_swList, *_swZoom, *_swFastScroll, *_swFastTap;
+@interface SIOVC () {
+    SIOTabType _tab;
+    // 引擎
+    UISwitch *_swEnabled;
     UISegmentedControl *_segMode;
     UISlider *_slider, *_sliderSlow;
     UILabel *_sliderLabel, *_sliderSlowLabel;
+    UISegmentedControl *_segFloor, *_segLayer, *_segTrans;
+    UILabel *_floorHint, *_layerHint, *_transHint;
+    // 手感
+    UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify;
+    UISegmentedControl *_segLongPress;
     UITextView *_blacklist;
-    UILabel *_status;
-    UISwitch *_swRM, *_swCF, *_swRT;
-    UISegmentedControl *_segDrag, *_segLayer;
-    UILabel *_dragLabel, *_layerLabel;
+    // 系统
     UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
+    UISwitch *_swRM, *_swCF, *_swRT;
+    UISegmentedControl *_segDrag;
+    UILabel *_dragHint;
+    // 高级 - App覆盖
     UITextField *_ovBundle;
-    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom, *_ovFastScroll, *_ovFastTap;
-    UISegmentedControl *_ovLayer, *_ovMode;
+    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom, *_ovFastScroll, *_ovFastTap, *_ovLongPress;
+    UISegmentedControl *_ovLayer, *_ovMode, *_ovFloor, *_ovTrans, *_ovLongPress, *_ovLongPressDur;
     UISlider *_ovSpeed;
     UILabel *_ovSpeedLabel, *_ovGuard;
+    // 高级 - 自检
+    UILabel *_selfCheck;
+}
+@end
+
+@implementation SIOVC
+
+- (instancetype)initWithTab:(SIOTabType)tab {
+    if (self = [super init]) { _tab = tab; }
+    return self;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
-    self.title = @"SI Original";
-    
-    NSMutableDictionary *cfg = ReadConfig();
-    int mode = [cfg[@"Mode"] intValue];
-    double speed = [cfg[@"Speed"] doubleValue];
-    double slowFactor = [cfg[@"SlowFactor"] doubleValue];
-    
+
     UIScrollView *scroll = [[UIScrollView alloc] init];
     scroll.translatesAutoresizingMaskIntoConstraints = NO;
     scroll.alwaysBounceVertical = YES;
     [self.view addSubview:scroll];
-    
+
     UIStackView *mainStack = [[UIStackView alloc] init];
     mainStack.axis = UILayoutConstraintAxisVertical;
     mainStack.spacing = 20;
     mainStack.translatesAutoresizingMaskIntoConstraints = NO;
     [scroll addSubview:mainStack];
-    
-    // Header
-    UIView *header = [[UIView alloc] init];
-    header.translatesAutoresizingMaskIntoConstraints = NO;
-    
-    UILabel *title = [[UILabel alloc] init];
-    title.text = @"SI Original";
-    title.font = [UIFont boldSystemFontOfSize:32];
-    title.textColor = [UIColor labelColor];
-    title.textAlignment = NSTextAlignmentCenter;
-    title.translatesAutoresizingMaskIntoConstraints = NO;
-    [header addSubview:title];
-    
-    UILabel *sub = [[UILabel alloc] init];
-    sub.text = @"v1.8.18 · 系统级增强";
-    sub.font = [UIFont systemFontOfSize:14];
-    sub.textColor = [UIColor secondaryLabelColor];
-    sub.textAlignment = NSTextAlignmentCenter;
-    sub.translatesAutoresizingMaskIntoConstraints = NO;
-    [header addSubview:sub];
-    
+
     [NSLayoutConstraint activateConstraints:@[
-        [title.topAnchor constraintEqualToAnchor:header.topAnchor constant:20],
-        [title.centerXAnchor constraintEqualToAnchor:header.centerXAnchor],
-        [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:4],
-        [sub.centerXAnchor constraintEqualToAnchor:header.centerXAnchor],
-        [sub.bottomAnchor constraintEqualToAnchor:header.bottomAnchor constant:-8],
+        [scroll.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [scroll.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
+        [mainStack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16],
+        [mainStack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-20],
+        [mainStack.leadingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.leadingAnchor constant:16],
+        [mainStack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor constant:-16],
+        [mainStack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32],
     ]];
-    [mainStack addArrangedSubview:header];
-    
-    // Section 1: 基础设置
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"基础设置" subtitle:nil]];
-    SIOCardView *card1 = [[SIOCardView alloc] init];
-    
+
+    NSMutableDictionary *cfg = ReadConfig();
+
+    switch (_tab) {
+        case SIOTabEngine:   [self buildEngine:cfg stack:mainStack]; break;
+        case SIOTabFeel:     [self buildFeel:cfg stack:mainStack]; break;
+        case SIOTabSystem:   [self buildSystem:cfg stack:mainStack]; break;
+        case SIOTabAdvanced: [self buildAdvanced:cfg stack:mainStack]; break;
+    }
+}
+
+- (UILabel *)label:(NSString *)t size:(CGFloat)s dim:(BOOL)dim {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = t;
+    l.font = [UIFont systemFontOfSize:s];
+    l.textColor = dim ? [UIColor secondaryLabelColor] : [UIColor labelColor];
+    l.numberOfLines = 0;
+    return l;
+}
+
+- (UIView *)hintRow:(UILabel *)label {
+    UIView *row = [[UIView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:label];
+    [NSLayoutConstraint activateConstraints:@[
+        [label.topAnchor constraintEqualToAnchor:row.topAnchor constant:8],
+        [label.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:16],
+        [label.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-16],
+        [label.bottomAnchor constraintEqualToAnchor:row.bottomAnchor constant:-8],
+    ]];
+    return row;
+}
+
+#pragma mark - 引擎 Tab
+
+- (void)buildEngine:(NSDictionary *)cfg stack:(UIStackView *)stack {
+    self.title = @"引擎";
+    double speed = [cfg[@"Speed"] doubleValue];
+    double slowFactor = [cfg[@"SlowFactor"] doubleValue];
+
+    // Hero 卡片
+    UIView *hero = [[UIView alloc] init];
+    hero.translatesAutoresizingMaskIntoConstraints = NO;
+    hero.layer.cornerRadius = 16;
+    hero.layer.masksToBounds = YES;
+    CAGradientLayer *grad = [CAGradientLayer layer];
+    grad.colors = @[(__bridge id)[UIColor colorWithRed:0.10 green:0.35 blue:0.25 alpha:1.0].CGColor,
+                    (__bridge id)[UIColor colorWithRed:0.05 green:0.15 blue:0.12 alpha:1.0].CGColor];
+    grad.startPoint = CGPointMake(0, 0);
+    grad.endPoint = CGPointMake(1, 1);
+    grad.frame = CGRectMake(0, 0, 360, 90);
+    [hero.layer insertSublayer:grad atIndex:0];
+    [hero.heightAnchor constraintEqualToConstant:90].active = YES;
+
+    UILabel *heroTitle = [[UILabel alloc] init];
+    heroTitle.text = @"隔壁老王·王灿专用";
+    heroTitle.font = [UIFont boldSystemFontOfSize:22];
+    heroTitle.textColor = [UIColor whiteColor];
+    heroTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    [hero addSubview:heroTitle];
+
+    UILabel *heroSub = [[UILabel alloc] init];
+    heroSub.text = @"SIOriginal v2.0.0 Max · 动画加速超强版";
+    heroSub.font = [UIFont systemFontOfSize:12];
+    heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
+    heroSub.translatesAutoresizingMaskIntoConstraints = NO;
+    [hero addSubview:heroSub];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [heroTitle.topAnchor constraintEqualToAnchor:hero.topAnchor constant:18],
+        [heroTitle.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor constant:18],
+        [heroSub.topAnchor constraintEqualToAnchor:heroTitle.bottomAnchor constant:4],
+        [heroSub.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor constant:18],
+    ]];
+    [stack addArrangedSubview:hero];
+
+    // 一键预设
+    UILabel *presetLabel = [self label:@"一键预设（点击立即套用并保存）" size:13 dim:YES];
+    [stack addArrangedSubview:presetLabel];
+
+    UIStackView *presetRow = [[UIStackView alloc] init];
+    presetRow.axis = UILayoutConstraintAxisHorizontal;
+    presetRow.spacing = 10;
+    presetRow.distribution = UIStackViewDistributionFillEqually;
+    NSArray *presets = @[
+        @{ @"title": @"极速", @"icon": @"bolt.fill",   @"color": [UIColor systemGreenColor] },
+        @{ @"title": @"均衡", @"icon": @"scalemass",   @"color": [UIColor systemBlueColor] },
+        @{ @"title": @"保守", @"icon": @"shield.fill",  @"color": [UIColor systemOrangeColor] },
+        @{ @"title": @"瞬切", @"icon": @"bolt.horizontal", @"color": [UIColor systemYellowColor] },
+    ];
+    for (int i = 0; i < 4; i++) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        [b setTitle:presets[i][@"title"] forState:UIControlStateNormal];
+        [b setImage:[UIImage systemImageNamed:presets[i][@"icon"]] forState:UIControlStateNormal];
+        b.tintColor = [UIColor whiteColor];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        b.backgroundColor = presets[i][@"color"];
+        b.layer.cornerRadius = 12;
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+        b.titleEdgeInsets = UIEdgeInsetsMake(0, 6, 0, 0);
+        b.imageEdgeInsets = UIEdgeInsetsMake(0, 0, 0, 6);
+        b.translatesAutoresizingMaskIntoConstraints = NO;
+        [b.heightAnchor constraintEqualToConstant:40].active = YES;
+        b.tag = i;
+        [b addTarget:self action:@selector(presetTapped:) forControlEvents:UIControlEventTouchUpInside];
+        [presetRow addArrangedSubview:b];
+    }
+    [stack addArrangedSubview:presetRow];
+
+    // 基础设置卡片
+    SIOCardView *c1 = [[SIOCardView alloc] init];
     _swEnabled = [[UISwitch alloc] init];
     _swEnabled.on = [cfg[@"Enabled"] boolValue];
-    SIOSettingRow *r1 = [[SIOSettingRow alloc] initWithTitle:@"启用加速" icon:@"bolt.fill" iconColor:[UIColor systemYellowColor] control:_swEnabled];
-    [card1 addRow:r1 isLast:NO];
-    
-    UILabel *lblMode = [self label:@"模式" size:17 dim:NO];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"启用动画引擎" icon:@"bolt.fill" iconColor:[UIColor systemGreenColor] control:_swEnabled] isLast:NO];
+
     _segMode = [[UISegmentedControl alloc] initWithItems:@[ @"加速", @"慢放", @"瞬切" ]];
-    _segMode.selectedSegmentIndex = (mode >= 0 && mode <= 2) ? mode : 0;
+    _segMode.selectedSegmentIndex = [cfg[@"Mode"] intValue];
     [_segMode addTarget:self action:@selector(modeChanged) forControlEvents:UIControlEventValueChanged];
-    SIOSettingRow *r2 = [[SIOSettingRow alloc] initWithTitle:@"运行模式" icon:@"gearshape.fill" iconColor:[UIColor systemBlueColor] control:_segMode];
-    [card1 addRow:r2 isLast:NO];
-    
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"模式" icon:@"gearshape.fill" iconColor:[UIColor systemBlueColor] control:_segMode] isLast:NO];
+
     _sliderLabel = [self label:[NSString stringWithFormat:@"×%.1f", speed] size:15 dim:YES];
     _slider = [[UISlider alloc] init];
-    _slider.minimumValue = 1.0;
-    _slider.maximumValue = 50.0;
-    _slider.continuous = YES;
+    _slider.minimumValue = 1.0; _slider.maximumValue = 50.0;
     _slider.value = speed;
     [_slider addTarget:self action:@selector(sliderChanged) forControlEvents:UIControlEventValueChanged];
-    [_slider.widthAnchor constraintEqualToConstant:120].active = YES;
-    SIOSettingRow *r3 = [[SIOSettingRow alloc] initWithTitle:@"加速倍率" icon:@"speedometer" iconColor:[UIColor systemGreenColor] control:_slider];
-    [card1 addRow:r3 isLast:NO];
-    
+    [_slider.widthAnchor constraintEqualToConstant:140].active = YES;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"加速倍率" icon:@"speedometer" iconColor:[UIColor systemGreenColor] control:_slider] isLast:NO];
+
     _sliderSlowLabel = [self label:[NSString stringWithFormat:@"×%.1f", slowFactor] size:15 dim:YES];
     _sliderSlow = [[UISlider alloc] init];
-    _sliderSlow.minimumValue = 1.0;
-    _sliderSlow.maximumValue = 10.0;
-    _sliderSlow.continuous = YES;
+    _sliderSlow.minimumValue = 1.0; _sliderSlow.maximumValue = 10.0;
     _sliderSlow.value = slowFactor;
     [_sliderSlow addTarget:self action:@selector(slowSliderChanged) forControlEvents:UIControlEventValueChanged];
-    [_sliderSlow.widthAnchor constraintEqualToConstant:120].active = YES;
-    SIOSettingRow *r4 = [[SIOSettingRow alloc] initWithTitle:@"慢放倍率" icon:@"tortoise.fill" iconColor:[UIColor systemOrangeColor] control:_sliderSlow];
-    [card1 addRow:r4 isLast:YES];
-    
-    [mainStack addArrangedSubview:card1];
-    
-    // Section 2: 动画选项
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"动画选项" subtitle:nil]];
-    SIOCardView *card2 = [[SIOCardView alloc] init];
-    
-    _swSpring = [[UISwitch alloc] init];
-    _swSpring.on = [cfg[@"Spring"] boolValue];
-    [card2 addRow:[[SIOSettingRow alloc] initWithTitle:@"弹簧参数缩放" icon:@"circle.hexagongrid.fill" iconColor:[UIColor systemPurpleColor] control:_swSpring] isLast:NO];
-    
-    _swExtra = [[UISwitch alloc] init];
-    _swExtra.on = [cfg[@"Extra"] boolValue];
-    [card2 addRow:[[SIOSettingRow alloc] initWithTitle:@"进阶转场" icon:@"rectangle.on.rectangle" iconColor:[UIColor systemIndigoColor] control:_swExtra] isLast:NO];
-    
-    _swList = [[UISwitch alloc] init];
-    _swList.on = [cfg[@"ListAccel"] boolValue];
-    _swList.onTintColor = [UIColor systemRedColor];
-    [card2 addRow:[[SIOSettingRow alloc] initWithTitle:@"列表加速 (高危)" icon:@"list.bullet" iconColor:[UIColor systemRedColor] control:_swList] isLast:NO];
-    
-    UILabel *listHint = [self label:@"重列表 App（顺丰同城骑士等）保持关闭，否则会卡死/崩溃" size:12 dim:YES];
-    listHint.numberOfLines = 0;
-    UIView *hintRow = [[UIView alloc] init];
-    hintRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [hintRow addSubview:listHint];
-    [NSLayoutConstraint activateConstraints:@[
-        [listHint.topAnchor constraintEqualToAnchor:hintRow.topAnchor constant:8],
-        [listHint.leadingAnchor constraintEqualToAnchor:hintRow.leadingAnchor constant:16],
-        [listHint.trailingAnchor constraintEqualToAnchor:hintRow.trailingAnchor constant:-16],
-        [listHint.bottomAnchor constraintEqualToAnchor:hintRow.bottomAnchor constant:-8],
-    ]];
-    [card2 addRow:hintRow isLast:NO];
-    
-    _swZoom = [[UISwitch alloc] init];
-    _swZoom.on = [cfg[@"ZoomAccel"] boolValue];
-    [card2 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画 (实验)" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_swZoom] isLast:NO];
-    
-    _swFastScroll = [[UISwitch alloc] init];
-    _swFastScroll.on = [cfg[@"FastScroll"] boolValue];
-    [card2 addRow:[[SIOSettingRow alloc] initWithTitle:@"滑行惯性加急" icon:@"hand.swipe.left.fill" iconColor:[UIColor systemOrangeColor] control:_swFastScroll] isLast:NO];
-    
-    _swFastTap = [[UISwitch alloc] init];
-    _swFastTap.on = [cfg[@"FastTap"] boolValue];
-    [card2 addRow:[[SIOSettingRow alloc] initWithTitle:@"点击零延迟" icon:@"hand.tap.fill" iconColor:[UIColor systemPinkColor] control:_swFastTap] isLast:YES];
-    
-    [mainStack addArrangedSubview:card2];
-    
-    // Section 3: LayerBoost
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"显式动画" subtitle:@"转圈/进度/旋转等 CAAnimation 路径额外倍率"]];
-    SIOCardView *card3 = [[SIOCardView alloc] init];
-    
+    [_sliderSlow.widthAnchor constraintEqualToConstant:140].active = YES;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"慢放倍率" icon:@"tortoise.fill" iconColor:[UIColor systemOrangeColor] control:_sliderSlow] isLast:YES];
+    [stack addArrangedSubview:c1];
+
+    // 动画时长下限
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"动画时长下限" subtitle:nil]];
+    SIOCardView *c2 = [[SIOCardView alloc] init];
+    _segFloor = [[UISegmentedControl alloc] initWithItems:@[ @"0.005", @"0.01", @"0.02", @"0.05" ]];
+    _segFloor.selectedSegmentIndex = FloorIndexForValue([cfg[@"Floor"] doubleValue]);
+    [_segFloor addTarget:self action:@selector(floorChanged) forControlEvents:UIControlEventValueChanged];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"时长下限（秒）" icon:@"timer" iconColor:[UIColor systemOrangeColor] control:_segFloor] isLast:NO];
+    _floorHint = [self label:@"" size:12 dim:YES];
+    _floorHint.numberOfLines = 0;
+    [c2 addRow:[self hintRow:_floorHint] isLast:YES];
+    [stack addArrangedSubview:c2];
+    [self updateFloorHint];
+
+    // 显式动画额外倍率
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"显式动画额外倍率" subtitle:nil]];
+    SIOCardView *c3 = [[SIOCardView alloc] init];
     _segLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
     _segLayer.selectedSegmentIndex = LayerIndexForBoost([cfg[@"LayerBoost"] doubleValue]);
     [_segLayer addTarget:self action:@selector(layerChanged) forControlEvents:UIControlEventValueChanged];
-    SIOSettingRow *rLayer = [[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:SIOCyanColor() control:_segLayer];
-    [card3 addRow:rLayer isLast:NO];
-    
-    _layerLabel = [self label:@"" size:12 dim:YES];
-    _layerLabel.textColor = [UIColor systemOrangeColor];
-    _layerLabel.numberOfLines = 0;
-    UIView *layerHintRow = [[UIView alloc] init];
-    layerHintRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [layerHintRow addSubview:_layerLabel];
+    [c3 addRow:[[SIOSettingRow alloc] initWithTitle:@"显式倍率" icon:@"layers.fill" iconColor:SIOCyanColor() control:_segLayer] isLast:NO];
+    _layerHint = [self label:@"" size:12 dim:YES];
+    _layerHint.numberOfLines = 0;
+    [c3 addRow:[self hintRow:_layerHint] isLast:YES];
+    [stack addArrangedSubview:c3];
+    [self updateLayerHint];
+
+    // 转场独立额外倍率
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"转场独立额外倍率" subtitle:nil]];
+    SIOCardView *c4 = [[SIOCardView alloc] init];
+    _segTrans = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×1.5", @"×2", @"×3" ]];
+    _segTrans.selectedSegmentIndex = TransitionBoostIndexForValue([cfg[@"TransitionBoost"] doubleValue]);
+    [_segTrans addTarget:self action:@selector(transChanged) forControlEvents:UIControlEventValueChanged];
+    [c4 addRow:[[SIOSettingRow alloc] initWithTitle:@"转场倍率" icon:@"rectangle.on.rectangle" iconColor:[UIColor systemIndigoColor] control:_segTrans] isLast:NO];
+    _transHint = [self label:@"" size:12 dim:YES];
+    _transHint.numberOfLines = 0;
+    [c4 addRow:[self hintRow:_transHint] isLast:YES];
+    [stack addArrangedSubview:c4];
+    [self updateTransHint];
+
+    [self modeChanged];
+}
+
+- (void)presetTapped:(UIButton *)sender {
+    int idx = (int)sender.tag;
+    switch (idx) {
+        case 0: // 极速
+            _segMode.selectedSegmentIndex = 0;
+            _slider.value = 50.0;
+            _segFloor.selectedSegmentIndex = 0;
+            _segLayer.selectedSegmentIndex = 4;
+            _segTrans.selectedSegmentIndex = 3;
+            break;
+        case 1: // 均衡
+            _segMode.selectedSegmentIndex = 0;
+            _slider.value = 5.0;
+            _segFloor.selectedSegmentIndex = 2;
+            _segLayer.selectedSegmentIndex = 1;
+            _segTrans.selectedSegmentIndex = 1;
+            break;
+        case 2: // 保守
+            _segMode.selectedSegmentIndex = 0;
+            _slider.value = 2.0;
+            _segFloor.selectedSegmentIndex = 3;
+            _segLayer.selectedSegmentIndex = 0;
+            _segTrans.selectedSegmentIndex = 0;
+            break;
+        case 3: // 瞬切
+            _segMode.selectedSegmentIndex = 2;
+            _segFloor.selectedSegmentIndex = 1;
+            _segLayer.selectedSegmentIndex = 0;
+            _segTrans.selectedSegmentIndex = 0;
+            break;
+    }
+    [self modeChanged];
+    [self sliderChanged];
+    [self updateFloorHint];
+    [self updateLayerHint];
+    [self updateTransHint];
+    [self onSave];
+}
+
+#pragma mark - 手感 Tab
+
+- (void)buildFeel:(NSDictionary *)cfg stack:(UIStackView *)stack {
+    self.title = @"手感·列表";
+
+    // 交互跟手
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"交互跟手" subtitle:nil]];
+    SIOCardView *c1 = [[SIOCardView alloc] init];
+    _swFastScroll = [[UISwitch alloc] init];
+    _swFastScroll.on = [cfg[@"FastScroll"] boolValue];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"滑行惯性加急（setter 强黏，防 App 改回）" icon:@"hand.swipe.left.fill" iconColor:[UIColor systemOrangeColor] control:_swFastScroll] isLast:NO];
+    _swFastTap = [[UISwitch alloc] init];
+    _swFastTap.on = [cfg[@"FastTap"] boolValue];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"点击零延迟（delaysContentTouches 强黏）" icon:@"hand.tap.fill" iconColor:[UIColor systemPinkColor] control:_swFastTap] isLast:NO];
+    _swLongPress = [[UISwitch alloc] init];
+    _swLongPress.on = [cfg[@"LongPress"] boolValue];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"长按手势加速（系统默认 0.5s 下压）" icon:@"hand.point.up.left.fill" iconColor:[UIColor systemTealColor] control:_swLongPress] isLast:NO];
+    _segLongPress = [[UISegmentedControl alloc] initWithItems:@[ @"0.20s", @"0.30s", @"0.40s" ]];
+    _segLongPress.selectedSegmentIndex = LongPressDurationIndexForValue([cfg[@"LongPressDuration"] doubleValue]);
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"长按触发时长" icon:@"timer" iconColor:[UIColor systemTealColor] control:_segLongPress] isLast:NO];
+    _swNotify = [[UISwitch alloc] init];
+    _swNotify.on = [cfg[@"Notify"] boolValue];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"保存后在目标 App 顶部弹生效提示" icon:@"bell.fill" iconColor:[UIColor systemRedColor] control:_swNotify] isLast:YES];
+    [stack addArrangedSubview:c1];
+
+    // 滚动 / 缩放
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"滚动 / 缩放" subtitle:nil]];
+    SIOCardView *c2 = [[SIOCardView alloc] init];
+    _swZoom = [[UISwitch alloc] init];
+    _swZoom.on = [cfg[@"ZoomAccel"] boolValue];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画加速（实验，图片预览异常就关）" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_swZoom] isLast:YES];
+    [stack addArrangedSubview:c2];
+
+    // 高危项
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"高危项" subtitle:nil]];
+    SIOCardView *c3 = [[SIOCardView alloc] init];
+    _swList = [[UISwitch alloc] init];
+    _swList.on = [cfg[@"ListAccel"] boolValue];
+    _swList.onTintColor = [UIColor systemRedColor];
+    [c3 addRow:[[SIOSettingRow alloc] initWithTitle:@"列表加速 TV/CV" icon:@"list.bullet" iconColor:[UIColor systemRedColor] control:_swList] isLast:NO];
+    UILabel *listWarn = [self label:@"⚠️ 硬保护名单：桌面进程 com.apple.springboard — 列表加速恒为关闭，任何配置都打不开（SpringBoard 打开会黑屏/白苹果）。淘宝/京东等重列表 App 也建议保持关闭。" size:12 dim:YES];
+    listWarn.textColor = [UIColor systemOrangeColor];
+    [c3 addRow:[self hintRow:listWarn] isLast:YES];
+    [stack addArrangedSubview:c3];
+
+    // 黑名单
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"黑名单（每行一个 Bundle ID，命中则完全不加速）" subtitle:nil]];
+    SIOCardView *c4 = [[SIOCardView alloc] init];
+    _blacklist = [[UITextView alloc] init];
+    _blacklist.translatesAutoresizingMaskIntoConstraints = NO;
+    _blacklist.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
+    _blacklist.layer.borderColor = [UIColor separatorColor].CGColor;
+    _blacklist.layer.borderWidth = 0.5;
+    _blacklist.layer.cornerRadius = 8;
+    _blacklist.text = [cfg[@"Blacklist"] componentsJoinedByString:@"\n"];
+    [_blacklist.heightAnchor constraintEqualToConstant:100].active = YES;
+    UIView *blRow = [[UIView alloc] init];
+    blRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [blRow addSubview:_blacklist];
     [NSLayoutConstraint activateConstraints:@[
-        [_layerLabel.topAnchor constraintEqualToAnchor:layerHintRow.topAnchor constant:8],
-        [_layerLabel.leadingAnchor constraintEqualToAnchor:layerHintRow.leadingAnchor constant:16],
-        [_layerLabel.trailingAnchor constraintEqualToAnchor:layerHintRow.trailingAnchor constant:-16],
-        [_layerLabel.bottomAnchor constraintEqualToAnchor:layerHintRow.bottomAnchor constant:-8],
+        [_blacklist.topAnchor constraintEqualToAnchor:blRow.topAnchor constant:12],
+        [_blacklist.leadingAnchor constraintEqualToAnchor:blRow.leadingAnchor constant:16],
+        [_blacklist.trailingAnchor constraintEqualToAnchor:blRow.trailingAnchor constant:-16],
+        [_blacklist.bottomAnchor constraintEqualToAnchor:blRow.bottomAnchor constant:-12],
     ]];
-    [card3 addRow:layerHintRow isLast:YES];
-    
-    [mainStack addArrangedSubview:card3];
-    
-    // Section 4: 系统效果
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"系统动态效果" subtitle:@"写入辅助功能，需注销生效"]];
-    SIOCardView *card4 = [[SIOCardView alloc] init];
-    
-    _swRM = [[UISwitch alloc] init];
-    _swRM.on = ReadAx(@"ReduceMotionEnabled");
-    [card4 addRow:[[SIOSettingRow alloc] initWithTitle:@"减弱动态效果" icon:@"tortoise.fill" iconColor:[UIColor systemGrayColor] control:_swRM] isLast:NO];
-    
-    _swCF = [[UISwitch alloc] init];
-    _swCF.on = ReadAx(@"PreferCrossFadeTransitions");
-    [card4 addRow:[[SIOSettingRow alloc] initWithTitle:@"交叉淡出过渡" icon:@"arrow.triangle.2.circlepath" iconColor:[UIColor systemGrayColor] control:_swCF] isLast:NO];
-    
-    _swRT = [[UISwitch alloc] init];
-    _swRT.on = ReadAx(@"ReduceTransparencyEnabled");
-    [card4 addRow:[[SIOSettingRow alloc] initWithTitle:@"减少透明度" icon:@"circle.lefthalf.filled" iconColor:[UIColor systemGrayColor] control:_swRT] isLast:YES];
-    
-    [mainStack addArrangedSubview:card4];
-    
-    // Section 5: UIKit 全局系数
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"UIKit 全局动画系数" subtitle:@"写入 com.apple.UIKit，需注销/重启目标 App"]];
-    SIOCardView *card5 = [[SIOCardView alloc] init];
-    
-    double curDrag = ReadUIKitDrag();
-    int curDragIdx = DragIndexForCoeff(curDrag);
-    _segDrag = [[UISegmentedControl alloc] initWithItems:@[ @"关", @"×5", @"×10", @"×20", @"极端" ]];
-    _segDrag.selectedSegmentIndex = curDragIdx;
-    [_segDrag addTarget:self action:@selector(dragChanged) forControlEvents:UIControlEventValueChanged];
-    SIOSettingRow *rDrag = [[SIOSettingRow alloc] initWithTitle:@"全局动画系数" icon:@"slider.horizontal.3" iconColor:SIOMintColor() control:_segDrag];
-    [card5 addRow:rDrag isLast:NO];
-    
-    _dragLabel = [self label:@"" size:12 dim:YES];
-    _dragLabel.textColor = [UIColor systemOrangeColor];
-    _dragLabel.numberOfLines = 0;
-    [self updateDragLabel];
-    UIView *dragHintRow = [[UIView alloc] init];
-    dragHintRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [dragHintRow addSubview:_dragLabel];
-    [NSLayoutConstraint activateConstraints:@[
-        [_dragLabel.topAnchor constraintEqualToAnchor:dragHintRow.topAnchor constant:8],
-        [_dragLabel.leadingAnchor constraintEqualToAnchor:dragHintRow.leadingAnchor constant:16],
-        [_dragLabel.trailingAnchor constraintEqualToAnchor:dragHintRow.trailingAnchor constant:-16],
-        [_dragLabel.bottomAnchor constraintEqualToAnchor:dragHintRow.bottomAnchor constant:-8],
-    ]];
-    [card5 addRow:dragHintRow isLast:YES];
-    
-    [mainStack addArrangedSubview:card5];
-    
-    // Section 6: 保活
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"真后台保活" subtitle:@"FUBackground 引擎"]];
-    SIOCardView *card6 = [[SIOCardView alloc] init];
-    
+    [c4 addRow:blRow isLast:YES];
+    [stack addArrangedSubview:c4];
+}
+
+#pragma mark - 系统 Tab
+
+- (void)buildSystem:(NSDictionary *)cfg stack:(UIStackView *)stack {
+    self.title = @"保活·系统";
+
+    // 真后台保活
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"真后台保活（FUBackground v2.0）" subtitle:nil]];
+    SIOCardView *c1 = [[SIOCardView alloc] init];
     _swFUBG = [[UISwitch alloc] init];
     _swFUBG.on = [cfg[@"FUBGEnabled"] boolValue];
-    [card6 addRow:[[SIOSettingRow alloc] initWithTitle:@"启用真后台保活" icon:@"battery.100.bolt" iconColor:[UIColor systemGreenColor] control:_swFUBG] isLast:NO];
-    
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"启用真后台保活" icon:@"battery.100.bolt" iconColor:[UIColor systemGreenColor] control:_swFUBG] isLast:NO];
     _swFUBGScene = [[UISwitch alloc] init];
     _swFUBGScene.on = [cfg[@"FUBGSceneFake"] boolValue];
-    [card6 addRow:[[SIOSettingRow alloc] initWithTitle:@"场景伪装引擎" icon:@"theatermasks.fill" iconColor:[UIColor systemIndigoColor] control:_swFUBGScene] isLast:NO];
-    
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"场景伪装引擎（推荐）" icon:@"theatermasks.fill" iconColor:[UIColor systemIndigoColor] control:_swFUBGScene] isLast:NO];
     _swFUBGAudio = [[UISwitch alloc] init];
     _swFUBGAudio.on = [cfg[@"FUBGAudioKeep"] boolValue];
-    [card6 addRow:[[SIOSettingRow alloc] initWithTitle:@"音频断言兜底" icon:@"speaker.wave.2.fill" iconColor:[UIColor systemOrangeColor] control:_swFUBGAudio] isLast:NO];
-    
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"音频断言兜底（静音白噪）" icon:@"speaker.wave.2.fill" iconColor:[UIColor systemOrangeColor] control:_swFUBGAudio] isLast:NO];
     _swFUBGBall = [[UISwitch alloc] init];
     _swFUBGBall.on = [cfg[@"FUBGFloatingBall"] boolValue];
     _swFUBGBall.enabled = NO;
-    [card6 addRow:[[SIOSettingRow alloc] initWithTitle:@"悬浮球 (已全局禁用)" icon:@"circle.fill" iconColor:[UIColor systemGrayColor] control:_swFUBGBall] isLast:YES];
-    
-    [mainStack addArrangedSubview:card6];
-    
-    // Section 7: App 专属覆盖
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"App 专属覆盖" subtitle:@"为指定 Bundle ID 单独配置，不影响其他 App"]];
-    SIOCardView *card7 = [[SIOCardView alloc] init];
-    
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"悬浮球（已全局禁用）" icon:@"circle.fill" iconColor:[UIColor systemGrayColor] control:_swFUBGBall] isLast:YES];
+    [stack addArrangedSubview:c1];
+
+    // 系统动态效果
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"系统动态效果（写入辅助功能，需注销生效）" subtitle:nil]];
+    SIOCardView *c2 = [[SIOCardView alloc] init];
+    _swRM = [[UISwitch alloc] init];
+    _swRM.on = ReadAx(@"ReduceMotionEnabled");
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"减弱动态效果（系统级）" icon:@"tortoise.fill" iconColor:[UIColor systemGrayColor] control:_swRM] isLast:NO];
+    _swCF = [[UISwitch alloc] init];
+    _swCF.on = ReadAx(@"PreferCrossFadeTransitions");
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"首选交叉淡出过渡" icon:@"arrow.triangle.2.circlepath" iconColor:[UIColor systemGrayColor] control:_swCF] isLast:NO];
+    _swRT = [[UISwitch alloc] init];
+    _swRT.on = ReadAx(@"ReduceTransparencyEnabled");
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"减少透明度（关毛玻璃，降 GPU 负载）" icon:@"circle.lefthalf.filled" iconColor:[UIColor systemGrayColor] control:_swRT] isLast:YES];
+    [stack addArrangedSubview:c2];
+
+    // UIKit 全局动画系数
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"UIKit 全局动画系数（需注销/重启目标 App）" subtitle:nil]];
+    SIOCardView *c3 = [[SIOCardView alloc] init];
+    _segDrag = [[UISegmentedControl alloc] initWithItems:@[ @"关闭", @"×5", @"×10", @"×20", @"极端" ]];
+    _segDrag.selectedSegmentIndex = DragIndexForCoeff(ReadUIKitDrag());
+    [_segDrag addTarget:self action:@selector(dragChanged) forControlEvents:UIControlEventValueChanged];
+    [c3 addRow:[[SIOSettingRow alloc] initWithTitle:@"全局系数" icon:@"slider.horizontal.3" iconColor:SIOMintColor() control:_segDrag] isLast:NO];
+    _dragHint = [self label:@"" size:12 dim:YES];
+    _dragHint.numberOfLines = 0;
+    [c3 addRow:[self hintRow:_dragHint] isLast:YES];
+    [stack addArrangedSubview:c3];
+    [self updateDragHint];
+}
+
+#pragma mark - 高级 Tab
+
+- (void)buildAdvanced:(NSDictionary *)cfg stack:(UIStackView *)stack {
+    self.title = @"高级";
     NSDictionary *ovAllCfg = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]]
                              ? cfg[@"AppOverrides"] : @{};
     NSString *ovFirst = ovAllCfg[@"com.sfic.knight"] ? @"com.sfic.knight"
                       : ([ovAllCfg.allKeys sortedArrayUsingSelector:@selector(compare:)].firstObject
                          ?: @"com.sfic.knight");
-    
+
+    // App 专属覆盖
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"App 专属覆盖（只影响该 Bundle ID）" subtitle:nil]];
+    SIOCardView *c1 = [[SIOCardView alloc] init];
+
     _ovBundle = [[UITextField alloc] init];
-    _ovBundle.translatesAutoresizingMaskIntoConstraints = NO;   // 必须设 NO，否则与高度/四边约束冲突被压成 0 高度
+    _ovBundle.translatesAutoresizingMaskIntoConstraints = NO;
     _ovBundle.text = ovFirst;
     _ovBundle.placeholder = @"com.sfic.knight";
     _ovBundle.borderStyle = UITextBorderStyleRoundedRect;
@@ -687,7 +885,6 @@ static int LayerIndexForBoost(double b) {
     _ovBundle.returnKeyType = UIReturnKeyDone;
     [_ovBundle addTarget:self action:@selector(ovBundleChanged) forControlEvents:UIControlEventEditingDidEnd | UIControlEventEditingDidEndOnExit];
     [_ovBundle.heightAnchor constraintEqualToConstant:36].active = YES;
-    
     UIView *bundleRow = [[UIView alloc] init];
     bundleRow.translatesAutoresizingMaskIntoConstraints = NO;
     [bundleRow addSubview:_ovBundle];
@@ -697,173 +894,133 @@ static int LayerIndexForBoost(double b) {
         [_ovBundle.trailingAnchor constraintEqualToAnchor:bundleRow.trailingAnchor constant:-16],
         [_ovBundle.bottomAnchor constraintEqualToAnchor:bundleRow.bottomAnchor constant:-12],
     ]];
-    [card7 addRow:bundleRow isLast:NO];
-    
+    [c1 addRow:bundleRow isLast:NO];
+
     _ovOn = [[UISwitch alloc] init];
     [_ovOn addTarget:self action:@selector(ovToggled) forControlEvents:UIControlEventValueChanged];
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"启用专属配置" icon:@"toggleswitch.fill" iconColor:[UIColor systemBlueColor] control:_ovOn] isLast:NO];
-    
-    _ovMode = [[UISegmentedControl alloc] initWithItems:@[ @"加速", @"慢放", @"瞬切" ]];
-    _ovMode.selectedSegmentIndex = 0;
-    [_ovMode addTarget:self action:@selector(ovModeChanged) forControlEvents:UIControlEventValueChanged];
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"专属模式" icon:@"gearshape.fill" iconColor:[UIColor systemBlueColor] control:_ovMode] isLast:NO];
-    
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"为该 App 启用专属配置" icon:@"toggleswitch.fill" iconColor:[UIColor systemBlueColor] control:_ovOn] isLast:NO];
+
     _ovSpeedLabel = [self label:@"×5.0" size:15 dim:YES];
     _ovSpeed = [[UISlider alloc] init];
-    _ovSpeed.minimumValue = 1.0;
-    _ovSpeed.maximumValue = 50.0;
+    _ovSpeed.minimumValue = 1.0; _ovSpeed.maximumValue = 50.0;
     _ovSpeed.value = 5.0;
-    _ovSpeed.continuous = YES;
     [_ovSpeed addTarget:self action:@selector(ovSliderChanged) forControlEvents:UIControlEventValueChanged];
-    [_ovSpeed.widthAnchor constraintEqualToConstant:120].active = YES;
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"专属倍率" icon:@"speedometer" iconColor:[UIColor systemGreenColor] control:_ovSpeed] isLast:NO];
-    
-    _ovSpring = [[UISwitch alloc] init];
-    _ovSpring.on = YES;
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"弹簧参数缩放" icon:@"circle.hexagongrid.fill" iconColor:[UIColor systemPurpleColor] control:_ovSpring] isLast:NO];
-    
-    _ovExtra = [[UISwitch alloc] init];
-    _ovExtra.on = YES;
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"进阶转场" icon:@"rectangle.on.rectangle" iconColor:[UIColor systemIndigoColor] control:_ovExtra] isLast:NO];
-    
-    _ovList = [[UISwitch alloc] init];
-    _ovList.on = NO;
-    _ovList.onTintColor = [UIColor systemRedColor];
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"列表加速" icon:@"list.bullet" iconColor:[UIColor systemRedColor] control:_ovList] isLast:NO];
-    
-    _ovZoom = [[UISwitch alloc] init];
-    _ovZoom.on = NO;
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_ovZoom] isLast:NO];
-    
-    _ovFastScroll = [[UISwitch alloc] init];
-    _ovFastScroll.on = NO;
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"滑行惯性加急" icon:@"hand.swipe.left.fill" iconColor:[UIColor systemOrangeColor] control:_ovFastScroll] isLast:NO];
-    
-    _ovFastTap = [[UISwitch alloc] init];
-    _ovFastTap.on = NO;
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"点击零延迟" icon:@"hand.tap.fill" iconColor:[UIColor systemPinkColor] control:_ovFastTap] isLast:NO];
-    
+    [_ovSpeed.widthAnchor constraintEqualToConstant:140].active = YES;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"专属倍率" icon:@"speedometer" iconColor:[UIColor systemGreenColor] control:_ovSpeed] isLast:NO];
+
+    _ovMode = [[UISegmentedControl alloc] initWithItems:@[ @"加速", @"慢放", @"瞬切" ]];
+    [_ovMode addTarget:self action:@selector(ovModeChanged) forControlEvents:UIControlEventValueChanged];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"专属模式" icon:@"gearshape.fill" iconColor:[UIColor systemBlueColor] control:_ovMode] isLast:NO];
+
     _ovLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
-    _ovLayer.selectedSegmentIndex = 0;
-    [_ovLayer addTarget:self action:@selector(ovLayerChanged) forControlEvents:UIControlEventValueChanged];
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:SIOCyanColor() control:_ovLayer] isLast:NO];
-    
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"显式动画额外倍率" icon:@"layers.fill" iconColor:SIOCyanColor() control:_ovLayer] isLast:NO];
+
+    _ovFloor = [[UISegmentedControl alloc] initWithItems:@[ @"0.005", @"0.01", @"0.02", @"0.05" ]];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"时长下限" icon:@"timer" iconColor:[UIColor systemOrangeColor] control:_ovFloor] isLast:NO];
+
+    _ovTrans = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×1.5", @"×2", @"×3" ]];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"转场额外倍率" icon:@"rectangle.on.rectangle" iconColor:[UIColor systemIndigoColor] control:_ovTrans] isLast:NO];
+
+    _ovSpring = [[UISwitch alloc] init]; _ovSpring.on = YES;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"弹簧参数缩放" icon:@"circle.hexagongrid.fill" iconColor:[UIColor systemPurpleColor] control:_ovSpring] isLast:NO];
+    _ovExtra = [[UISwitch alloc] init]; _ovExtra.on = YES;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"进阶转场" icon:@"rectangle.on.rectangle" iconColor:[UIColor systemIndigoColor] control:_ovExtra] isLast:NO];
+    _ovList = [[UISwitch alloc] init]; _ovList.on = NO; _ovList.onTintColor = [UIColor systemRedColor];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"列表加速（高危）" icon:@"list.bullet" iconColor:[UIColor systemRedColor] control:_ovList] isLast:NO];
+    _ovZoom = [[UISwitch alloc] init]; _ovZoom.on = NO;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画加速" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_ovZoom] isLast:NO];
+    _ovFastScroll = [[UISwitch alloc] init]; _ovFastScroll.on = NO;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"滑行惯性加急" icon:@"hand.swipe.left.fill" iconColor:[UIColor systemOrangeColor] control:_ovFastScroll] isLast:NO];
+    _ovFastTap = [[UISwitch alloc] init]; _ovFastTap.on = NO;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"点击零延迟" icon:@"hand.tap.fill" iconColor:[UIColor systemPinkColor] control:_ovFastTap] isLast:NO];
+    _ovLongPress = [[UISwitch alloc] init]; _ovLongPress.on = NO;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"长按手势加速" icon:@"hand.point.up.left.fill" iconColor:[UIColor systemTealColor] control:_ovLongPress] isLast:NO];
+
+    _ovLongPressDur = [[UISegmentedControl alloc] initWithItems:@[ @"0.20s", @"0.30s", @"0.40s" ]];
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"专属长按时长" icon:@"timer" iconColor:[UIColor systemTealColor] control:_ovLongPressDur] isLast:NO];
+
     _ovGuard = [self label:@"" size:12 dim:YES];
     _ovGuard.textColor = [UIColor systemRedColor];
     _ovGuard.numberOfLines = 0;
-    UIView *ovGuardRow = [[UIView alloc] init];
-    ovGuardRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [ovGuardRow addSubview:_ovGuard];
-    [NSLayoutConstraint activateConstraints:@[
-        [_ovGuard.topAnchor constraintEqualToAnchor:ovGuardRow.topAnchor constant:8],
-        [_ovGuard.leadingAnchor constraintEqualToAnchor:ovGuardRow.leadingAnchor constant:16],
-        [_ovGuard.trailingAnchor constraintEqualToAnchor:ovGuardRow.trailingAnchor constant:-16],
-        [_ovGuard.bottomAnchor constraintEqualToAnchor:ovGuardRow.bottomAnchor constant:-8],
-    ]];
-    [card7 addRow:ovGuardRow isLast:YES];
-    
-    [mainStack addArrangedSubview:card7];
-    
-    // Section 8: 黑名单
-    [mainStack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"黑名单" subtitle:@"每行一个 Bundle ID，不加速这些 App"]];
-    SIOCardView *card8 = [[SIOCardView alloc] init];
-    
-    _blacklist = [[UITextView alloc] init];
-    _blacklist.translatesAutoresizingMaskIntoConstraints = NO;   // 必须设 NO，否则 autoresizing mask 与高度/四边约束冲突，文本域被压成 0 高度
-    _blacklist.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
-    _blacklist.layer.borderColor = [UIColor separatorColor].CGColor;
-    _blacklist.layer.borderWidth = 0.5;
-    _blacklist.layer.cornerRadius = 8;
-    _blacklist.text = [cfg[@"Blacklist"] componentsJoinedByString:@"\n"];
-    [_blacklist.heightAnchor constraintEqualToConstant:80].active = YES;
+    [c1 addRow:[self hintRow:_ovGuard] isLast:YES];
+    [stack addArrangedSubview:c1];
 
-    UIView *blRow = [[UIView alloc] init];
-    blRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [blRow addSubview:_blacklist];
+    // 配置导入/导出
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"配置导入/导出（JSON，经剪贴板）" subtitle:nil]];
+    UIStackView *ioRow = [[UIStackView alloc] init];
+    ioRow.axis = UILayoutConstraintAxisHorizontal;
+    ioRow.spacing = 12;
+    ioRow.distribution = UIStackViewDistributionFillEqually;
+    UIButton *exportBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [exportBtn setTitle:@"导出配置到剪贴板" forState:UIControlStateNormal];
+    exportBtn.backgroundColor = [UIColor systemBlueColor];
+    [exportBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    exportBtn.layer.cornerRadius = 12;
+    exportBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [exportBtn.heightAnchor constraintEqualToConstant:44].active = YES;
+    [exportBtn addTarget:self action:@selector(onExport) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *importBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [importBtn setTitle:@"从剪贴板导入并保存" forState:UIControlStateNormal];
+    importBtn.backgroundColor = SIOMintColor();
+    [importBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    importBtn.layer.cornerRadius = 12;
+    importBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [importBtn.heightAnchor constraintEqualToConstant:44].active = YES;
+    [importBtn addTarget:self action:@selector(onImport) forControlEvents:UIControlEventTouchUpInside];
+    [ioRow addArrangedSubview:exportBtn];
+    [ioRow addArrangedSubview:importBtn];
+    [stack addArrangedSubview:ioRow];
+
+    // 注入/环境自检
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"注入/环境自检" subtitle:nil]];
+    SIOCardView *c2 = [[SIOCardView alloc] init];
+    UIButton *recheck = [UIButton buttonWithType:UIButtonTypeSystem];
+    [recheck setTitle:@"🔍 重新检测" forState:UIControlStateNormal];
+    [recheck addTarget:self action:@selector(onSelfCheck) forControlEvents:UIControlEventTouchUpInside];
+    UIView *recheckRow = [[UIView alloc] init];
+    recheckRow.translatesAutoresizingMaskIntoConstraints = NO;
+    [recheckRow addSubview:recheck];
+    recheck.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[
-        [_blacklist.topAnchor constraintEqualToAnchor:blRow.topAnchor constant:12],
-        [_blacklist.leadingAnchor constraintEqualToAnchor:blRow.leadingAnchor constant:16],
-        [_blacklist.trailingAnchor constraintEqualToAnchor:blRow.trailingAnchor constant:-16],
-        [_blacklist.bottomAnchor constraintEqualToAnchor:blRow.bottomAnchor constant:-12],
+        [recheck.topAnchor constraintEqualToAnchor:recheckRow.topAnchor constant:10],
+        [recheck.centerXAnchor constraintEqualToAnchor:recheckRow.centerXAnchor],
+        [recheck.bottomAnchor constraintEqualToAnchor:recheckRow.bottomAnchor constant:-10],
     ]];
-    [card8 addRow:blRow isLast:YES];
-    
-    [mainStack addArrangedSubview:card8];
-    
-    // Buttons
-    UIButton *save = [UIButton buttonWithType:UIButtonTypeSystem];
-    [save setTitle:@"保存配置" forState:UIControlStateNormal];
-    save.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    save.backgroundColor = [UIColor systemBlueColor];
-    [save setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    save.layer.cornerRadius = 14;
-    save.translatesAutoresizingMaskIntoConstraints = NO;
-    [save.heightAnchor constraintEqualToConstant:50].active = YES;
-    [save addTarget:self action:@selector(onSave) forControlEvents:UIControlEventTouchUpInside];
-    [mainStack addArrangedSubview:save];
-    
-    UIStackView *btnRow = [[UIStackView alloc] init];
-    btnRow.axis = UILayoutConstraintAxisHorizontal;
-    btnRow.spacing = 12;
-    btnRow.distribution = UIStackViewDistributionFillEqually;
-    
+    [c2 addRow:recheckRow isLast:NO];
+    _selfCheck = [self label:@"" size:12 dim:YES];
+    _selfCheck.numberOfLines = 0;
+    [c2 addRow:[self hintRow:_selfCheck] isLast:YES];
+    [stack addArrangedSubview:c2];
+    [self onSelfCheck];
+
+    // 电源操作
+    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"电源操作（会先自动保存）" subtitle:nil]];
     UIButton *rs = [UIButton buttonWithType:UIButtonTypeSystem];
-    [rs setTitle:@"注销" forState:UIControlStateNormal];
-    rs.layer.cornerRadius = 12;
-    rs.layer.borderWidth = 1;
-    rs.layer.borderColor = [UIColor systemBlueColor].CGColor;
-    rs.translatesAutoresizingMaskIntoConstraints = NO;
-    [rs.heightAnchor constraintEqualToConstant:44].active = YES;
+    [rs setTitle:@"🔄 注销 SpringBoard" forState:UIControlStateNormal];
+    rs.backgroundColor = [UIColor systemBlueColor];
+    [rs setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    rs.layer.cornerRadius = 14;
+    rs.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [rs.heightAnchor constraintEqualToConstant:50].active = YES;
     [rs addTarget:self action:@selector(onRespring) forControlEvents:UIControlEventTouchUpInside];
-    
+    [stack addArrangedSubview:rs];
+
     UIButton *rb = [UIButton buttonWithType:UIButtonTypeSystem];
-    [rb setTitle:@"重启" forState:UIControlStateNormal];
-    [rb setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
-    rb.layer.cornerRadius = 12;
-    rb.layer.borderWidth = 1;
-    rb.layer.borderColor = [UIColor systemRedColor].CGColor;
-    rb.translatesAutoresizingMaskIntoConstraints = NO;
-    [rb.heightAnchor constraintEqualToConstant:44].active = YES;
+    [rb setTitle:@"⚠️ 硬重启设备" forState:UIControlStateNormal];
+    rb.backgroundColor = [UIColor systemRedColor];
+    [rb setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    rb.layer.cornerRadius = 14;
+    rb.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [rb.heightAnchor constraintEqualToConstant:50].active = YES;
     [rb addTarget:self action:@selector(onReboot) forControlEvents:UIControlEventTouchUpInside];
-    
-    [btnRow addArrangedSubview:rs];
-    [btnRow addArrangedSubview:rb];
-    [mainStack addArrangedSubview:btnRow];
-    
-    _status = [[UILabel alloc] init];
-    _status.font = [UIFont systemFontOfSize:13];
-    _status.textColor = [UIColor secondaryLabelColor];
-    _status.textAlignment = NSTextAlignmentCenter;
-    _status.numberOfLines = 0;
-    [mainStack addArrangedSubview:_status];
-    
-    [NSLayoutConstraint activateConstraints:@[
-        [scroll.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
-        [scroll.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
-        [scroll.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
-        [scroll.bottomAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.bottomAnchor],
-        [mainStack.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor constant:16],
-        [mainStack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-20],
-        [mainStack.leadingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.leadingAnchor constant:16],
-        [mainStack.trailingAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.trailingAnchor constant:-16],
-        [mainStack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32],
-    ]];
-    
-    [self modeChanged];
-    [self updateLayerLabel];
+    [stack addArrangedSubview:rb];
+
     [self ovBundleChanged];
     [self ovToggled];
     [self ovModeChanged];
 }
 
-- (UILabel *)label:(NSString *)t size:(CGFloat)s dim:(BOOL)dim {
-    UILabel *l = [[UILabel alloc] init];
-    l.text = t;
-    l.font = [UIFont systemFontOfSize:s];
-    l.textColor = dim ? [UIColor secondaryLabelColor] : [UIColor labelColor];
-    l.numberOfLines = 0;
-    return l;
-}
+#pragma mark - 引擎 handlers
 
 - (void)modeChanged {
     int m = (int)_segMode.selectedSegmentIndex;
@@ -881,41 +1038,52 @@ static int LayerIndexForBoost(double b) {
     _sliderSlowLabel.text = [NSString stringWithFormat:@"×%.1f", _sliderSlow.value];
 }
 
-- (void)layerChanged {
-    [self updateLayerLabel];
+- (void)floorChanged { [self updateFloorHint]; }
+- (void)updateFloorHint {
+    double v = FloorForIndex((int)_segFloor.selectedSegmentIndex);
+    _floorHint.text = [NSString stringWithFormat:@"所有动画的时长下限：%.3gs。追求极致选 0.005s（风险自担）；遇到卡顿/回调异常请调回 0.01s 或更高。瞬切模式也使用该下限。", v];
 }
 
-- (void)updateLayerLabel {
+- (void)layerChanged { [self updateLayerHint]; }
+- (void)updateLayerHint {
     int idx = (int)_segLayer.selectedSegmentIndex;
     if (idx == 0) {
-        _layerLabel.text = @"×1：不额外加速，显式动画按全局倍率缩放";
+        _layerHint.text = @"×1：不额外加速，显式动画按全局倍率缩放";
     } else {
-        _layerLabel.text = [NSString stringWithFormat:@"×%d：转圈/进度/旋转等 CAAnimation 额外加速，不影响块动画", (int)LayerBoostForIndex(idx)];
+        _layerHint.text = [NSString stringWithFormat:@"转圆/进度/旋转/地图相机等显式动画在全局倍率上再 ×%g。不影响 UIView 块动画与转场；慢放不叠加；受下限保护。", LayerBoostForIndex(idx)];
     }
 }
 
-- (void)dragChanged {
-    [self updateDragLabel];
+- (void)transChanged { [self updateTransHint]; }
+- (void)updateTransHint {
+    int idx = (int)_segTrans.selectedSegmentIndex;
+    if (idx == 0) {
+        _transHint.text = @"×1 = 不额外加速。push/pop/模态弹窗按全局倍率缩放。";
+    } else {
+        _transHint.text = [NSString stringWithFormat:@"转场在全局倍率基础上再 ×%g。仅影响导航 push/pop、模态 present/dismiss 等转场动画。", TransitionBoostForIndex(idx)];
+    }
 }
 
-- (void)updateDragLabel {
+- (void)dragChanged { [self updateDragHint]; }
+- (void)updateDragHint {
     int idx = (int)_segDrag.selectedSegmentIndex;
     double coeff = DragCoeffForIndex(idx);
     if (idx == 0) {
-        _dragLabel.text = @"未启用。要全系统加速请选 ×5 / ×10 / ×20；不建议与 dylib 加速同时开到最大（两个机制会叠加）。";
+        _dragHint.text = @"未启用。选 ×5 / ×10 / ×20 可全系统加速，不建议与 dylib 加速同时拉满（两机制叠加）。";
     } else if (idx == 4) {
-        _dragLabel.text = [NSString stringWithFormat:@"⚠️ 极端档（写入 %.4f）：所有 UIKit 动画时长≈归零，等于全系统无动画。它会绕过 dylib 的 0.01s 安全下限，可能触发\"动画完成回调配对错乱\"类故障（例如微信图片预览卡死），并且会与 dylib 加速叠加。只在明确知道代价时使用。", coeff];
+        _dragHint.text = [NSString stringWithFormat:@"⚠️ 极端档（写入 %.4f）：所有 UIKit 动画时长≈归零，会绕过 dylib 下限，可能触发回调配对错乱（如微信图片预览卡死）。", coeff];
     } else {
-        _dragLabel.text = [NSString stringWithFormat:@"当前已启用 %.2f（≈×%d，全系统生效，需注销/重启目标 App）。", coeff, DragMultiplierForCoeff(coeff)];
+        _dragHint.text = [NSString stringWithFormat:@"当前已启用 %.2f（≈×%d，全系统生效，需注销/重启目标 App）。", coeff, DragMultiplierForCoeff(coeff)];
     }
 }
+
+#pragma mark - 高级 overrides handlers
 
 - (void)ovBundleChanged {
     NSString *bid = _ovBundle.text ?: @"";
     NSDictionary *cfg = ReadConfig();
     NSDictionary *ovAll = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]] ? cfg[@"AppOverrides"] : @{};
     NSDictionary *mine = [ovAll[bid] isKindOfClass:[NSDictionary class]] ? ovAll[bid] : nil;
-    
     if (mine) {
         _ovOn.on = [mine[@"Enabled"] boolValue];
         _ovMode.selectedSegmentIndex = [mine[@"Mode"] intValue];
@@ -927,20 +1095,21 @@ static int LayerIndexForBoost(double b) {
         _ovZoom.on = [mine[@"ZoomAccel"] boolValue];
         _ovFastScroll.on = [mine[@"FastScroll"] boolValue];
         _ovFastTap.on = [mine[@"FastTap"] boolValue];
+        _ovLongPress.on = [mine[@"LongPress"] boolValue];
         _ovLayer.selectedSegmentIndex = LayerIndexForBoost([mine[@"LayerBoost"] doubleValue]);
+        _ovFloor.selectedSegmentIndex = FloorIndexForValue([mine[@"Floor"] doubleValue]);
+        _ovTrans.selectedSegmentIndex = TransitionBoostIndexForValue([mine[@"TransitionBoost"] doubleValue]);
+        _ovLongPressDur.selectedSegmentIndex = LongPressDurationIndexForValue([mine[@"LongPressDuration"] doubleValue]);
     }
-    
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     if (guarded) {
-        _ovGuard.text = [NSString stringWithFormat:@"⚠️ %@ 在硬保护名单内：列表加速恒为关闭，配置界面无法打开（该 App 的列表状态机与 TV/CV hook 冲突，打开会卡死/崩溃）", bid];
+        _ovGuard.text = [NSString stringWithFormat:@"⚠️ %@ 在列表 hook 硬保护名单：列表加速恒关，无法打开（dylib 启动时 listGuard=1）。其余 hook 正常加速。", bid];
         _ovList.on = NO;
         _ovList.enabled = NO;
     } else {
         _ovGuard.text = @"";
         _ovList.enabled = YES;
     }
-
-    // 切换 Bundle ID 后按当前「启用专属配置」开关同步控件可用状态
     [self ovToggled];
     [self ovModeChanged];
 }
@@ -950,7 +1119,6 @@ static int LayerIndexForBoost(double b) {
 }
 
 - (void)ovModeChanged {
-    // 与全局 modeChanged 一致：加速(0) 才需要倍率滑块；慢放(1)/瞬切(2) 时禁用并置灰
     int m = (int)_ovMode.selectedSegmentIndex;
     BOOL accel = (m == 0);
     _ovSpeed.enabled = accel;
@@ -958,79 +1126,87 @@ static int LayerIndexForBoost(double b) {
     _ovSpeedLabel.alpha = accel ? 1.0 : 0.4;
 }
 
-- (void)ovLayerChanged {
-    // 显式动画倍率在保存时读取 selectedSegmentIndex，无需实时回调
-}
-
 - (void)ovToggled {
-    // 关闭「启用专属配置」时，所有专属控件置灰不可操作（但保留当前值，保存时仍写入）
     BOOL on = _ovOn.on;
     NSArray *ovControls = @[ _ovMode, _ovSpeed, _ovSpring, _ovExtra,
-                             _ovList, _ovZoom, _ovFastScroll, _ovFastTap, _ovLayer ];
+                             _ovList, _ovZoom, _ovFastScroll, _ovFastTap,
+                             _ovLongPress, _ovLayer, _ovFloor, _ovTrans, _ovLongPressDur ];
     for (UIControl *c in ovControls) {
         c.enabled = on;
         c.alpha = on ? 1.0 : 0.4;
     }
-    // 硬保护名单的列表加速始终禁用
     if ([HardGuardBundles() containsObject:_ovBundle.text ?: @""]) {
         _ovList.enabled = NO;
     }
 }
 
+#pragma mark - 保存 / 电源
+
 - (void)onSave {
     NSMutableDictionary *cfg = ReadConfig();
-    cfg[@"Enabled"] = @(_swEnabled.on);
-    cfg[@"Mode"] = @((int)_segMode.selectedSegmentIndex);
-    cfg[@"Speed"] = @((double)_slider.value);
-    cfg[@"SlowFactor"] = @((double)_sliderSlow.value);
-    cfg[@"Spring"] = @(_swSpring.on);
-    cfg[@"Extra"] = @(_swExtra.on);
-    cfg[@"ListAccel"] = @(_swList.on);
-    cfg[@"ZoomAccel"] = @(_swZoom.on);
-    cfg[@"FastScroll"] = @(_swFastScroll.on);
-    cfg[@"FastTap"] = @(_swFastTap.on);
-    cfg[@"LayerBoost"] = @(LayerBoostForIndex((int)_segLayer.selectedSegmentIndex));
-    cfg[@"FUBGEnabled"] = @(_swFUBG.on);
-    cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on);
-    cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on);
-    cfg[@"FUBGFloatingBall"] = @(_swFUBGBall.on);
-    
-    NSMutableArray *bl = [NSMutableArray array];
-    for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:
-            [NSCharacterSet newlineCharacterSet]]) {
-        NSString *t = [line stringByTrimmingCharactersInSet:
-            [NSCharacterSet whitespaceCharacterSet]];
-        if (t.length) [bl addObject:t];
+    // 引擎 tab
+    if (_swEnabled) { cfg[@"Enabled"] = @(_swEnabled.on); }
+    if (_segMode) { cfg[@"Mode"] = @((int)_segMode.selectedSegmentIndex); }
+    if (_slider) { cfg[@"Speed"] = @((double)_slider.value); }
+    if (_sliderSlow) { cfg[@"SlowFactor"] = @((double)_sliderSlow.value); }
+    if (_segFloor) { cfg[@"Floor"] = @(FloorForIndex((int)_segFloor.selectedSegmentIndex)); }
+    if (_segLayer) { cfg[@"LayerBoost"] = @(LayerBoostForIndex((int)_segLayer.selectedSegmentIndex)); }
+    if (_segTrans) { cfg[@"TransitionBoost"] = @(TransitionBoostForIndex((int)_segTrans.selectedSegmentIndex)); }
+    // 手感 tab
+    if (_swFastScroll) { cfg[@"FastScroll"] = @(_swFastScroll.on); }
+    if (_swFastTap) { cfg[@"FastTap"] = @(_swFastTap.on); }
+    if (_swLongPress) { cfg[@"LongPress"] = @(_swLongPress.on); }
+    if (_segLongPress) { cfg[@"LongPressDuration"] = @(LongPressDurationForIndex((int)_segLongPress.selectedSegmentIndex)); }
+    if (_swZoom) { cfg[@"ZoomAccel"] = @(_swZoom.on); }
+    if (_swList) { cfg[@"ListAccel"] = @(_swList.on); }
+    if (_swNotify) { cfg[@"Notify"] = @(_swNotify.on); }
+    // 系统 tab
+    if (_swFUBG) { cfg[@"FUBGEnabled"] = @(_swFUBG.on); }
+    if (_swFUBGScene) { cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on); }
+    if (_swFUBGAudio) { cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on); }
+    if (_swFUBGBall) { cfg[@"FUBGFloatingBall"] = @(_swFUBGBall.on); }
+    // 黑名单
+    if (_blacklist) {
+        NSMutableArray *bl = [NSMutableArray array];
+        for (NSString *line in [_blacklist.text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+            NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if (t.length) [bl addObject:t];
+        }
+        cfg[@"Blacklist"] = bl;
     }
-    cfg[@"Blacklist"] = bl;
-    
     // App 覆盖
-    NSString *bid = _ovBundle.text ?: @"";
-    if (bid.length && _ovOn.on) {
-        NSMutableDictionary *ovAll = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]]
-                                     ? [cfg[@"AppOverrides"] mutableCopy] : [NSMutableDictionary dictionary];
-        NSMutableDictionary *mine = [ovAll[bid] isKindOfClass:[NSDictionary class]]
-                                    ? [ovAll[bid] mutableCopy] : [NSMutableDictionary dictionary];
-        mine[@"Enabled"] = @(_ovOn.on);
-        mine[@"Mode"] = @((int)_ovMode.selectedSegmentIndex);
-        mine[@"Speed"] = @((double)_ovSpeed.value);
-        mine[@"Spring"] = @(_ovSpring.on);
-        mine[@"Extra"] = @(_ovExtra.on);
-        mine[@"ListAccel"] = @(_ovList.on);
-        mine[@"ZoomAccel"] = @(_ovZoom.on);
-        mine[@"FastScroll"] = @(_ovFastScroll.on);
-        mine[@"FastTap"] = @(_ovFastTap.on);
-        mine[@"LayerBoost"] = @(LayerBoostForIndex((int)_ovLayer.selectedSegmentIndex));
-        ovAll[bid] = mine;
-        cfg[@"AppOverrides"] = ovAll;
+    if (_ovBundle) {
+        NSString *bid = _ovBundle.text ?: @"";
+        if (bid.length && _ovOn.on) {
+            NSMutableDictionary *ovAll = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]]
+                                         ? [cfg[@"AppOverrides"] mutableCopy] : [NSMutableDictionary dictionary];
+            NSMutableDictionary *mine = [ovAll[bid] isKindOfClass:[NSDictionary class]]
+                                        ? [ovAll[bid] mutableCopy] : [NSMutableDictionary dictionary];
+            mine[@"Enabled"] = @(_ovOn.on);
+            mine[@"Mode"] = @((int)_ovMode.selectedSegmentIndex);
+            mine[@"Speed"] = @((double)_ovSpeed.value);
+            mine[@"Spring"] = @(_ovSpring.on);
+            mine[@"Extra"] = @(_ovExtra.on);
+            mine[@"ListAccel"] = @(_ovList.on);
+            mine[@"ZoomAccel"] = @(_ovZoom.on);
+            mine[@"FastScroll"] = @(_ovFastScroll.on);
+            mine[@"FastTap"] = @(_ovFastTap.on);
+            mine[@"LongPress"] = @(_ovLongPress.on);
+            mine[@"LongPressDuration"] = @(LongPressDurationForIndex((int)_ovLongPressDur.selectedSegmentIndex));
+            mine[@"LayerBoost"] = @(LayerBoostForIndex((int)_ovLayer.selectedSegmentIndex));
+            mine[@"Floor"] = @(FloorForIndex((int)_ovFloor.selectedSegmentIndex));
+            mine[@"TransitionBoost"] = @(TransitionBoostForIndex((int)_ovTrans.selectedSegmentIndex));
+            ovAll[bid] = mine;
+            cfg[@"AppOverrides"] = ovAll;
+        }
     }
-    
+
     BOOL ok = WriteConfig(cfg);
-    WriteAx(@"ReduceMotionEnabled", _swRM.on);
-    WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
-    WriteAx(@"ReduceTransparencyEnabled", _swRT.on);
-    WriteUIKitDrag(DragCoeffForIndex((int)_segDrag.selectedSegmentIndex));
-    
+    if (_swRM) WriteAx(@"ReduceMotionEnabled", _swRM.on);
+    if (_swCF) WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
+    if (_swRT) WriteAx(@"ReduceTransparencyEnabled", _swRT.on);
+    if (_segDrag) WriteUIKitDrag(DragCoeffForIndex((int)_segDrag.selectedSegmentIndex));
+
     UINotificationFeedbackGenerator *fg = [[UINotificationFeedbackGenerator alloc] init];
     [fg prepare];
     if (ok) {
@@ -1050,6 +1226,82 @@ static int LayerIndexForBoost(double b) {
     }
 }
 
+- (void)onExport {
+    NSMutableDictionary *cfg = ReadConfig();
+    NSError *err;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:cfg options:NSJSONWritingPrettyPrinted error:&err];
+    if (!data) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"导出失败" message:err.localizedDescription preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    NSString *json = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+    [UIPasteboard generalPasteboard].string = json;
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"已导出" message:@"配置 JSON 已复制到剪贴板。" preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)onImport {
+    NSString *json = [UIPasteboard generalPasteboard].string;
+    if (!json.length) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"导入失败" message:@"剪贴板为空。" preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    NSError *err;
+    id obj = [NSJSONSerialization JSONObjectWithData:[json dataUsingEncoding:NSUTF8StringEncoding] options:0 error:&err];
+    if (![obj isKindOfClass:[NSDictionary class]]) {
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"导入失败" message:@"剪贴板内容不是合法配置 JSON。" preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+        return;
+    }
+    NSMutableDictionary *cfg = [(NSDictionary *)obj mutableCopy];
+    BOOL ok = WriteConfig(cfg);
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:(ok ? @"导入成功" : @"导入失败")
+                        message:(ok ? @"配置已写入，重启目标 App 生效。" : @"写入配置文件失败。")
+                        preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+- (void)onSelfCheck {
+    NSMutableDictionary *cfg = ReadConfig();
+    BOOL prefsOK = [[NSFileManager defaultManager] isWritableFileAtPath:PrefPath];
+    BOOL uikitOK = [[NSFileManager defaultManager] fileExistsAtPath:UIKitPath];
+    BOOL axOK = [[NSFileManager defaultManager] fileExistsAtPath:AxPath];
+    int mode = [cfg[@"Mode"] intValue];
+    double floor = [cfg[@"Floor"] doubleValue];
+    double layer = [cfg[@"LayerBoost"] doubleValue];
+    double trans = [cfg[@"TransitionBoost"] doubleValue];
+    BOOL fubg = [cfg[@"FUBGEnabled"] boolValue];
+    NSString *engine = [NSString stringWithFormat:@"已启用，瞬切（下限 %.3gs），显式×%g，转场×%g，%@弹簧，%@点按，%@长按",
+                        floor, layer, trans,
+                        [cfg[@"Spring"] boolValue] ? @"开" : @"关",
+                        [cfg[@"FastTap"] boolValue] ? @"开" : @"关",
+                        [cfg[@"LongPress"] boolValue] ? @"开" : @"关"];
+    if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
+    else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
+    _selfCheck.text = [NSString stringWithFormat:
+        @"SIOriginal 配置器 2.0.0 (build 43)\nBundle ID: com.local.sioriginal\n\n"
+        @"【权限/路径自检】\n"
+        @"/var/Managed Preferences/mobile 配置目录：%@\n"
+        @"UIKit.plist 存在：%@\n"
+        @"辅助功能目录可写：%@\n\n"
+        @"【当前引擎配置】\n%@\n"
+        @"保活：%@\n\n"
+        @"【注入方式提醒】\n"
+        @"本 App 只负责写配置并发 Darwin 热重载通知；动画引擎 SIOriginal.dylib 需用 TrollFools 注入目标 App。保存配置后，前台目标 App 顶部会出现 1.5 秒生效提示（可在「手感」页关闭）。",
+        prefsOK ? @"✅" : @"❌",
+        uikitOK ? @"✅" : @"❌",
+        axOK ? @"✅" : @"❌",
+        engine,
+        fubg ? @"开启" : @"关闭"];
+}
+
 - (void)onRespring {
     [self onSave];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
@@ -1064,23 +1316,49 @@ static int LayerIndexForBoost(double b) {
     [a addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *x) {
         [self onSave];
         NSString *way = SIOReboot();
-        _status.text = [NSString stringWithFormat:@"重启：%@", way];
+        _selfCheck.text = [NSString stringWithFormat:@"重启：%@", way];
     }]];
     [self presentViewController:a animated:YES completion:nil];
 }
 
 @end
 
-@interface SIOAppDelegate : UIResponder <UIApplicationDelegate>
+#pragma mark - App Delegate
+
+@interface SIOAppDelegate : UIResponder <UIApplicationDelegate, UITabBarControllerDelegate>
 @property (strong, nonatomic) UIWindow *window;
 @end
 
 @implementation SIOAppDelegate
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)opts {
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:[[SIOVC alloc] init]];
-    nav.navigationBar.prefersLargeTitles = YES;
-    self.window.rootViewController = nav;
+
+    SIOVC *engine = [[SIOVC alloc] initWithTab:SIOTabEngine];
+    SIOVC *feel   = [[SIOVC alloc] initWithTab:SIOTabFeel];
+    SIOVC *system = [[SIOVC alloc] initWithTab:SIOTabSystem];
+    SIOVC *adv    = [[SIOVC alloc] initWithTab:SIOTabAdvanced];
+
+    UINavigationController *n1 = [[UINavigationController alloc] initWithRootViewController:engine];
+    UINavigationController *n2 = [[UINavigationController alloc] initWithRootViewController:feel];
+    UINavigationController *n3 = [[UINavigationController alloc] initWithRootViewController:system];
+    UINavigationController *n4 = [[UINavigationController alloc] initWithRootViewController:adv];
+
+    n1.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"引擎" image:[UIImage systemImageNamed:@"bolt.fill"] selectedImage:nil];
+    n2.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"手感" image:[UIImage systemImageNamed:@"hand.tap.fill"] selectedImage:nil];
+    n3.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"系统" image:[UIImage systemImageNamed:@"gearshape.fill"] selectedImage:nil];
+    n4.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"高级" image:[UIImage systemImageNamed:@"wrench.fill"] selectedImage:nil];
+
+    UITabBarController *tab = [[UITabBarController alloc] init];
+    tab.viewControllers = @[n1, n2, n3, n4];
+    tab.delegate = self;
+
+    // 全局保存按钮
+    for (UINavigationController *nav in @[n1, n2, n3, n4]) {
+        nav.topViewController.navigationItem.rightBarButtonItem =
+            [[UIBarButtonItem alloc] initWithTitle:@"保存" style:UIBarButtonItemStyleDone target:nav.topViewController action:@selector(onSave)];
+    }
+
+    self.window.rootViewController = tab;
     [self.window makeKeyAndVisible];
     return YES;
 }
