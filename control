@@ -1,8 +1,8 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 1.8.18
-Architecture: iphoneos-arm
-Description: 动画加速 Tweak v1.8.18：系统级增强（UIRefreshControl/UINavigationBar 大标题/UIPageViewController/UIDocumentInteractionController hook）；显式动画额外倍率 LayerBoost（转圈/进度/旋转单独加速）；CAAnimation 幂等缩放标记（修双重缩放）；App 级配置覆盖；列表 hook 硬保护名单；微信预览放大态守卫；真后台保活引擎；纯 runtime 无 substrate，TrollFools 可注入
+Version: 1.8.19
+Architecture: iphoneos-arm64
+Description: 动画加速 Tweak v1.8.19：修复注入后目标 App 启动闪退（dylib 改为无 entitlement ad-hoc 签名 + @rpath install_name）；修复弹簧动画 hook 参数错位（漏 delay）；修正 UIRefreshControl/UINavigationItem/UIPageViewController 三处错误选择器与 ABI；修复 swizzle 继承方法污染父类；CI 修复 Release 403 并补全 IPA CodeResources；显式动画 LayerBoost；App 级覆盖；真后台保活；纯 runtime 无 substrate，TrollFools 可注入
 Maintainer: local
 Author: local
 Section: Tweaks
