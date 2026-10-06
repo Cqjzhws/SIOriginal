@@ -38,10 +38,12 @@ static UIColor *SIOMintColor(void) {
     return [UIColor colorWithRed:0.0 green:0.72 blue:0.65 alpha:1.0];
 }
 
+// 列表 hook 硬保护名单（配置 App 侧）。命中则列表加速开关强制关闭并提示。
+// v1.8.19：移除 com.sfic.knight（顺丰同城骑士），改由用户黑名单/覆盖自行控制。
 static NSArray *HardGuardBundles(void) {
     static NSArray *a;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ a = @[ @"com.sfic.knight" ]; });
+    dispatch_once(&once, ^{ a = @[]; });
     return a;
 }
 
@@ -702,6 +704,7 @@ static int LayerIndexForBoost(double b) {
     
     _ovMode = [[UISegmentedControl alloc] initWithItems:@[ @"加速", @"慢放", @"瞬切" ]];
     _ovMode.selectedSegmentIndex = 0;
+    [_ovMode addTarget:self action:@selector(ovModeChanged) forControlEvents:UIControlEventValueChanged];
     [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"专属模式" icon:@"gearshape.fill" iconColor:[UIColor systemBlueColor] control:_ovMode] isLast:NO];
     
     _ovSpeedLabel = [self label:@"×5.0" size:15 dim:YES];
@@ -741,6 +744,7 @@ static int LayerIndexForBoost(double b) {
     
     _ovLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
     _ovLayer.selectedSegmentIndex = 0;
+    [_ovLayer addTarget:self action:@selector(ovLayerChanged) forControlEvents:UIControlEventValueChanged];
     [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:SIOCyanColor() control:_ovLayer] isLast:NO];
     
     _ovGuard = [self label:@"" size:12 dim:YES];
@@ -847,6 +851,8 @@ static int LayerIndexForBoost(double b) {
     [self modeChanged];
     [self updateLayerLabel];
     [self ovBundleChanged];
+    [self ovToggled];
+    [self ovModeChanged];
 }
 
 - (UILabel *)label:(NSString *)t size:(CGFloat)s dim:(BOOL)dim {
@@ -932,14 +938,42 @@ static int LayerIndexForBoost(double b) {
         _ovGuard.text = @"";
         _ovList.enabled = YES;
     }
+
+    // 切换 Bundle ID 后按当前「启用专属配置」开关同步控件可用状态
+    [self ovToggled];
+    [self ovModeChanged];
 }
 
 - (void)ovSliderChanged {
     _ovSpeedLabel.text = [NSString stringWithFormat:@"×%.1f", _ovSpeed.value];
 }
 
+- (void)ovModeChanged {
+    // 与全局 modeChanged 一致：加速(0) 才需要倍率滑块；慢放(1)/瞬切(2) 时禁用并置灰
+    int m = (int)_ovMode.selectedSegmentIndex;
+    BOOL accel = (m == 0);
+    _ovSpeed.enabled = accel;
+    _ovSpeed.alpha = accel ? 1.0 : 0.4;
+    _ovSpeedLabel.alpha = accel ? 1.0 : 0.4;
+}
+
+- (void)ovLayerChanged {
+    // 显式动画倍率在保存时读取 selectedSegmentIndex，无需实时回调
+}
+
 - (void)ovToggled {
-    // 只刷新提示文案，绝不回读 plist
+    // 关闭「启用专属配置」时，所有专属控件置灰不可操作（但保留当前值，保存时仍写入）
+    BOOL on = _ovOn.on;
+    NSArray *ovControls = @[ _ovMode, _ovSpeed, _ovSpring, _ovExtra,
+                             _ovList, _ovZoom, _ovFastScroll, _ovFastTap, _ovLayer ];
+    for (UIControl *c in ovControls) {
+        c.enabled = on;
+        c.alpha = on ? 1.0 : 0.4;
+    }
+    // 硬保护名单的列表加速始终禁用
+    if ([HardGuardBundles() containsObject:_ovBundle.text ?: @""]) {
+        _ovList.enabled = NO;
+    }
 }
 
 - (void)onSave {
