@@ -804,6 +804,31 @@ static NSTimeInterval (*o_CATransaction_getDur)(id, SEL);
 static void   (*o_indicator_start)(id, SEL);
 // v2.0.5：下拉刷新转圈加强（UIRefreshControl didMoveToWindow）
 static void   (*o_refresh_didMove)(id, SEL);
+// v2.0.6：控件 / 导航栏 / 工具栏 / 单元格 全路径覆盖
+static void   (*o_switch_setOn)(id, SEL, BOOL, BOOL);
+static void   (*o_slider_setValue)(id, SEL, float, BOOL);
+static void   (*o_progress_setProgress)(id, SEL, float, BOOL);
+static void   (*o_picker_selectRow)(id, SEL, NSInteger, NSInteger, BOOL);
+static void   (*o_datePicker_setDate)(id, SEL, id, BOOL);
+static void   (*o_segmented_setIndex)(id, SEL, NSInteger);
+static void   (*o_pageControl_setPage)(id, SEL, NSInteger);
+static void   (*o_effectView_setEffect)(id, SEL, id);
+static void   (*o_control_setHighlighted)(id, SEL, BOOL);
+static void   (*o_control_setSelected)(id, SEL, BOOL);
+static void   (*o_navBar_pushItem)(id, SEL, id, BOOL);
+static id     (*o_navBar_popItem)(id, SEL, BOOL);
+static void   (*o_navBar_setItems)(id, SEL, NSArray *, BOOL);
+static void   (*o_toolbar_setItems)(id, SEL, NSArray *, BOOL);
+static void   (*o_tabBar_setItem)(id, SEL, id);
+static void   (*o_nav_setBarHidden)(id, SEL, BOOL, BOOL);
+static void   (*o_nav_setToolbarHidden)(id, SEL, BOOL, BOOL);
+static void   (*o_tvCell_setSelected)(id, SEL, BOOL, BOOL);
+static void   (*o_tvCell_setHighlighted)(id, SEL, BOOL, BOOL);
+static void   (*o_cvCell_setSelected)(id, SEL, BOOL);
+static void   (*o_cvCell_setHighlighted)(id, SEL, BOOL);
+static void   (*o_cv_batchUpdates)(id, SEL, void (^)(void), void (^)(BOOL));
+static void   (*o_cv_setLayout)(id, SEL, id, BOOL);
+static void   (*o_cv_setLayoutComp)(id, SEL, id, BOOL, void (^)(BOOL));
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
@@ -1359,6 +1384,170 @@ static void sio_refresh_didMove(id self, SEL _cmd) {
     [CATransaction commit];
 }
 
+#pragma mark - v2.0.6 控件 / 栏 / 单元格 全路径覆盖
+
+// ---- 通用控件（纯外观动画，仅受全局开关/黑名单门控）----
+// UISwitch 开关滑动、UISlider 滑块动画、UIProgressView 进度条动画
+static void sio_switch_setOn(id self, SEL _cmd, BOOL on, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_switch_setOn);
+    if (SIO_blocked() || !animated) { o_switch_setOn(self, _cmd, on, animated); return; }
+    SIO_listWrap(^{ o_switch_setOn(self, _cmd, on, animated); });
+}
+static void sio_slider_setValue(id self, SEL _cmd, float v, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_slider_setValue);
+    if (SIO_blocked() || !animated) { o_slider_setValue(self, _cmd, v, animated); return; }
+    SIO_listWrap(^{ o_slider_setValue(self, _cmd, v, animated); });
+}
+static void sio_progress_setProgress(id self, SEL _cmd, float p, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_progress_setProgress);
+    if (SIO_blocked() || !animated) { o_progress_setProgress(self, _cmd, p, animated); return; }
+    SIO_listWrap(^{ o_progress_setProgress(self, _cmd, p, animated); });
+}
+// UIPickerView 滚轮选行动画（系统默认 ~0.6s，列表/表单页体感明显）
+static void sio_picker_selectRow(id self, SEL _cmd, NSInteger row, NSInteger comp, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_picker_selectRow);
+    if (SIO_blocked() || !animated) { o_picker_selectRow(self, _cmd, row, comp, animated); return; }
+    SIO_listWrap(^{ o_picker_selectRow(self, _cmd, row, comp, animated); });
+}
+// UIDatePicker 滚轮/日历切日期动画
+static void sio_datePicker_setDate(id self, SEL _cmd, id date, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_datePicker_setDate);
+    if (SIO_blocked() || !animated) { o_datePicker_setDate(self, _cmd, date, animated); return; }
+    SIO_listWrap(^{ o_datePicker_setDate(self, _cmd, date, animated); });
+}
+// UISegmentedControl 选中滑块平移（iOS 13+ 内部动画）
+static void sio_segmented_setIndex(id self, SEL _cmd, NSInteger idx) {
+    SIO_REQUIRE_ORIG(o_segmented_setIndex);
+    if (SIO_blocked()) { o_segmented_setIndex(self, _cmd, idx); return; }
+    SIO_listWrap(^{ o_segmented_setIndex(self, _cmd, idx); });
+}
+// UIPageControl 圆点切换动画
+static void sio_pageControl_setPage(id self, SEL _cmd, NSInteger page) {
+    SIO_REQUIRE_ORIG(o_pageControl_setPage);
+    if (SIO_blocked()) { o_pageControl_setPage(self, _cmd, page); return; }
+    SIO_listWrap(^{ o_pageControl_setPage(self, _cmd, page); });
+}
+// UIVisualEffectView 毛玻璃过渡（setEffect: 内部做模糊半径动画）
+static void sio_effectView_setEffect(id self, SEL _cmd, id effect) {
+    SIO_REQUIRE_ORIG(o_effectView_setEffect);
+    if (SIO_blocked()) { o_effectView_setEffect(self, _cmd, effect); return; }
+    SIO_listWrap(^{ o_effectView_setEffect(self, _cmd, effect); });
+}
+// UIControl 高亮/选中淡入淡出（按钮按压反馈，基类 hook 覆盖 UIButton 等子类）
+static void sio_control_setHighlighted(id self, SEL _cmd, BOOL hl) {
+    SIO_REQUIRE_ORIG(o_control_setHighlighted);
+    if (SIO_blocked()) { o_control_setHighlighted(self, _cmd, hl); return; }
+    SIO_listWrap(^{ o_control_setHighlighted(self, _cmd, hl); });
+}
+static void sio_control_setSelected(id self, SEL _cmd, BOOL sel) {
+    SIO_REQUIRE_ORIG(o_control_setSelected);
+    if (SIO_blocked()) { o_control_setSelected(self, _cmd, sel); return; }
+    SIO_listWrap(^{ o_control_setSelected(self, _cmd, sel); });
+}
+
+// ---- 导航栏 / 工具栏 / 标签栏 转场（gExtra 门控，与 push/present 同族）----
+static void sio_navBar_pushItem(id self, SEL _cmd, id item, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_navBar_pushItem);
+    if (SIO_blocked() || !gExtra || !animated) { o_navBar_pushItem(self, _cmd, item, animated); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_navBar_pushItem(self, _cmd, item, animated);
+    [CATransaction commit];
+}
+static id sio_navBar_popItem(id self, SEL _cmd, BOOL animated) {
+    if (__builtin_expect(o_navBar_popItem == NULL, 0)) return nil;
+    if (SIO_blocked() || !gExtra || !animated) { return o_navBar_popItem(self, _cmd, animated); }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    id r = o_navBar_popItem(self, _cmd, animated);
+    [CATransaction commit];
+    return r;
+}
+static void sio_navBar_setItems(id self, SEL _cmd, NSArray *items, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_navBar_setItems);
+    if (SIO_blocked() || !gExtra || !animated) { o_navBar_setItems(self, _cmd, items, animated); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_navBar_setItems(self, _cmd, items, animated);
+    [CATransaction commit];
+}
+static void sio_toolbar_setItems(id self, SEL _cmd, NSArray *items, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_toolbar_setItems);
+    if (SIO_blocked() || !gExtra || !animated) { o_toolbar_setItems(self, _cmd, items, animated); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_toolbar_setItems(self, _cmd, items, animated);
+    [CATransaction commit];
+}
+// UITabBar 选中项弹跳动画（无 animated 参数，内部固定动画）
+static void sio_tabBar_setItem(id self, SEL _cmd, id item) {
+    SIO_REQUIRE_ORIG(o_tabBar_setItem);
+    if (SIO_blocked() || !gExtra) { o_tabBar_setItem(self, _cmd, item); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_tabBar_setItem(self, _cmd, item);
+    [CATransaction commit];
+}
+// UINavigationController 导航栏/工具栏显隐滑入滑出
+static void sio_nav_setBarHidden(id self, SEL _cmd, BOOL hidden, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_nav_setBarHidden);
+    if (SIO_blocked() || !gExtra || !animated) { o_nav_setBarHidden(self, _cmd, hidden, animated); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_nav_setBarHidden(self, _cmd, hidden, animated);
+    [CATransaction commit];
+}
+static void sio_nav_setToolbarHidden(id self, SEL _cmd, BOOL hidden, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_nav_setToolbarHidden);
+    if (SIO_blocked() || !gExtra || !animated) { o_nav_setToolbarHidden(self, _cmd, hidden, animated); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_transitionDuration());
+    o_nav_setToolbarHidden(self, _cmd, hidden, animated);
+    [CATransaction commit];
+}
+
+// ---- 单元格高亮/选中（纯外观，不动列表状态机，默认随全局开关生效）----
+// 注意：与 ListAccel 门控的 reload/insert/delete 不同，这两个方法只改外观，
+// 不参与数据一致性，重列表 App 也可安全使用。
+static void sio_tvCell_setSelected(id self, SEL _cmd, BOOL sel, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_tvCell_setSelected);
+    if (SIO_blocked() || !animated) { o_tvCell_setSelected(self, _cmd, sel, animated); return; }
+    SIO_listWrap(^{ o_tvCell_setSelected(self, _cmd, sel, animated); });
+}
+static void sio_tvCell_setHighlighted(id self, SEL _cmd, BOOL hl, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_tvCell_setHighlighted);
+    if (SIO_blocked() || !animated) { o_tvCell_setHighlighted(self, _cmd, hl, animated); return; }
+    SIO_listWrap(^{ o_tvCell_setHighlighted(self, _cmd, hl, animated); });
+}
+static void sio_cvCell_setSelected(id self, SEL _cmd, BOOL sel) {
+    SIO_REQUIRE_ORIG(o_cvCell_setSelected);
+    if (SIO_blocked()) { o_cvCell_setSelected(self, _cmd, sel); return; }
+    SIO_listWrap(^{ o_cvCell_setSelected(self, _cmd, sel); });
+}
+static void sio_cvCell_setHighlighted(id self, SEL _cmd, BOOL hl) {
+    SIO_REQUIRE_ORIG(o_cvCell_setHighlighted);
+    if (SIO_blocked()) { o_cvCell_setHighlighted(self, _cmd, hl); return; }
+    SIO_listWrap(^{ o_cvCell_setHighlighted(self, _cmd, hl); });
+}
+
+// ---- UICollectionView 结构性动画（与 TV 全家桶同族，ListAccel 门控）----
+// v2.0.5 及之前 TV 有 performBatchUpdates 而 CV 没有 —— 瀑布流/布局切换 App 的盲区。
+static void sio_cv_batchUpdates(id self, SEL _cmd, void (^updates)(void), void (^comp)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_cv_batchUpdates);
+    if (!SIO_listOK()) { o_cv_batchUpdates(self, _cmd, updates, comp); return; }
+    SIO_listWrap(^{ o_cv_batchUpdates(self, _cmd, updates, comp); });
+}
+static void sio_cv_setLayout(id self, SEL _cmd, id layout, BOOL animated) {
+    SIO_REQUIRE_ORIG(o_cv_setLayout);
+    if (!SIO_listOK() || !animated) { o_cv_setLayout(self, _cmd, layout, animated); return; }
+    SIO_listWrap(^{ o_cv_setLayout(self, _cmd, layout, animated); });
+}
+static void sio_cv_setLayoutComp(id self, SEL _cmd, id layout, BOOL animated, void (^comp)(BOOL)) {
+    SIO_REQUIRE_ORIG(o_cv_setLayoutComp);
+    if (!SIO_listOK() || !animated) { o_cv_setLayoutComp(self, _cmd, layout, animated, comp); return; }
+    SIO_listWrap(^{ o_cv_setLayoutComp(self, _cmd, layout, animated, comp); });
+}
+
 #pragma mark - 安装
 
 __attribute__((constructor))
@@ -1526,7 +1715,10 @@ static void SIOriginalInit(void) {
     // v2.0.3：修复 toast 中文乱码（C 字符串 %s → NSString %@）
     // v2.0.4：补 SwiftUI/CALayer 隐式动画盲区（CATransaction getter + UIActivityIndicatorView startAnimating）
     // v2.0.5：下拉刷新转圈加强（UIRefreshControl didMoveToWindow 强制设置事务时长）
-    NSLog(@"[SIOriginal] v2.0.5 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.6：控件/栏/单元格全路径覆盖（Switch/Slider/Progress/Picker/DatePicker/Segmented/
+    //         PageControl/EffectView/Control/UINavigationBar/UIToolbar/UITabBar/Nav显隐/
+    //         TVCell/CVCell/CV performBatchUpdates/setCollectionViewLayout）
+    NSLog(@"[SIOriginal] v2.0.6 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
           gLongPress, gLongPressDuration, gNotify, gHasAppOverride, gListHardGuarded);
@@ -1993,6 +2185,90 @@ static void SIO_installiOS16Extras(void) {
     // [盲区 3] SwiftUI 动画桥接：SwiftUI 的 Animation 是 struct，不能直接 hook。
     // 但 SwiftUI 最终会通过 UIView/CALayer 的隐式动画执行，上面的 CATransaction
     // getter hook 会覆盖这条路径。
+    // =========================================================================
+
+    // ==================== v2.0.6：控件 / 栏 / 单元格 全路径覆盖 ====================
+    // 门控规则与本体一致：通用控件与单元格仅受全局开关+黑名单；导航/工具/标签栏
+    // 受 gExtra；CV 结构性动画（batchUpdates/setLayout）受 ListAccel。
+    // SIO_swizzleInstance 在方法不存在时静默跳过，此处无需逐一判 selector。
+    Class uiswitch = objc_getClass("UISwitch");
+    if (uiswitch) SIO_swizzleInstance(uiswitch, @selector(setOn:animated:),
+                                      (IMP)sio_switch_setOn, (IMP *)&o_switch_setOn);
+    Class uislider = objc_getClass("UISlider");
+    if (uislider) SIO_swizzleInstance(uislider, @selector(setValue:animated:),
+                                      (IMP)sio_slider_setValue, (IMP *)&o_slider_setValue);
+    Class uiprogress = objc_getClass("UIProgressView");
+    if (uiprogress) SIO_swizzleInstance(uiprogress, @selector(setProgress:animated:),
+                                        (IMP)sio_progress_setProgress, (IMP *)&o_progress_setProgress);
+    Class uipicker = objc_getClass("UIPickerView");
+    if (uipicker) SIO_swizzleInstance(uipicker, @selector(selectRow:inComponent:animated:),
+                                      (IMP)sio_picker_selectRow, (IMP *)&o_picker_selectRow);
+    Class uidatepicker = objc_getClass("UIDatePicker");
+    if (uidatepicker) SIO_swizzleInstance(uidatepicker, @selector(setDate:animated:),
+                                          (IMP)sio_datePicker_setDate, (IMP *)&o_datePicker_setDate);
+    Class uisegmented = objc_getClass("UISegmentedControl");
+    if (uisegmented) SIO_swizzleInstance(uisegmented, @selector(setSelectedSegmentIndex:),
+                                         (IMP)sio_segmented_setIndex, (IMP *)&o_segmented_setIndex);
+    Class uipagecontrol = objc_getClass("UIPageControl");
+    if (uipagecontrol) SIO_swizzleInstance(uipagecontrol, @selector(setCurrentPage:),
+                                           (IMP)sio_pageControl_setPage, (IMP *)&o_pageControl_setPage);
+    Class uieffect = objc_getClass("UIVisualEffectView");
+    if (uieffect) SIO_swizzleInstance(uieffect, @selector(setEffect:),
+                                      (IMP)sio_effectView_setEffect, (IMP *)&o_effectView_setEffect);
+    Class uicontrol = objc_getClass("UIControl");
+    if (uicontrol) {
+        SIO_swizzleInstance(uicontrol, @selector(setHighlighted:),
+                            (IMP)sio_control_setHighlighted, (IMP *)&o_control_setHighlighted);
+        SIO_swizzleInstance(uicontrol, @selector(setSelected:),
+                            (IMP)sio_control_setSelected, (IMP *)&o_control_setSelected);
+    }
+
+    Class navbar = objc_getClass("UINavigationBar");
+    if (navbar) {
+        SIO_swizzleInstance(navbar, @selector(pushNavigationItem:animated:),
+                            (IMP)sio_navBar_pushItem, (IMP *)&o_navBar_pushItem);
+        SIO_swizzleInstance(navbar, @selector(popNavigationItemAnimated:),
+                            (IMP)sio_navBar_popItem, (IMP *)&o_navBar_popItem);
+        SIO_swizzleInstance(navbar, @selector(setItems:animated:),
+                            (IMP)sio_navBar_setItems, (IMP *)&o_navBar_setItems);
+    }
+    Class toolbar = objc_getClass("UIToolbar");
+    if (toolbar) SIO_swizzleInstance(toolbar, @selector(setItems:animated:),
+                                     (IMP)sio_toolbar_setItems, (IMP *)&o_toolbar_setItems);
+    Class tabbar = objc_getClass("UITabBar");
+    if (tabbar) SIO_swizzleInstance(tabbar, @selector(setSelectedItem:),
+                                    (IMP)sio_tabBar_setItem, (IMP *)&o_tabBar_setItem);
+    Class nav2 = objc_getClass("UINavigationController");
+    if (nav2) {
+        SIO_swizzleInstance(nav2, @selector(setNavigationBarHidden:animated:),
+                            (IMP)sio_nav_setBarHidden, (IMP *)&o_nav_setBarHidden);
+        SIO_swizzleInstance(nav2, @selector(setToolbarHidden:animated:),
+                            (IMP)sio_nav_setToolbarHidden, (IMP *)&o_nav_setToolbarHidden);
+    }
+
+    Class tvcell = objc_getClass("UITableViewCell");
+    if (tvcell) {
+        SIO_swizzleInstance(tvcell, @selector(setSelected:animated:),
+                            (IMP)sio_tvCell_setSelected, (IMP *)&o_tvCell_setSelected);
+        SIO_swizzleInstance(tvcell, @selector(setHighlighted:animated:),
+                            (IMP)sio_tvCell_setHighlighted, (IMP *)&o_tvCell_setHighlighted);
+    }
+    Class cvcell = objc_getClass("UICollectionViewCell");
+    if (cvcell) {
+        SIO_swizzleInstance(cvcell, @selector(setSelected:),
+                            (IMP)sio_cvCell_setSelected, (IMP *)&o_cvCell_setSelected);
+        SIO_swizzleInstance(cvcell, @selector(setHighlighted:),
+                            (IMP)sio_cvCell_setHighlighted, (IMP *)&o_cvCell_setHighlighted);
+    }
+    Class cv2 = objc_getClass("UICollectionView");
+    if (cv2) {
+        SIO_swizzleInstance(cv2, @selector(performBatchUpdates:completion:),
+                            (IMP)sio_cv_batchUpdates, (IMP *)&o_cv_batchUpdates);
+        SIO_swizzleInstance(cv2, @selector(setCollectionViewLayout:animated:),
+                            (IMP)sio_cv_setLayout, (IMP *)&o_cv_setLayout);
+        SIO_swizzleInstance(cv2, @selector(setCollectionViewLayout:animated:completion:),
+                            (IMP)sio_cv_setLayoutComp, (IMP *)&o_cv_setLayoutComp);
+    }
     // =========================================================================
 }
 
