@@ -489,12 +489,27 @@ static inline BOOL SIO_blocked(void) {
 // ---------- swizzle 工具 ----------
 // v1.8.12：增加重复安装保护。若目标 IMP 已经是我们的实现（同一 dylib 被重复注入、
 // 或 constructor 被执行两次），绝不能再把它存进 orig —— 否则回调会自递归爆栈。
+// v1.8.19：修复「继承方法污染父类」。若方法不在本类而在父类（例如
+// -[UIScrollView didMoveToWindow] 实际继承自 UIView），旧实现直接
+// method_setImplementation 会全局改掉父类 IMP，导致进程内*所有* UIView 走进
+// UIScrollView 专用 hook（按 UIScrollView 布局解释 self，非滚动视图必崩）。
+// 正确做法：先 class_addMethod 在本类落地新 IMP，orig 指向父类实现。
 static void SIO_swizzleInstance(Class c, SEL sel, IMP newImp, IMP *orig) {
     if (!c || !sel || !newImp) return;
     Method m = class_getInstanceMethod(c, sel);
     if (!m) return;
     IMP cur = method_getImplementation(m);
     if (cur == newImp) return;
+    const char *types = method_getTypeEncoding(m);
+    // 本类未实现（方法来自父类）：add 一份新实现到本类，不动父类
+    if (class_addMethod(c, sel, newImp, types)) {
+        if (orig) {
+            Method superM = class_getInstanceMethod(class_getSuperclass(c), sel);
+            *orig = superM ? method_getImplementation(superM) : NULL;
+        }
+        return;
+    }
+    // 本类自有实现：直接替换（addMethod 失败说明已存在）
     if (orig) *orig = cur;
     method_setImplementation(m, newImp);
 }
@@ -506,6 +521,16 @@ static void SIO_swizzleClass(Class c, SEL sel, IMP newImp, IMP *orig) {
     if (!m) return;
     IMP cur = method_getImplementation(m);
     if (cur == newImp) return;
+    Class meta = object_getClass(c);
+    const char *types = method_getTypeEncoding(m);
+    // 同样防护类方法继承污染：先尝试往元类 add（对应父类实现的类方法）
+    if (class_addMethod(meta, sel, newImp, types)) {
+        if (orig) {
+            Method superM = class_getInstanceMethod(class_getSuperclass(meta), sel);
+            *orig = superM ? method_getImplementation(superM) : NULL;
+        }
+        return;
+    }
     if (orig) *orig = cur;
     method_setImplementation(m, newImp);
 }
@@ -516,7 +541,7 @@ static void   (*o_CATransaction_setDur)(id, SEL, double);
 static void   (*o_UV_anim_d)(id, SEL, double, void (^)(void));
 static void   (*o_UV_anim_dc)(id, SEL, double, void (^)(void), void (^)(BOOL));
 static void   (*o_UV_anim_ddoc)(id, SEL, double, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
-static void   (*o_UV_anim_spring)(id, SEL, double, double, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
+static void   (*o_UV_anim_spring)(id, SEL, double, double, double, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
 static void   (*o_UV_trans)(id, SEL, UIView *, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
 static void   (*o_UV_transFrom)(id, SEL, UIView *, UIView *, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
 static void   (*o_CASpring_mass)(id, SEL, double);
@@ -566,9 +591,13 @@ static void   (*o_UV_setAnimDelay)(Class, SEL, double);
 
 // ---- v1.8.18 新增：系统级增强 hook ----
 static void   (*o_refresh_begin)(id, SEL);
-static void   (*o_refresh_end)(id, SEL, BOOL);
-static void   (*o_navBar_setLargeTitle)(id, SEL, BOOL);
-static void   (*o_pageVC_setVC)(id, SEL, NSArray *, UIViewController *, UIPageViewControllerNavigationDirection);
+// v1.8.19：-[UIRefreshControl endRefreshing] 是无参方法（旧代码误写成 endRefreshing: 带 BOOL）
+static void   (*o_refresh_end)(id, SEL);
+// v1.8.19：setLargeTitleDisplayMode: 属于 UINavigationItem（不是 UINavigationBar），
+// 参数是 UINavigationItemLargeTitleDisplayMode（NSInteger 枚举，不是 BOOL）
+static void   (*o_navItem_setLargeTitle)(id, SEL, NSInteger);
+// v1.8.19：真实 API 为 setViewControllers:direction:animated:completion:（带 animated 与 completion）
+static void   (*o_pageVC_setVC)(id, SEL, NSArray *, UIPageViewControllerNavigationDirection, BOOL, void (^)(void));
 static void   (*o_docInteract_present)(id, SEL, BOOL);
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
@@ -633,13 +662,18 @@ static void sio_UV_anim_ddoc(Class self, SEL _cmd, double d, double delay, UIVie
     SIO_setUIViewAnim(NO);
 }
 
-static void sio_UV_anim_spring(Class self, SEL _cmd, double d, double damp, double vel,
+// v1.8.19 修复：真实签名是 animateWithDuration:delay:usingSpringWithDamping:
+// initialSpringVelocity:options:animations:completion:（8 参数）。旧实现漏声明
+// delay:，导致 d 之后所有实参整体错位（damping 收到 delay、velocity 收到 damping、
+// options 收到 velocity 指针值……），弹簧参数被错误换算，异常入参可触发 UIKit
+// 内部断言导致宿主 App 崩溃。
+static void sio_UV_anim_spring(Class self, SEL _cmd, double d, double delay, double damp, double vel,
                                UIViewAnimationOptions o, void (^a)(void), void (^c)(BOOL)) {
     SIO_REQUIRE_ORIG(o_UV_anim_spring);
-    if (SIO_blocked()) { o_UV_anim_spring(self, _cmd, d, damp, vel, o, a, c); return; }
+    if (SIO_blocked()) { o_UV_anim_spring(self, _cmd, d, delay, damp, vel, o, a, c); return; }
     SIO_setUIViewAnim(YES);
     double m = SIO_springScale();
-    o_UV_anim_spring(self, _cmd, SIO_targetDuration(d),
+    o_UV_anim_spring(self, _cmd, SIO_targetDuration(d), SIO_targetDelay(delay),
                      1.0 - (1.0 - damp) / m, vel * m, o, a, c);
     SIO_setUIViewAnim(NO);
 }
@@ -1010,7 +1044,7 @@ static void sio_cv_deselectItem(id self, SEL _cmd, NSIndexPath *ip, BOOL anim) {
 
 #pragma mark - v1.8.18 系统级增强 hook
 
-// UIRefreshControl：下拉刷新动画（beginRefreshing / endRefreshing:）
+// UIRefreshControl：下拉刷新动画（beginRefreshing / endRefreshing）
 // 用 CATransaction 包裹改时长，不改写 animated 语义
 static void sio_refresh_begin(id self, SEL _cmd) {
     SIO_REQUIRE_ORIG(o_refresh_begin);
@@ -1021,35 +1055,46 @@ static void sio_refresh_begin(id self, SEL _cmd) {
     [CATransaction commit];
 }
 
-static void sio_refresh_end(id self, SEL _cmd, BOOL animated) {
+// v1.8.19：真实 API 是 -[UIRefreshControl endRefreshing]（无参）。
+// 旧选择器 endRefreshing: 在 UIKit 不存在 → hook 从未安装（纯死代码）。
+static void sio_refresh_end(id self, SEL _cmd) {
     SIO_REQUIRE_ORIG(o_refresh_end);
-    if (SIO_blocked() || !animated) { o_refresh_end(self, _cmd, animated); return; }
+    if (SIO_blocked()) { o_refresh_end(self, _cmd); return; }
     [CATransaction begin];
     SIO_setTransactionDuration(SIO_targetDuration(0.25));
-    o_refresh_end(self, _cmd, animated);
+    o_refresh_end(self, _cmd);
     [CATransaction commit];
 }
 
-// UINavigationBar：大标题折叠/展开动画（setLargeTitleDisplayMode:）
-// iOS 11+ 的大标题导航栏在滚动时会折叠/展开，动画时长由 UIKit 内部控制
-static void sio_navBar_setLargeTitle(id self, SEL _cmd, BOOL large) {
-    SIO_REQUIRE_ORIG(o_navBar_setLargeTitle);
-    if (SIO_blocked()) { o_navBar_setLargeTitle(self, _cmd, large); return; }
+// UINavigationItem：大标题折叠/展开动画（setLargeTitleDisplayMode:）
+// iOS 11+ 的大标题导航栏在滚动时会折叠/展开，动画时长由 UIKit 内部控制。
+// v1.8.19：旧代码 hook UINavigationBar，但该属性在 UINavigationItem 上
+// （UINavigationBar 只有 prefersLargeTitles），选择器不存在 → hook 从未安装。
+static void sio_navItem_setLargeTitle(id self, SEL _cmd, NSInteger mode) {
+    SIO_REQUIRE_ORIG(o_navItem_setLargeTitle);
+    if (SIO_blocked()) { o_navItem_setLargeTitle(self, _cmd, mode); return; }
     [CATransaction begin];
     SIO_setTransactionDuration(SIO_targetDuration(0.3));
-    o_navBar_setLargeTitle(self, _cmd, large);
+    o_navItem_setLargeTitle(self, _cmd, mode);
     [CATransaction commit];
 }
 
 // UIPageViewController：页面切换动画
-// setViewControllers:direction:animated:completion: 的动画时长接管
-static void sio_pageVC_setVC(id self, SEL _cmd, NSArray *vcs, UIViewController *ref,
-                              UIPageViewControllerNavigationDirection dir) {
+// v1.8.19：真实签名 setViewControllers:direction:animated:completion:。
+// 旧代码注册了不存在的三参选择器 setViewControllers:direction:animated:
+// （hook 从未安装）；且原 IMP 指针少声明 animated/completion 两个参数，
+// 即便选择器存在，按旧 ABI 调用也会把寄存器垃圾当 completion block 跳转，必崩。
+static void sio_pageVC_setVC(id self, SEL _cmd, NSArray *vcs,
+                              UIPageViewControllerNavigationDirection dir, BOOL animated,
+                              void (^)(void)completion) {
     SIO_REQUIRE_ORIG(o_pageVC_setVC);
-    if (SIO_blocked()) { o_pageVC_setVC(self, _cmd, vcs, ref, dir); return; }
+    if (SIO_blocked() || !animated) {
+        o_pageVC_setVC(self, _cmd, vcs, dir, animated, completion);
+        return;
+    }
     [CATransaction begin];
     SIO_setTransactionDuration(SIO_targetDuration(0.35));
-    o_pageVC_setVC(self, _cmd, vcs, ref, dir);
+    o_pageVC_setVC(self, _cmd, vcs, dir, animated, completion);
     [CATransaction commit];
 }
 
@@ -1224,7 +1269,8 @@ static void SIOriginalInit(void) {
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v1.8.18：新增 5 个系统级 hook（UIRefreshControl/UINavigationBar/UIPageViewController/UIDocumentInteractionController）
-    NSLog(@"[SIOriginal] v1.8.18 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
+    // v1.8.19：修正 spring ABI 错位、3 个错误选择器、swizzle 继承污染；dylib 改为无 entitlement ad-hoc 签名
+    NSLog(@"[SIOriginal] v1.8.19 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
@@ -1505,24 +1551,25 @@ static void SIO_installiOS16Extras(void) {
                             (IMP)sio_layer_addAnim, (IMP *)&o_layer_addAnim);
     }
 
-    // v1.8.18：系统级增强 hook
+    // v1.8.18：系统级增强 hook（v1.8.19 修正选择器与 ABI）
     Class refresh = objc_getClass("UIRefreshControl");
     if (refresh) {
         SIO_swizzleInstance(refresh, @selector(beginRefreshing),
                             (IMP)sio_refresh_begin, (IMP *)&o_refresh_begin);
-        SIO_swizzleInstance(refresh, @selector(endRefreshing:),
+        SIO_swizzleInstance(refresh, @selector(endRefreshing),
                             (IMP)sio_refresh_end, (IMP *)&o_refresh_end);
     }
 
-    Class navBar = objc_getClass("UINavigationBar");
-    if (navBar && class_getInstanceMethod(navBar, @selector(setLargeTitleDisplayMode:))) {
-        SIO_swizzleInstance(navBar, @selector(setLargeTitleDisplayMode:),
-                            (IMP)sio_navBar_setLargeTitle, (IMP *)&o_navBar_setLargeTitle);
+    // setLargeTitleDisplayMode: 是 UINavigationItem（iOS 11+）的属性，不在 UINavigationBar 上
+    Class navItem = objc_getClass("UINavigationItem");
+    if (navItem && class_getInstanceMethod(navItem, @selector(setLargeTitleDisplayMode:))) {
+        SIO_swizzleInstance(navItem, @selector(setLargeTitleDisplayMode:),
+                            (IMP)sio_navItem_setLargeTitle, (IMP *)&o_navItem_setLargeTitle);
     }
 
     Class pageVC = objc_getClass("UIPageViewController");
     if (pageVC) {
-        SIO_swizzleInstance(pageVC, @selector(setViewControllers:direction:animated:),
+        SIO_swizzleInstance(pageVC, @selector(setViewControllers:direction:animated:completion:),
                             (IMP)sio_pageVC_setVC, (IMP *)&o_pageVC_setVC);
     }
 
@@ -2198,7 +2245,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.18) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.19) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
