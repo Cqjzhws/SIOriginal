@@ -764,13 +764,14 @@ static int LayerIndexForBoost(double b) {
     SIOCardView *card8 = [[SIOCardView alloc] init];
     
     _blacklist = [[UITextView alloc] init];
+    _blacklist.translatesAutoresizingMaskIntoConstraints = NO;   // 必须设 NO，否则 autoresizing mask 与高度/四边约束冲突，文本域被压成 0 高度
     _blacklist.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
     _blacklist.layer.borderColor = [UIColor separatorColor].CGColor;
     _blacklist.layer.borderWidth = 0.5;
     _blacklist.layer.cornerRadius = 8;
     _blacklist.text = [cfg[@"Blacklist"] componentsJoinedByString:@"\n"];
     [_blacklist.heightAnchor constraintEqualToConstant:80].active = YES;
-    
+
     UIView *blRow = [[UIView alloc] init];
     blRow.translatesAutoresizingMaskIntoConstraints = NO;
     [blRow addSubview:_blacklist];
