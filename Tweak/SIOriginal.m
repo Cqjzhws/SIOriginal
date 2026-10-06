@@ -1959,8 +1959,9 @@ static void SIO_installiOS16Extras(void) {
     // 时如果没有显式动画，系统会创建默认 CABasicAnimation，时长由 CATransaction
     // 的 animationDuration 决定。虽然已 hook setAnimationDuration:，但 getter
     // 也需要 hook——否则 SwiftUI/系统内部读取默认时长时会拿到未缩放的原值。
-    if (catx && class_getClassMethod(catx, @selector(animationDuration))) {
-        SIO_swizzleClass(catx, @selector(animationDuration),
+    Class catx_cls = objc_getClass("CATransaction");
+    if (catx_cls && class_getClassMethod(catx_cls, @selector(animationDuration))) {
+        SIO_swizzleClass(catx_cls, @selector(animationDuration),
                          (IMP)sio_CATransaction_getDur, (IMP *)&o_CATransaction_getDur);
     }
     // [盲区 2] UIActivityIndicatorView startAnimating：v2.0.1 只处理了动画时长，
