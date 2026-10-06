@@ -4,7 +4,7 @@
 
 set -e
 
-echo "=== SIOriginal v1.8.18 构建 ==="
+echo "=== SIOriginal v1.8.19 构建 ==="
 
 # 检查工具链
 if ! command -v clang &> /dev/null; then
@@ -13,7 +13,7 @@ if ! command -v clang &> /dev/null; then
 fi
 
 if ! command -v ldid &> /dev/null; then
-    echo "警告：未找到 ldid，将跳过签名（可 brew install ldid 安装）"
+    echo "警告：未找到 ldid，dylib 将尝试用 codesign ad-hoc 签名（可 brew install ldid）"
     SKIP_SIGN=1
 fi
 
@@ -32,17 +32,22 @@ echo ">>> 构建 SIOriginal.dylib ..."
 clang -dynamiclib -O2 -arch arm64 \
     -isysroot "$SDK_PATH" \
     -target arm64-apple-ios14.0 \
-    -framework UIKit -framework QuartzCore -framework AVFoundation -framework UserNotifications \
+    -framework UIKit -framework QuartzCore -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
     -fobjc-arc \
-    -install_name /Library/MobileSubstrate/DynamicLibraries/SIOriginal.dylib \
+    -Wl,-no_fixup_chains \
+    -install_name @rpath/SIOriginal.dylib \
     -o SIOriginal.dylib \
     Tweak/SIOriginal.m
 
+# v1.8.19：dylib 只做无 entitlement 的 ad-hoc 签名。
+# 绝不能把 entitlements.plist（platform-application/no-sandbox/persona-mgmt 等
+# 私有授权）签进注入库——TrollFools 注入普通 App 后 dyld/AMFI 会直接 SIGKILL。
 if [ -z "$SKIP_SIGN" ]; then
-    ldid -Sentitlements.plist SIOriginal.dylib
-    echo "✓ dylib 已构建并签名"
+    ldid -S SIOriginal.dylib
+    echo "✓ dylib 已构建并 ad-hoc 签名（无 entitlement）"
 else
-    echo "✓ dylib 已构建（未签名）"
+    codesign --force --sign - SIOriginal.dylib
+    echo "✓ dylib 已构建并 codesign ad-hoc 签名"
 fi
 
 # 构建 App
@@ -57,6 +62,7 @@ clang -O2 -arch arm64 \
     -target arm64-apple-ios14.0 \
     -framework UIKit -framework CoreGraphics -framework Foundation \
     -fobjc-arc \
+    -Wl,-no_fixup_chains \
     -o "$APP_DIR/SIOriginal" \
     App/main.m
 
@@ -66,14 +72,22 @@ for icon in App/AppIcon.png App/Icon-60@2x.png App/Icon-60@3x.png App/Icon-76@2x
     [ -f "$icon" ] && cp "$icon" "$APP_DIR/"
 done
 
-# 签名
+# 配置 App 主程序保留私有 entitlement；整包签名生成 _CodeSignature/CodeResources
 if [ -z "$SKIP_SIGN" ]; then
     ldid -Sentitlements.plist "$APP_DIR/SIOriginal"
+    command -v codesign &> /dev/null && codesign --force --sign - --entitlements entitlements.plist --generate-entitlement-der "$APP_DIR" || true
+else
+    codesign --force --sign - --entitlements entitlements.plist --generate-entitlement-der "$APP_DIR"
 fi
 
 # 打包 IPA
 zip -qr SIOriginal.ipa Payload
 echo "✓ IPA 已构建"
+
+# 校验
+echo ""
+otool -D SIOriginal.dylib | grep -q '@rpath/SIOriginal.dylib' && echo "✓ install_name = @rpath/SIOriginal.dylib"
+unzip -l SIOriginal.ipa | grep -q '_CodeSignature/CodeResources' && echo "✓ CodeResources 存在" || echo "⚠ IPA 缺少 CodeResources"
 
 # 清理
 rm -rf Payload
