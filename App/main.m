@@ -477,7 +477,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     // 高级 - App覆盖
     UITextField *_ovBundle;
     UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom, *_ovFastScroll, *_ovFastTap, *_ovLongPress;
-    UISegmentedControl *_ovLayer, *_ovMode, *_ovFloor, *_ovTrans, *_ovLongPress, *_ovLongPressDur;
+    UISegmentedControl *_ovLayer, *_ovMode, *_ovFloor, *_ovTrans, *_ovLongPressDur;
     UISlider *_ovSpeed;
     UILabel *_ovSpeedLabel, *_ovGuard;
     // 高级 - 自检
