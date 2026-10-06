@@ -970,15 +970,16 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     SIOCardView *c2 = [[SIOCardView alloc] init];
     UIButton *recheck = [UIButton buttonWithType:UIButtonTypeSystem];
     [recheck setTitle:@"🔍 重新检测" forState:UIControlStateNormal];
+    recheck.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
     [recheck addTarget:self action:@selector(onSelfCheck) forControlEvents:UIControlEventTouchUpInside];
     UIView *recheckRow = [[UIView alloc] init];
     recheckRow.translatesAutoresizingMaskIntoConstraints = NO;
     [recheckRow addSubview:recheck];
     recheck.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[
-        [recheck.topAnchor constraintEqualToAnchor:recheckRow.topAnchor constant:10],
+        [recheckRow.heightAnchor constraintEqualToConstant:50],
         [recheck.centerXAnchor constraintEqualToAnchor:recheckRow.centerXAnchor],
-        [recheck.bottomAnchor constraintEqualToAnchor:recheckRow.bottomAnchor constant:-10],
+        [recheck.centerYAnchor constraintEqualToAnchor:recheckRow.centerYAnchor],
     ]];
     [c2 addRow:recheckRow isLast:NO];
     _selfCheck = [self label:@"" size:12 dim:YES];
