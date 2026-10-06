@@ -1,6 +1,6 @@
 # SIOriginal — iOS 动画加速 + 真后台保活
 
-面向 iOS 14–17（含 iOS 16/17）的动画加速方案，v1.8.18 共 **50+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
+面向 iOS 14–17（含 iOS 16/17）的动画加速方案，v1.8.19 共 **50+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
 ## 特性
 
@@ -16,10 +16,22 @@
 - 系统动态效果：减弱动态效果 / 交叉淡出 / 减少透明度
 
 **v1.8.18 新增 hook**
-- UIRefreshControl：beginTracking / endTracking
-- UINavigationBar：大标题过渡动画
+- UIRefreshControl：beginRefreshing / endRefreshing
+- UINavigationItem：大标题过渡动画（setLargeTitleDisplayMode:）
 - UIPageViewController：页面切换
 - UIDocumentInteractionController：预览动画
+
+**v1.8.19 修复（注入闪退专项）**
+- dylib 改为**无 entitlement** ad-hoc 签名：旧版把 platform-application / no-sandbox /
+  persona-mgmt 等私有授权签进 dylib，TrollFools 注入普通 App 后 dyld/AMFI 直接 SIGKILL（启动即闪退）
+- dylib install_name 改回 `@rpath/SIOriginal.dylib`（旧版是 MobileSubstrate 绝对路径）
+- 修复弹簧动画 hook 参数整体错位（`animateWithDuration:delay:usingSpringWithDamping:...` 漏声明 delay:）
+- 修正 3 处错误选择器/ABI：`endRefreshing`（无参）、`UINavigationItem setLargeTitleDisplayMode:`、
+  `setViewControllers:direction:animated:completion:`
+- 修复 swizzle 对「继承自父类方法」直接替换导致父类实现被全局污染（如所有 UIView 误进 UIScrollView hook）
+- 链接器禁用 chained fixups（-no_fixup_chains），兼容 iOS 14 与旧注入工具
+- 配置 App：systemCyanColor/systemMintColor 增加 iOS 15 可用性守卫（iOS 14 不再崩溃）
+- CI：修复 Release 创建 403（显式 contents: write 权限），IPA 补全 _CodeSignature/CodeResources
 
 **安全防护**
 - CAAnimation 幂等缩放标记（修双重缩放 bug）
@@ -70,9 +82,9 @@ Darwin 通知 `com.local.sioriginal.settingschanged` 触发热重载。
 
 ## 构建
 GitHub Actions 自动构建（`.github/workflows/build.yml`，macos-15）：
-- dylib：纯 clang 直编（-O2）+ ad-hoc 签名
-- IPA：clang 直编 .app + `codesign --entitlements`（含 no-sandbox）后打包 Payload
-- 推送 `v*` tag 自动发布 GitHub Release
+- dylib：纯 clang 直编（-O2）+ `ldid -S` **无 entitlement** ad-hoc 签名（注入库绝不带私有授权）
+- IPA：clang 直编 .app + 整包 `codesign --entitlements`（App 主程序保留 no-sandbox 等私有授权），含 CodeResources
+- 推送 `v*` tag 自动发布 GitHub Release（工作流已声明 `contents: write` 权限）；也可 workflow_dispatch 手动触发
 
 ## 安装
 1. TrollStore 安装 `SIOriginal.ipa`（配置 App）
