@@ -26,7 +26,12 @@ jobs:
     - name: Build dylib
       run: |
         set -e
-        clang -dynamiclib -O2 -arch arm64 \
+        # v2.0.2：构建 arm64 + arm64e 双架构。
+        # A12+ 设备（iPhone XS 及以后）主程序默认加载 arm64e slice；
+        # 注入的 dylib 若只有 arm64，TrollFools 注入后 dyld 会拒绝加载，
+        # 表现为「注入成功但功能完全不生效」。必须双架构。
+        clang -dynamiclib -O2 \
+          -arch arm64 -arch arm64e \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -target arm64-apple-ios14.0 \
           -framework UIKit -framework QuartzCore -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
@@ -53,7 +58,8 @@ jobs:
         rm -rf Payload
         mkdir -p "$APP_DIR"
 
-        clang -O2 -arch arm64 \
+        clang -O2 \
+          -arch arm64 -arch arm64e \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -target arm64-apple-ios14.0 \
           -framework UIKit -framework CoreGraphics -framework Foundation \
@@ -85,6 +91,10 @@ jobs:
         set -e
         echo "== install_name 必须是 @rpath（TrollFools 注入要求）"
         otool -D SIOriginal.dylib | grep -q '@rpath/SIOriginal.dylib'
+        echo "== dylib 必须包含 arm64 + arm64e 双架构（A12+ 兼容）"
+        lipo -info SIOriginal.dylib | tee /tmp/lipo.txt
+        grep -q 'arm64'  /tmp/lipo.txt
+        grep -q 'arm64e' /tmp/lipo.txt
         echo "== dylib 不得内嵌 entitlement"
         if ldid -e SIOriginal.dylib 2>/dev/null | grep -q .; then
           echo "::error::dylib 内嵌了 entitlement，注入普通 App 会被 AMFI 杀死"

@@ -4,7 +4,7 @@
 
 set -e
 
-echo "=== SIOriginal v2.0.1 构建 ==="
+echo "=== SIOriginal v2.0.2 构建 ==="
 
 # 检查工具链
 if ! command -v clang &> /dev/null; then
@@ -29,7 +29,8 @@ echo "SDK: $SDK_PATH"
 # 构建 dylib
 echo ""
 echo ">>> 构建 SIOriginal.dylib ..."
-clang -dynamiclib -O2 -arch arm64 \
+# v2.0.2：arm64+arm64e 双架构（A12+ 设备注入要求）
+clang -dynamiclib -O2 -arch arm64 -arch arm64e \
     -isysroot "$SDK_PATH" \
     -target arm64-apple-ios14.0 \
     -framework UIKit -framework QuartzCore -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
@@ -57,7 +58,7 @@ rm -rf Payload
 APP_DIR="Payload/SIOriginal.app"
 mkdir -p "$APP_DIR"
 
-clang -O2 -arch arm64 \
+clang -O2 -arch arm64 -arch arm64e \
     -isysroot "$SDK_PATH" \
     -target arm64-apple-ios14.0 \
     -framework UIKit -framework CoreGraphics -framework Foundation \

@@ -1,4 +1,5 @@
 // SIOriginal — 配置 App（TrollStore 安装）
+// v2.0.2：双架构 arm64+arm64e；启动注入确认 toast
 // v2.0.1：修复专属开关关闭后旧覆盖仍生效、切换 Bundle 控件残留；版本同步
 // v2.0.0 Max：底部 Tab 栏 UI（引擎/手感/系统/高级），新增 Floor / TransitionBoost / LongPress
 #import <UIKit/UIKit.h>
@@ -576,7 +577,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.0.1 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.0.2 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1304,7 +1305,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.0.1 (build 45)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 2.0.2 (build 46)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"

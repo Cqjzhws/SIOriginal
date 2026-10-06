@@ -489,13 +489,14 @@ static void SIO_installiOS16Extras(void); // forward declaration
 //   · 1.5s 节流，避免连续保存/悬浮球切换时堆叠。
 static NSTimeInterval gSIOLastNotifyAt = 0;
 
-static void SIO_showNotifyToast(void) {
-    if (!gNotify) return;
+// v2.0.2：toast 拆出通用实现，供「设置生效」与「启动注入确认」两处复用。
+// 返回 YES 表示真实显示成功（启动确认据此决定要不要重试）。
+static BOOL SIO_showToast(NSString *text, BOOL throttle) {
     @try {
         UIApplication *app = [UIApplication sharedApplication];
-        if (app.applicationState != UIApplicationStateActive) return;
+        if (app.applicationState != UIApplicationStateActive) return NO;
         NSTimeInterval now = CACurrentMediaTime();
-        if (now - gSIOLastNotifyAt < 1.5) return;
+        if (throttle && now - gSIOLastNotifyAt < 1.5) return NO;
         gSIOLastNotifyAt = now;
 
         UIWindowScene *target = nil;
@@ -506,12 +507,12 @@ static void SIO_showNotifyToast(void) {
                 break;
             }
         }
-        if (!target) return;
+        if (!target) return NO;
         UIWindow *kw = nil;
         for (UIWindow *w in target.windows) {
             if (!w.hidden && w.isKeyWindow) { kw = w; break; }
         }
-        if (!kw) return;
+        if (!kw) return NO;
 
         UIView *toast = [[UIView alloc] init];
         toast.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
@@ -521,7 +522,7 @@ static void SIO_showNotifyToast(void) {
         toast.translatesAutoresizingMaskIntoConstraints = NO;
 
         UILabel *label = [[UILabel alloc] init];
-        label.text = @"SIOriginal 设置已生效";
+        label.text = text;
         label.textColor = [UIColor whiteColor];
         label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
         label.textAlignment = NSTextAlignmentCenter;
@@ -553,7 +554,41 @@ static void SIO_showNotifyToast(void) {
                 } completion:^(__unused BOOL f2) { [toast removeFromSuperview]; }];
             });
         }];
-    } @catch (__unused NSException *e) {}
+        return YES;
+    } @catch (__unused NSException *e) { return NO; }
+}
+
+// 保存配置后的生效提示（受 Notify 开关 + 1.5s 节流）
+static void SIO_showNotifyToast(void) {
+    if (!gNotify) return;
+    SIO_showToast(@"SIOriginal 设置已生效", YES);
+}
+
+// v2.0.2：启动注入确认。dylib 加载后 0.6s 在目标 App 顶部弹一次
+// 「SIOriginal 已注入 · 瞬切/加速 ×N · 或 OFF/黑名单状态」，失败重试 5 次。
+// 解决用户反馈的最大盲区：「动画慢」到底是没注入，还是配置了没生效，
+// 此前没有任何可见信号。gNotify 关时静默（避免打扰已确认好用的用户）。
+static void SIO_showInjectToast(int attempt) {
+    if (!gNotify || attempt > 5) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        // 未启用 / 黑名单 / 硬保护时也要提示——这正是用户需要知道的「为什么没加速」。
+        NSString *msg;
+        if (gSelfBlacklisted) {
+            msg = @"SIOriginal 已注入 · 本 App 在黑名单（加速未启用）";
+        } else if (gListHardGuarded) {
+            msg = @"SIOriginal 已注入 · 本 App 被硬保护（加速未启用）";
+        } else if (!gEnabled) {
+            msg = @"SIOriginal 已注入 · 总开关已关闭";
+        } else {
+            const char *modeName = (gMode == 2) ? "瞬切" : (gMode == 1) ? "慢放" : "加速";
+            double mval = (gMode == 1) ? gSlowFactor : (gMode == 2 ? 0 : gSpeed);
+            msg = [NSString stringWithFormat:@"SIOriginal 已注入 · %s%s",
+                   modeName, gMode == 2 ? "" :
+                   [[NSString stringWithFormat:@" ×%.1f", mval] UTF8String]];
+        }
+        if (!SIO_showToast(msg, NO)) SIO_showInjectToast(attempt + 1);
+    });
 }
 
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
@@ -1447,7 +1482,8 @@ static void SIOriginalInit(void) {
     // v1.8.18：新增 5 个系统级 hook（UIRefreshControl/UINavigationBar/UIPageViewController/UIDocumentInteractionController）
     // v1.8.19：修正 spring ABI 错位、3 个错误选择器、swizzle 继承污染；dylib 改为无 entitlement ad-hoc 签名
     // v2.0.1：落实 LongPress/Notify 两个假功能、FastScroll/FastTap setter 强黏、转圈平滑加速
-    NSLog(@"[SIOriginal] v2.0.1 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.2：启动注入确认 toast（消除「是否生效」盲区）；双架构 arm64+arm64e
+    NSLog(@"[SIOriginal] v2.0.2 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
           gLongPress, gLongPressDuration, gNotify, gHasAppOverride, gListHardGuarded);
@@ -1457,6 +1493,8 @@ static void SIOriginalInit(void) {
     if (gListHardGuarded) {
         NSLog(@"[SIOriginal] %@ is on the list-hook hard-guard list: ListAccel is forced OFF (safety)", gSelfBundle);
     }
+    // v2.0.2：启动注入确认 toast（gNotify=YES 时）
+    SIO_showInjectToast(0);
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
