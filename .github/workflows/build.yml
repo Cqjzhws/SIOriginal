@@ -6,59 +6,94 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# v1.8.19：tag 推送时创建 Release 需要 contents: write。
+# 默认 GITHUB_TOKEN 只有 Contents: read，softprops/action-gh-release 会 403，
+# 表现为「编译全部成功但工作流最终失败」。
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
-    
+
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-      
+
     - name: Install ldid
-      run: |
-        brew install ldid
-        
+      run: brew install ldid
+
     - name: Build dylib
       run: |
+        set -e
         clang -dynamiclib -O2 -arch arm64 \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -target arm64-apple-ios14.0 \
           -framework UIKit -framework QuartzCore -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
           -fobjc-arc \
-          -install_name /Library/MobileSubstrate/DynamicLibraries/SIOriginal.dylib \
+          -Wl,-no_fixup_chains \
+          -install_name @rpath/SIOriginal.dylib \
           -o SIOriginal.dylib \
           Tweak/SIOriginal.m
-        
-        ldid -Sentitlements.plist SIOriginal.dylib
-        
+        # v1.8.19 关键修复：注入用 dylib 必须「不带任何 entitlement」ad-hoc 签名。
+        # 旧流程 ldid -Sentitlements.plist 把 platform-application / no-sandbox /
+        # persona-mgmt / AppDataContainers 等私有 entitlement 嵌进 dylib；
+        # TrollFools 注入后宿主是普通第三方 App，dyld/AMFI 加载携带私有
+        # entitlement 的注入库会直接 SIGKILL —— 表现为目标 App 启动即闪退。
+        # `ldid -S` 不带参数 = 仅 ad-hoc 签名，不嵌入 entitlement。
+        ldid -S SIOriginal.dylib
+        echo "--- dylib id:"; otool -D SIOriginal.dylib
+        echo "--- dylib entitlements (必须为空):"; ldid -e SIOriginal.dylib || true
+
     - name: Build App
       run: |
+        set -e
         # 编译 .app
         APP_DIR="Payload/SIOriginal.app"
+        rm -rf Payload
         mkdir -p "$APP_DIR"
-        
+
         clang -O2 -arch arm64 \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -target arm64-apple-ios14.0 \
           -framework UIKit -framework CoreGraphics -framework Foundation \
           -fobjc-arc \
+          -Wl,-no_fixup_chains \
           -o "$APP_DIR/SIOriginal" \
           App/main.m
-        
+
         # 复制资源
         cp App/Info.plist "$APP_DIR/"
-        cp App/AppIcon.png "$APP_DIR/" 2>/dev/null || true
-        cp App/Icon-60@2x.png "$APP_DIR/" 2>/dev/null || true
-        cp App/Icon-60@3x.png "$APP_DIR/" 2>/dev/null || true
-        cp App/Icon-76@2x.png "$APP_DIR/" 2>/dev/null || true
-        cp App/Icon-83.5@2x.png "$APP_DIR/" 2>/dev/null || true
-        
-        # 签名
-        ldid -Sentitlements.plist "$APP_DIR/SIOriginal"
-        
+        for icon in App/AppIcon.png App/Icon-60@2x.png App/Icon-60@3x.png App/Icon-76@2x.png App/Icon-83.5@2x.png; do
+          [ -f "$icon" ] && cp "$icon" "$APP_DIR/"
+        done
+
+        # 配置 App 主程序需要私有 entitlement（写 /var/Managed Preferences、
+        # posix_spawn persona 提权重启），由 TrollStore 安装时保留授权。
+        # v1.8.19：对整个 .app 目录 ad-hoc 签名，生成 _CodeSignature/CodeResources
+        # （旧流程只签二进制，IPA 内缺包签名清单）。
+        codesign --force --sign - --entitlements entitlements.plist \
+          --generate-entitlement-der "$APP_DIR"
+        codesign -d --entitlements - "$APP_DIR/SIOriginal" || true
+
         # 打包 IPA
-        zip -r SIOriginal.ipa Payload
-        
+        rm -f SIOriginal.ipa
+        zip -qr SIOriginal.ipa Payload
+
+    - name: Verify artifacts
+      run: |
+        set -e
+        echo "== install_name 必须是 @rpath（TrollFools 注入要求）"
+        otool -D SIOriginal.dylib | grep -q '@rpath/SIOriginal.dylib'
+        echo "== dylib 不得内嵌 entitlement"
+        if ldid -e SIOriginal.dylib 2>/dev/null | grep -q .; then
+          echo "::error::dylib 内嵌了 entitlement，注入普通 App 会被 AMFI 杀死"
+          exit 1
+        fi
+        echo "== IPA 必须包含包签名清单"
+        unzip -l SIOriginal.ipa | grep -q '_CodeSignature/CodeResources'
+        ls -l SIOriginal.dylib SIOriginal.ipa
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -66,13 +101,12 @@ jobs:
         path: |
           SIOriginal.dylib
           SIOriginal.ipa
-          
+        if-no-files-found: error
+
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2
       with:
         files: |
           SIOriginal.dylib
           SIOriginal.ipa
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
