@@ -4,7 +4,7 @@
 
 set -e
 
-echo "=== SIOriginal v1.8.19 构建 ==="
+echo "=== SIOriginal v2.0.1 构建 ==="
 
 # 检查工具链
 if ! command -v clang &> /dev/null; then

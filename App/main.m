@@ -1,4 +1,5 @@
 // SIOriginal — 配置 App（TrollStore 安装）
+// v2.0.1：修复专属开关关闭后旧覆盖仍生效、切换 Bundle 控件残留；版本同步
 // v2.0.0 Max：底部 Tab 栏 UI（引擎/手感/系统/高级），新增 Floor / TransitionBoost / LongPress
 #import <UIKit/UIKit.h>
 #import <spawn.h>
@@ -575,7 +576,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.0.0 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.0.1 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1090,6 +1091,24 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         _ovFloor.selectedSegmentIndex = FloorIndexForValue([mine[@"Floor"] doubleValue]);
         _ovTrans.selectedSegmentIndex = TransitionBoostIndexForValue([mine[@"TransitionBoost"] doubleValue]);
         _ovLongPressDur.selectedSegmentIndex = LongPressDurationIndexForValue([mine[@"LongPressDuration"] doubleValue]);
+    } else {
+        // v2.0.1：该 Bundle 无专属配置时，控件镜像当前【全局】值作为默认，
+        // 避免残留上一个 Bundle 的设置（旧代码切换 Bundle 后显示/保存的都是上个 App 的值）
+        _ovOn.on = NO;
+        _ovMode.selectedSegmentIndex = [cfg[@"Mode"] intValue];
+        _ovSpeed.value = [cfg[@"Speed"] doubleValue];
+        _ovSpeedLabel.text = [NSString stringWithFormat:@"×%.1f", _ovSpeed.value];
+        _ovSpring.on = [cfg[@"Spring"] boolValue];
+        _ovExtra.on = [cfg[@"Extra"] boolValue];
+        _ovList.on = [cfg[@"ListAccel"] boolValue];
+        _ovZoom.on = [cfg[@"ZoomAccel"] boolValue];
+        _ovFastScroll.on = [cfg[@"FastScroll"] boolValue];
+        _ovFastTap.on = [cfg[@"FastTap"] boolValue];
+        _ovLongPress.on = [cfg[@"LongPress"] boolValue];
+        _ovLayer.selectedSegmentIndex = LayerIndexForBoost([cfg[@"LayerBoost"] doubleValue]);
+        _ovFloor.selectedSegmentIndex = FloorIndexForValue([cfg[@"Floor"] doubleValue]);
+        _ovTrans.selectedSegmentIndex = TransitionBoostIndexForValue([cfg[@"TransitionBoost"] doubleValue]);
+        _ovLongPressDur.selectedSegmentIndex = LongPressDurationIndexForValue([cfg[@"LongPressDuration"] doubleValue]);
     }
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     if (guarded) {
@@ -1167,26 +1186,33 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     // App 覆盖
     if (_ovBundle) {
         NSString *bid = _ovBundle.text ?: @"";
-        if (bid.length && _ovOn.on) {
+        if (bid.length) {
             NSMutableDictionary *ovAll = [cfg[@"AppOverrides"] isKindOfClass:[NSDictionary class]]
                                          ? [cfg[@"AppOverrides"] mutableCopy] : [NSMutableDictionary dictionary];
-            NSMutableDictionary *mine = [ovAll[bid] isKindOfClass:[NSDictionary class]]
-                                        ? [ovAll[bid] mutableCopy] : [NSMutableDictionary dictionary];
-            mine[@"Enabled"] = @(_ovOn.on);
-            mine[@"Mode"] = @((int)_ovMode.selectedSegmentIndex);
-            mine[@"Speed"] = @((double)_ovSpeed.value);
-            mine[@"Spring"] = @(_ovSpring.on);
-            mine[@"Extra"] = @(_ovExtra.on);
-            mine[@"ListAccel"] = @(_ovList.on);
-            mine[@"ZoomAccel"] = @(_ovZoom.on);
-            mine[@"FastScroll"] = @(_ovFastScroll.on);
-            mine[@"FastTap"] = @(_ovFastTap.on);
-            mine[@"LongPress"] = @(_ovLongPress.on);
-            mine[@"LongPressDuration"] = @(LongPressDurationForIndex((int)_ovLongPressDur.selectedSegmentIndex));
-            mine[@"LayerBoost"] = @(LayerBoostForIndex((int)_ovLayer.selectedSegmentIndex));
-            mine[@"Floor"] = @(FloorForIndex((int)_ovFloor.selectedSegmentIndex));
-            mine[@"TransitionBoost"] = @(TransitionBoostForIndex((int)_ovTrans.selectedSegmentIndex));
-            ovAll[bid] = mine;
+            if (_ovOn.on) {
+                NSMutableDictionary *mine = [ovAll[bid] isKindOfClass:[NSDictionary class]]
+                                            ? [ovAll[bid] mutableCopy] : [NSMutableDictionary dictionary];
+                mine[@"Enabled"] = @(_ovOn.on);
+                mine[@"Mode"] = @((int)_ovMode.selectedSegmentIndex);
+                mine[@"Speed"] = @((double)_ovSpeed.value);
+                mine[@"Spring"] = @(_ovSpring.on);
+                mine[@"Extra"] = @(_ovExtra.on);
+                mine[@"ListAccel"] = @(_ovList.on);
+                mine[@"ZoomAccel"] = @(_ovZoom.on);
+                mine[@"FastScroll"] = @(_ovFastScroll.on);
+                mine[@"FastTap"] = @(_ovFastTap.on);
+                mine[@"LongPress"] = @(_ovLongPress.on);
+                mine[@"LongPressDuration"] = @(LongPressDurationForIndex((int)_ovLongPressDur.selectedSegmentIndex));
+                mine[@"LayerBoost"] = @(LayerBoostForIndex((int)_ovLayer.selectedSegmentIndex));
+                mine[@"Floor"] = @(FloorForIndex((int)_ovFloor.selectedSegmentIndex));
+                mine[@"TransitionBoost"] = @(TransitionBoostForIndex((int)_ovTrans.selectedSegmentIndex));
+                ovAll[bid] = mine;
+            } else {
+                // v2.0.1：关闭「为该 App 启用专属配置」必须删除整条覆盖。
+                // 旧代码此时什么都不写，旧字典（Enabled 仍是旧值，通常为 YES）
+                // 继续被 dylib 命中——开关关掉后专属参数依旧生效，等于关不掉。
+                [ovAll removeObjectForKey:bid];
+            }
             cfg[@"AppOverrides"] = ovAll;
         }
     }
@@ -1278,7 +1304,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.0.0 (build 43)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 2.0.1 (build 45)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"

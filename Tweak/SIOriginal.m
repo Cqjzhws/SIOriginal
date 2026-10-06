@@ -129,6 +129,34 @@
 //     · 进入时若已在自己的一次块动画包裹内（SIO_inUIViewAnim）→ 原样透传；
 //     · 调用原 IMP 期间置起同一线程局部标记 → 抑制内部再入。
 // =========================================================================
+//
+// ==================== v2.0.1 配置真实性审计修复（假功能清零）====================
+// 逐键核对「配置 App 写 plist → dylib 读 plist → hook 真实生效」全链路后修复：
+//
+// [假功能 1] LongPress / LongPressDuration：配置 App 有开关与 0.20/0.30/0.40
+//   档位，全局保存与 AppOverrides 都写入 plist，但 dylib 侧**从未读取、没有任何
+//   实现**——「长按手势加速」自 v2.0.0 Max 起纯界面摆设。现 hook
+//   UILongPressGestureRecognizer 的 initWithTarget:action: / initWithCoder: /
+//   setMinimumPressDuration: 三个入口，仅把系统默认 0.5s（容差 0.45–0.55）替换
+//   为配置时长；App 自定义的更短/更长时长原样透传，避免破坏特殊手势。
+//
+// [假功能 2] Notify：开关与自检文案都承诺「保存后前台目标 App 顶部出现 1.5 秒
+//   生效提示」，dylib 无任何实现。现补 Darwin 热重载后的顶部 toast
+//   （userInteractionEnabled=NO，绝不拦截触摸；仅前台、1.5s 节流）。
+//
+// [假功能 3] FastScroll / FastTap 界面标注「setter 强黏，防 App 改回」，实际
+//   只在 didMoveToWindow 设置一次，App 后续改回即失效。补 setDecelerationRate:
+//   与 setDelaysContentTouches: 强黏 hook，App 每次设置都被强制纠正。
+//
+// [崩溃隐患] v2.0.0 转圈检测沿 superlayer 链对 layer.delegate 发 superview
+//   消息；delegate 不是 UIView 时（AVPlayerLayer 附属、自定义图层代理等）
+//   unrecognized selector 直接崩，且整段无 @try。加 isKindOfClass 类型门与
+//   @try 兜底。
+//
+// [体感·加载提速] UIActivityIndicatorView 转圈由 v2.0.0 的「完全不加速」改为
+//   「按全局倍率加速、但钳制 0.4s 下限」：60Hz 下每圈约 24 帧仍平滑，彻底消除
+//   ×5 下转圈反而显得最慢的违和感；不吃 LayerBoost；慢放模式依旧慢放。
+// =========================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -159,6 +187,13 @@ static BOOL     gFastTap = NO;       // v1.8.16：取消列表点击延迟（del
 static double   gLayerBoost = 1.0;   // v1.8.17：显式动画（CAAnimation/CALayer）额外倍率，默认 1（不额外加速）
 static double   gFloor = 0.02;       // v2.0.0：动画时长下限（秒），默认 0.02
 static double   gTransitionBoost = 1.0; // v2.0.0：转场独立额外倍率，默认 1（不额外加速）
+static BOOL     gLongPress = YES;    // v2.0.1：长按手势加速（默认 0.5s → 配置时长），默认开
+static double   gLongPressDuration = 0.30; // v2.0.1：长按触发时长，默认 0.30s
+static BOOL     gNotify = YES;       // v2.0.1：保存配置后在前台目标 App 顶部弹 1.5s 提示
+// v2.0.1：转圈（UIActivityIndicatorView）专属时长下限。旋转动画低于该值会因
+// 帧率采样混叠出现频闪/视觉倒转（×5 把 1s 压到 0.2s 时肉眼像"越转越慢"）。
+// 0.4s ≈ 每秒 2.5 圈，60Hz 下每圈约 24 帧，平滑且明显比系统默认快。
+static const double kSIOSpinnerFloor = 0.4;
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
@@ -330,6 +365,9 @@ static void SIO_reload(void) {
         gLayerBoost = 1.0;
         gFloor = 0.02;
         gTransitionBoost = 1.0;
+        gLongPress = YES;
+        gLongPressDuration = 0.30;
+        gNotify = YES;
         gSelfBlacklisted = NO;
         gHasAppOverride  = NO;
         gListHardGuarded = SIO_listHardBlocked();
@@ -363,6 +401,12 @@ static void SIO_reload(void) {
     // v2.0.0：转场独立额外倍率，缺键默认 1.0，范围 1.0–10.0
     double tb = d[@"TransitionBoost"] ? [d[@"TransitionBoost"] doubleValue] : 1.0;
     gTransitionBoost = (tb >= 1.0 && tb <= 10.0) ? tb : 1.0;
+    // v2.0.1：长按手势加速 + 触发时长，缺键默认开 / 0.30s（与配置 App 一致）
+    gLongPress = d[@"LongPress"] ? [d[@"LongPress"] boolValue] : YES;
+    double lp = d[@"LongPressDuration"] ? [d[@"LongPressDuration"] doubleValue] : 0.30;
+    gLongPressDuration = (lp >= 0.1 && lp <= 2.0) ? lp : 0.30;
+    // v2.0.1：保存后顶部生效提示，缺键默认开
+    gNotify = d[@"Notify"] ? [d[@"Notify"] boolValue] : YES;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -419,6 +463,12 @@ static void SIO_reload(void) {
             double tb2 = [ovr[@"TransitionBoost"] doubleValue];
             if (tb2 >= 1.0 && tb2 <= 10.0) gTransitionBoost = tb2;
         }
+        // v2.0.1：长按加速的 App 级覆盖（v2.0.0 配置 App 已写键，dylib 当时没读）
+        if (ovr[@"LongPress"]) gLongPress = [ovr[@"LongPress"] boolValue];
+        if (ovr[@"LongPressDuration"]) {
+            double lp2 = [ovr[@"LongPressDuration"] doubleValue];
+            if (lp2 >= 0.1 && lp2 <= 2.0) gLongPressDuration = lp2;
+        }
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -432,10 +482,89 @@ static void SIO_reload(void) {
 
 static void SIO_installiOS16Extras(void); // forward declaration
 
+// v2.0.1：保存配置后在前台目标 App 顶部弹 1.5s 生效提示（配置 App 的 Notify 开关）。
+// 关键约束（吸取 v1.8.10 悬浮球被全局禁用的教训）：
+//   · toast 与 label 都 userInteractionEnabled = NO —— 不拦截任何触摸、不抢状态栏；
+//   · 只在 App 处于 UIApplicationStateActive 时显示，后台静默；
+//   · 1.5s 节流，避免连续保存/悬浮球切换时堆叠。
+static NSTimeInterval gSIOLastNotifyAt = 0;
+
+static void SIO_showNotifyToast(void) {
+    if (!gNotify) return;
+    @try {
+        UIApplication *app = [UIApplication sharedApplication];
+        if (app.applicationState != UIApplicationStateActive) return;
+        NSTimeInterval now = CACurrentMediaTime();
+        if (now - gSIOLastNotifyAt < 1.5) return;
+        gSIOLastNotifyAt = now;
+
+        UIWindowScene *target = nil;
+        for (UIScene *sc in app.connectedScenes) {
+            if ([sc isKindOfClass:[UIWindowScene class]] &&
+                sc.activationState == UISceneActivationStateForegroundActive) {
+                target = (UIWindowScene *)sc;
+                break;
+            }
+        }
+        if (!target) return;
+        UIWindow *kw = nil;
+        for (UIWindow *w in target.windows) {
+            if (!w.hidden && w.isKeyWindow) { kw = w; break; }
+        }
+        if (!kw) return;
+
+        UIView *toast = [[UIView alloc] init];
+        toast.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.92];
+        toast.layer.cornerRadius = 22;
+        toast.layer.masksToBounds = YES;
+        toast.userInteractionEnabled = NO;
+        toast.translatesAutoresizingMaskIntoConstraints = NO;
+
+        UILabel *label = [[UILabel alloc] init];
+        label.text = @"SIOriginal 设置已生效";
+        label.textColor = [UIColor whiteColor];
+        label.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+        label.textAlignment = NSTextAlignmentCenter;
+        label.userInteractionEnabled = NO;
+        label.translatesAutoresizingMaskIntoConstraints = NO;
+        [toast addSubview:label];
+        [kw addSubview:toast];
+        [NSLayoutConstraint activateConstraints:@[
+            [label.topAnchor constraintEqualToAnchor:toast.topAnchor constant:10],
+            [label.bottomAnchor constraintEqualToAnchor:toast.bottomAnchor constant:-10],
+            [label.leadingAnchor constraintEqualToAnchor:toast.leadingAnchor constant:18],
+            [label.trailingAnchor constraintEqualToAnchor:toast.trailingAnchor constant:-18],
+            [toast.centerXAnchor constraintEqualToAnchor:kw.centerXAnchor],
+            [toast.topAnchor constraintEqualToAnchor:kw.safeAreaLayoutGuide.topAnchor constant:8],
+            [toast.widthAnchor constraintGreaterThanOrEqualToConstant:180],
+        ]];
+
+        toast.transform = CGAffineTransformMakeTranslation(0, -60);
+        toast.alpha = 0;
+        [UIView animateWithDuration:0.25 animations:^{
+            toast.transform = CGAffineTransformIdentity;
+            toast.alpha = 1;
+        } completion:^(__unused BOOL finished) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                [UIView animateWithDuration:0.25 animations:^{
+                    toast.alpha = 0;
+                    toast.transform = CGAffineTransformMakeTranslation(0, -60);
+                } completion:^(__unused BOOL f2) { [toast removeFromSuperview]; }];
+            });
+        }];
+    } @catch (__unused NSException *e) {}
+}
+
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
     SIO_reload();
+    // Darwin 回调线程以注册时的 runloop 为准（constructor 在主线程注册），
+    // 但所有 UI 操作统一切回主线程，不依赖该实现细节。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SIO_showNotifyToast();
+    });
 }
 
 // ---------- 微信图片预览「放大态」全局旁路（v1.8.4） ----------
@@ -602,6 +731,14 @@ static void   (*o_sv_zoomToRect)(id, SEL, CGRect, BOOL);
 
 // ---- v1.8.16：交互手感（滑行惯性 / 点击延迟） ----
 static void   (*o_sv_didMoveToWindow)(id, SEL);
+// v2.0.1：setter 强黏（界面承诺「防 App 改回」，旧版只在 didMoveToWindow 设一次）
+static void   (*o_sv_setDecelRate)(id, SEL, CGFloat);
+static void   (*o_sv_setDelaysTouches)(id, SEL, BOOL);
+
+// ---- v2.0.1：长按手势加速（v2.0.0 配置 App 有开关，dylib 此前无实现） ----
+static id     (*o_lpr_init)(id, SEL, id, SEL);
+static id     (*o_lpr_initCoder)(id, SEL, id);
+static void   (*o_lpr_setMinDur)(id, SEL, double);
 
 // ---- v1.8.12 新增 hook ----
 static void   (*o_UV_anim_keyframes)(Class, SEL, double, double, NSUInteger, void (^)(void), void (^)(BOOL));
@@ -1309,9 +1446,11 @@ static void SIOriginalInit(void) {
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v1.8.18：新增 5 个系统级 hook（UIRefreshControl/UINavigationBar/UIPageViewController/UIDocumentInteractionController）
     // v1.8.19：修正 spring ABI 错位、3 个错误选择器、swizzle 继承污染；dylib 改为无 entitlement ad-hoc 签名
-    NSLog(@"[SIOriginal] v2.0.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gFloor, gLayerBoost, gTransitionBoost, gSpring, gExtra, gListAccel, gZoomAccel,
-          gFastScroll, gFastTap, gHasAppOverride, gListHardGuarded);
+    // v2.0.1：落实 LongPress/Notify 两个假功能、FastScroll/FastTap setter 强黏、转圈平滑加速
+    NSLog(@"[SIOriginal] v2.0.1 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
+          gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
+          gLongPress, gLongPressDuration, gNotify, gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
     }
@@ -1517,40 +1656,115 @@ static void sio_SV_didMoveToWindow(id self, SEL _cmd) {
     } @catch (__unused NSException *e) {}
 }
 
+// v2.0.1：setter 强黏。didMoveToWindow 只能保证「上窗那一刻」是快的，App 之后
+// （或从 nib/storyboard 唤醒后）再写回正常值即失效——界面上明确写着
+// 「setter 强黏，防 App 改回」，就必须真的拦 setter。直接改写实参调原 IMP，
+// 不经过属性消息派发，因此不存在自递归。
+static void sio_SV_setDecelRate(id self, SEL _cmd, CGFloat rate) {
+    SIO_REQUIRE_ORIG(o_sv_setDecelRate);
+    if (!SIO_blocked() && gFastScroll) rate = UIScrollViewDecelerationRateFast;
+    o_sv_setDecelRate(self, _cmd, rate);
+}
+
+static void sio_SV_setDelaysTouches(id self, SEL _cmd, BOOL delays) {
+    SIO_REQUIRE_ORIG(o_sv_setDelaysTouches);
+    if (!SIO_blocked() && gFastTap) delays = NO;
+    o_sv_setDelaysTouches(self, _cmd, delays);
+}
+
+#pragma mark - v2.0.1 长按手势加速
+
+// 系统默认 minimumPressDuration = 0.5s。只替换这个「默认值」：
+// App 自己显式设置的更短（0.2 快捷菜单）/更长（1.0s 特殊手势）时长一律透传，
+// 避免破坏 App 的手势语义。容差 0.45–0.55 覆盖浮点写死 0.5 的各种来源。
+static inline BOOL SIO_isDefaultLongPressDur(double d) { return d >= 0.45 && d <= 0.55; }
+
+static void sio_LPR_setMinDur(id self, SEL _cmd, double d) {
+    SIO_REQUIRE_ORIG(o_lpr_setMinDur);
+    if (!SIO_blocked() && gLongPress && SIO_isDefaultLongPressDur(d)) d = gLongPressDuration;
+    o_lpr_setMinDur(self, _cmd, d);
+}
+
+// 指定初始化器（纯代码创建的唯一入口）。init 完成后系统默认值已是 0.5s，
+// 这里直接调原始 setter 写入配置时长——不走自己的 hook，无需重入保护。
+static id sio_LPR_init(id self, SEL _cmd, id target, SEL action) {
+    SIO_REQUIRE_ORIG_NIL(o_lpr_init);
+    id r = o_lpr_init(self, _cmd, target, action);
+    if (!SIO_blocked() && gLongPress && o_lpr_setMinDur && r) {
+        o_lpr_setMinDur(r, @selector(setMinimumPressDuration:), gLongPressDuration);
+    }
+    return r;
+}
+
+// storyboard/xib 创建入口。解码完成后再读当前值：IB 里自定义过时长的手势
+// （值不在默认区间）保持 App 配置，只把仍是系统默认 0.5s 的替换掉。
+static id sio_LPR_initCoder(id self, SEL _cmd, id coder) {
+    SIO_REQUIRE_ORIG_NIL(o_lpr_initCoder);
+    id r = o_lpr_initCoder(self, _cmd, coder);
+    if (!SIO_blocked() && gLongPress && o_lpr_setMinDur &&
+        [r isKindOfClass:[UILongPressGestureRecognizer class]]) {
+        double cur = ((UILongPressGestureRecognizer *)r).minimumPressDuration;
+        if (SIO_isDefaultLongPressDur(cur)) {
+            o_lpr_setMinDur(r, @selector(setMinimumPressDuration:), gLongPressDuration);
+        }
+    }
+    return r;
+}
+
 #pragma mark - CALayer addAnimation:forKey:（补 CAAnimation setDuration 盲区）
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     SIO_REQUIRE_ORIG(o_layer_addAnim);
-    // v2.0.0：UIActivityIndicatorView 的转圈动画是无限重复的 transform.rotation，
-    // 加速后转速过高会产生频闪/视觉倒退，用户感知为"转圈变慢"。直接跳过不缩放。
+    // UIActivityIndicatorView 的转圈动画是无限重复的 transform.rotation。
+    // v2.0.0 曾直接跳过不缩放，结果 ×5 下转圈反而成了界面上最慢的元素；
+    // v2.0.1 改为「按全局倍率加速、钳制 0.4s 下限」，既明显变快又不频闪。
     if (anim && [anim isKindOfClass:[CAAnimation class]]) {
-        CALayer *layer = (CALayer *)self;
         BOOL isSpinner = NO;
-        // 检查当前 layer 及其 superlayer 链的 delegate
-        CALayer *l = layer;
-        while (l) {
-            id delegate = [l delegate];
-            if (delegate) {
-                Class c = [delegate class];
-                NSString *n = NSStringFromClass(c);
-                if ([n containsString:@"ActivityIndicator"] ||
-                    [delegate isKindOfClass:[UIActivityIndicatorView class]]) {
-                    isSpinner = YES;
-                    break;
+        // v2.0.1 崩溃修复：layer.delegate 不保证是 UIView（AVPlayerLayer 附属、
+        // 第三方绘图图层等会挂自定义 NSObject 代理），对其直接发 superview 会
+        // unrecognized selector 崩溃。必须先过 isKindOfClass 类型门，整段再
+        // 用 @try 兜底，检测失败按「非转圈」处理（只损失加速，绝不崩）。
+        @try {
+            CALayer *l = (CALayer *)self;
+            while (l) {
+                id delegate = [l delegate];
+                if (delegate) {
+                    NSString *n = NSStringFromClass([delegate class]);
+                    if ([n containsString:@"ActivityIndicator"] ||
+                        [delegate isKindOfClass:[UIActivityIndicatorView class]]) {
+                        isSpinner = YES;
+                        break;
+                    }
+                    if ([delegate isKindOfClass:[UIView class]]) {
+                        UIView *v = (UIView *)delegate;
+                        while (v) {
+                            if ([v isKindOfClass:[UIActivityIndicatorView class]]) { isSpinner = YES; break; }
+                            v = v.superview;
+                        }
+                        if (isSpinner) break;
+                    }
                 }
-                UIView *v = (UIView *)delegate;
-                while (v) {
-                    if ([v isKindOfClass:[UIActivityIndicatorView class]]) { isSpinner = YES; break; }
-                    v = v.superview;
-                }
-                if (isSpinner) break;
+                l = l.superlayer;
             }
-            l = l.superlayer;
-        }
+        } @catch (__unused NSException *e) { isSpinner = NO; }
+
         if (isSpinner) {
-            // 还原为 setDuration: 时保存的原始时长，覆盖缩放
             double orig = SIO_getOrigDur(anim);
-            if (orig > 0 && o_CAAnim_setDuration) {
+            if (orig <= 0.0) orig = ((CAAnimation *)anim).duration;
+            if (!SIO_blocked() && orig > 0.0 && o_CAAnim_setDuration) {
+                double nd;
+                if (gMode == 1) {
+                    nd = orig * gSlowFactor;                     // 慢放：转圈同步变慢
+                } else if (gMode == 2) {
+                    nd = MIN(kSIOSpinnerFloor, orig);            // 瞬切：到平滑下限即可，自定义短转圈不反被放慢
+                } else {
+                    nd = orig / (gSpeed > 1.0001 ? gSpeed : 1.0);
+                }
+                // 钳制：不低于 0.4s，也绝不比原始时长更慢（兼容自定义短时长转圈）
+                if (nd < kSIOSpinnerFloor) nd = MIN(kSIOSpinnerFloor, orig);
+                if (nd != orig) o_CAAnim_setDuration(anim, @selector(setDuration:), nd);
+            } else if (orig > 0.0 && o_CAAnim_setDuration) {
+                // 黑名单 / 全局禁用 / 微信放大态：还原 setDuration: 时保存的原始时长
                 o_CAAnim_setDuration(anim, @selector(setDuration:), orig);
             }
             o_layer_addAnim(self, _cmd, anim, key);
@@ -1619,6 +1833,24 @@ static void SIO_installiOS16Extras(void) {
         // v1.8.16 新增：交互手感（滑行惯性 / 点击延迟），FastScroll / FastTap 控制
         SIO_swizzleInstance(sv, @selector(didMoveToWindow),
                             (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
+        // v2.0.1：setter 强黏（App 任何时候写回都会被拦回）
+        SIO_swizzleInstance(sv, @selector(setDecelerationRate:),
+                            (IMP)sio_SV_setDecelRate, (IMP *)&o_sv_setDecelRate);
+        SIO_swizzleInstance(sv, @selector(setDelaysContentTouches:),
+                            (IMP)sio_SV_setDelaysTouches, (IMP *)&o_sv_setDelaysTouches);
+    }
+
+    // v2.0.1：长按手势加速（v2.0.0 只有配置界面、dylib 无实现）。
+    // initWithTarget:action: 继承自 UIGestureRecognizer，SIO_swizzleInstance
+    // 会在本类落地新 IMP、orig 指向父类实现，不污染父类（v1.8.19 防护规则）。
+    Class lpr = objc_getClass("UILongPressGestureRecognizer");
+    if (lpr) {
+        SIO_swizzleInstance(lpr, @selector(initWithTarget:action:),
+                            (IMP)sio_LPR_init, (IMP *)&o_lpr_init);
+        SIO_swizzleInstance(lpr, @selector(initWithCoder:),
+                            (IMP)sio_LPR_initCoder, (IMP *)&o_lpr_initCoder);
+        SIO_swizzleInstance(lpr, @selector(setMinimumPressDuration:),
+                            (IMP)sio_LPR_setMinDur, (IMP *)&o_lpr_setMinDur);
     }
 
     if (layer) {
@@ -2320,7 +2552,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.0 (SIOriginal v1.8.19) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.1 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

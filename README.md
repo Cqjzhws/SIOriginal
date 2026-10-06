@@ -1,19 +1,37 @@
 # SIOriginal — iOS 动画加速 + 真后台保活
 
-面向 iOS 14–17（含 iOS 16/17）的动画加速方案，v1.8.19 共 **50+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
+面向 iOS 14–17（含 iOS 16/17）的动画加速方案，v2.0.1 共 **70+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
+
+## v2.0.1 修复（配置真实性审计 · 假功能清零）
+逐键核对「配置 App 写 plist → dylib 读 plist → hook 真实生效」全链路：
+- **长按加速落地**：LongPress / LongPressDuration 在 v2.0.0 只有界面开关，dylib 从未读取实现；
+  现 hook `UILongPressGestureRecognizer` 的 init/initWithCoder:/setMinimumPressDuration:，
+  只把系统默认 0.5s 替换为配置时长，App 自定义时长透传
+- **生效提示落地**：Notify 开关承诺的「保存后目标 App 顶部 1.5s 提示」此前无实现；
+  现补不拦截触摸（userInteractionEnabled=NO）的顶部 toast，仅前台显示、1.5s 节流
+- **setter 强黏落地**：滑行加急 / 点击零延迟新增 setDecelerationRate: /
+  setDelaysContentTouches: hook，App 任何时候写回都会被拦回（旧版只在 didMoveToWindow 设一次）
+- **转圈加载提速**：UIActivityIndicatorView 由「完全不加速」改为按全局倍率加速并钳制
+  0.4s 平滑下限（×5 下不再是界面上最慢的元素，且不频闪）
+- **崩溃修复**：转圈检测对非 UIView 的 layer.delegate 发 superview 会 unrecognized selector，
+  增加类型门 + @try 兜底
+- **配置 App 修复**：关闭某 App 专属开关时旧覆盖字典未删除（旧参数继续生效、开关关不掉）；
+  切换 Bundle ID 时控件残留上一个 App 的值
 
 ## 特性
 
 **动画加速**
-- 三种模式：加速（×1–×50）、慢放（×1–×10）、瞬切（0.01s）
+- 三种模式：加速（×1–×50）、慢放（×1–×10）、瞬切（Floor 下限）
 - 弹簧参数缩放（保持物理一致性）
-- 进阶转场（导航栈 / 模态弹窗）
-- 显式动画额外倍率 LayerBoost（转圈/进度/旋转单独加速 ×1–×10）
+- 进阶转场（导航栈 / 模态弹窗）+ 转场独立额外倍率 TransitionBoost（×1/×1.5/×2/×3）
+- 显式动画额外倍率 LayerBoost（进度/旋转/地图相机单独加速 ×1–×10；转圈走独立平滑下限）
+- 动画时长下限 Floor（0.005 / 0.01 / 0.02 / 0.05s 可配）
 - 列表加速（TV/CV 全家桶，高危，默认关）
 - 缩放动画加速（UIScrollView，实验性，默认关）
-- 交互手感：滑行惯性加急 + 点击零延迟
+- 交互手感：滑行惯性加急 + 点击零延迟（setter 强黏）+ 长按手势加速（0.20/0.30/0.40s）
 - UIKit 全局动画系数（×5/×10/×20/极端档）
 - 系统动态效果：减弱动态效果 / 交叉淡出 / 减少透明度
+- 一键预设（极速/均衡/保守/瞬切）、配置 JSON 导入导出、注入环境自检
 
 **v1.8.18 新增 hook**
 - UIRefreshControl：beginRefreshing / endRefreshing
@@ -35,7 +53,7 @@
 
 **安全防护**
 - CAAnimation 幂等缩放标记（修双重缩放 bug）
-- 列表 hook 硬保护名单（顺丰同城骑士 / SpringBoard 永不开启）
+- 列表 hook 硬保护名单（SpringBoard 永不开启；顺丰同城骑士 v1.8.19 起移出名单，由用户黑名单/专属覆盖控制）
 - 微信图片预览放大态全局旁路
 - 所有原 IMP 调用前判空 + 重复安装保护 + @try 包裹
 
@@ -63,9 +81,14 @@
 <key>Extra</key><true/>
 <key>ListAccel</key><false/>
 <key>ZoomAccel</key><false/>
-<key>FastScroll</key><false/>
-<key>FastTap</key><false/>
+<key>FastScroll</key><true/>
+<key>FastTap</key><true/>
+<key>LongPress</key><true/>
+<key>LongPressDuration</key><real>0.30</real>
 <key>LayerBoost</key><real>1.0</real>
+<key>Floor</key><real>0.02</real>
+<key>TransitionBoost</key><real>1.0</real>
+<key>Notify</key><true/>
 <key>Blacklist</key><array><string>com.tencent.wework</string></array>
 <key>FUBGEnabled</key><true/>
 <key>FUBGSceneFake</key><true/>
