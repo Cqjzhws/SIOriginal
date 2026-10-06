@@ -1536,8 +1536,8 @@ static void SIOriginalInit(void) {
     if (gListHardGuarded) {
         NSLog(@"[SIOriginal] %@ is on the list-hook hard-guard list: ListAccel is forced OFF (safety)", gSelfBundle);
     }
-    // v2.0.2：启动注入确认 toast（gNotify=YES 时）
-    SIO_showInjectToast(0);
+    // v2.0.5：启动注入确认 toast 已移除（用户反馈：每次打开 App 都弹太烦）
+    // 保存配置后的 toast（SIO_showNotifyToast）保留，用于确认设置生效
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
