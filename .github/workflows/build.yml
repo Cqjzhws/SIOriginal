@@ -50,6 +50,16 @@ jobs:
         echo "--- dylib id:"; otool -D SIOriginal.dylib
         echo "--- dylib entitlements (必须为空):"; ldid -e SIOriginal.dylib || true
 
+        # v2.0.6 新增：构建后立即做结构审计。
+        # 起因：v2.0.6 发布的产物里，FAT 头第 2 个架构条目是**畸形的** ——
+        # 它声明为 x86_64，但指向的偏移处实际是 ASCII 字符串
+        # （"ppOverride\0_SIO_bundleID\0"），根本不是 Mach-O 头。
+        # `lipo -info` 只读 FAT 头的架构名列表，不校验每个条目是否真能解析，
+        # 因此这个缺陷能一路通过 CI，直到注入器实际读 slice 时才炸。
+        # 审计脚本会逐条目校验 magic / 段覆盖自洽性，并在发现畸形条目时直接失败。
+        echo "--- 结构审计:"
+        python3 tools/audit_dylib.py SIOriginal.dylib
+
     - name: Build App
       run: |
         set -e
@@ -103,6 +113,14 @@ jobs:
         echo "== IPA 必须包含包签名清单"
         unzip -l SIOriginal.ipa | grep -q '_CodeSignature/CodeResources'
         ls -l SIOriginal.dylib SIOriginal.ipa
+
+    - name: Static source check
+      run: |
+        set -e
+        # 在花时间编译之前先做静态核查：括号配平 / 原 IMP 判空 / hook 符号配对。
+        # 这些是本项目历史上反复出现过的错误类别（见 README 的 v1.8.12 条目），
+        # 静态阶段就能拦下，比等 clang 报错更快、报错信息也更直白。
+        python3 tools/static_check.py .
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

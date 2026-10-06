@@ -179,6 +179,10 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
+        // 注：这里用 `if (cfg[k])` 判断的是**指针非空**（Objective-C 裸 id 条件
+        // 语义），不是 NSNumber 的值真伪。@NO / @0 都是 tagged pointer（非 nil），
+        // 因此「关掉开关」能正确写入 @NO，不会被跳过。切勿改成 [cfg[k] boolValue]
+        // 之类的值判断，否则 @NO 会被当缺失而保留旧值。
         if (cfg[k]) merged[k] = cfg[k];
     }
     BOOL ok = [merged writeToFile:PrefPath atomically:YES];

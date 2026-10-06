@@ -164,6 +164,7 @@
 #import <UserNotifications/UserNotifications.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <math.h>
 #import <pthread.h>
 #import <dlfcn.h>
 #import <notify.h>
@@ -353,6 +354,14 @@ static BOOL gListHardGuarded  = NO;
 static void SIO_reload(void) {
     NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
     if (!d) {
+        // v2.0.6：补可观测性。原实现在此静默 return，用户看到「配置没生效」时
+        // 无从判断是 plist 缺失、路径错、还是权限不足 —— 而这三种的处理方式完全不同。
+        // 只在缺配置时打一条日志（每次热重载至多一条，Darwin 通知节流由上层负责），
+        // 并明确「回落默认值」而不是让用户误以为配置已加载。
+        NSLog(@"[SIOriginal] config plist not readable at %s — falling back to built-in defaults "
+              @"(speed x%.1f, mode=accelerate). Write it from the config app, or check "
+              @"/var/Managed Preferences/mobile permissions.",
+              kPrefPath.UTF8String, 5.0);
         gEnabled   = YES;
         gMode      = 0;
         gSpeed     = 5.0;
@@ -571,7 +580,15 @@ static void SIO_showNotifyToast(void) {
 // 此前没有任何可见信号。gNotify 关时静默（避免打扰已确认好用的用户）。
 static void SIO_showInjectToast(int attempt) {
     if (!gNotify || attempt > 5) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+    // v2.0.6 修复：重试退避。原先固定 0.6s 间隔，5 次全挤在头 3 秒内跑完。
+    // 但 SIO_showToast 失败的最常见原因是「App 尚未起完 / 无 active scene」，
+    // 那是秒级以上的事 —— 0.6s 连打 5 次必然全部落空，等于没有重试，
+    // 而用户看到的就是「注入后什么都没弹，不知道到底有没有生效」。
+    // 改为指数退避 0.5→0.75→1.1→1.7→2.5s，累计约 6.5s，覆盖真实冷启动窗口，
+    // 同时总次数不变（不会打扰用户）。
+    static const NSTimeInterval kBackoff[5] = { 0.5, 0.75, 1.1, 1.7, 2.5 };
+    NSTimeInterval delay = (attempt >= 0 && attempt < 5) ? kBackoff[attempt] : 0.6;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         // 未启用 / 黑名单 / 硬保护时也要提示——这正是用户需要知道的「为什么没加速」。
         NSString *msg;
@@ -2022,23 +2039,34 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
         } @catch (__unused NSException *e) { isSpinner = NO; }
 
         if (isSpinner) {
-            double orig = SIO_getOrigDur(anim);
-            if (orig <= 0.0) orig = ((CAAnimation *)anim).duration;
-            if (!SIO_blocked() && orig > 0.0 && o_CAAnim_setDuration) {
-                double nd;
-                if (gMode == 1) {
-                    nd = orig * gSlowFactor;                     // 慢放：转圈同步变慢
-                } else if (gMode == 2) {
-                    nd = MIN(kSIOSpinnerFloor, orig);            // 瞬切：到平滑下限即可，自定义短转圈不反被放慢
-                } else {
-                    nd = orig / (gSpeed > 1.0001 ? gSpeed : 1.0);
+            // 取本轮真实原始时长。saved 是 App 上一次显式 setDuration: 传进来的值
+            // （在 sio_CAAnim_setDuration 入口保存，先于缩放，故为未缩放原值）。
+            // 仅当它与当前值一致时才采信 —— 不一致说明这中间被别处改过
+            // （我们自己的缩放，或 App 直接写 duration），此时用当前值重算。
+            double cur    = ((CAAnimation *)anim).duration;
+            double saved  = SIO_getOrigDur(anim);
+            double orig   = (saved > 0.0 && fabs(saved - cur) < 1e-9) ? saved : cur;
+            if (orig <= 0.0) orig = cur;
+            if (orig > 0.0 && o_CAAnim_setDuration) {
+                if (!SIO_blocked()) {
+                    // 与通用分支一致地打标：转圈动画会被 -setAnimating: 反复
+                    // addAnimation，同一实例多次进入本函数，标记让重复缩放可被识别。
+                    SIO_markAnimScaled(anim);
+                    double nd;
+                    if (gMode == 1) {
+                        nd = orig * gSlowFactor;               // 慢放：转圈同步变慢
+                    } else if (gMode == 2) {
+                        nd = MIN(kSIOSpinnerFloor, orig);
+                    } else {
+                        nd = orig / (gSpeed > 1.0001 ? gSpeed : 1.0);
+                    }
+                    // 钳制：不低于 0.4s，也绝不比原始时长更慢（兼容自定义短时长转圈）
+                    if (nd < kSIOSpinnerFloor) nd = MIN(kSIOSpinnerFloor, orig);
+                    if (nd != cur) o_CAAnim_setDuration(anim, @selector(setDuration:), nd);
+                } else if (cur != orig) {
+                    // 黑名单 / 全局禁用 / 微信放大态：还原到本轮原始时长
+                    o_CAAnim_setDuration(anim, @selector(setDuration:), orig);
                 }
-                // 钳制：不低于 0.4s，也绝不比原始时长更慢（兼容自定义短时长转圈）
-                if (nd < kSIOSpinnerFloor) nd = MIN(kSIOSpinnerFloor, orig);
-                if (nd != orig) o_CAAnim_setDuration(anim, @selector(setDuration:), nd);
-            } else if (orig > 0.0 && o_CAAnim_setDuration) {
-                // 黑名单 / 全局禁用 / 微信放大态：还原 setDuration: 时保存的原始时长
-                o_CAAnim_setDuration(anim, @selector(setDuration:), orig);
             }
             o_layer_addAnim(self, _cmd, anim, key);
             return;

@@ -1,6 +1,30 @@
 # SIOriginal — iOS 动画加速 + 真后台保活
 
-面向 iOS 14–17（含 iOS 16/17）的动画加速方案，v2.0.1 共 **70+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
+面向 iOS 14–17（含 iOS 16/17）的动画加速方案，共 **70+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
+
+## v2.0.6 修复
+
+对已发布产物做 Mach-O 级审计 + 源码静态核查后的修复：
+
+- **[真缺陷] 转圈动画缺少缩放标记**：`-[CALayer addAnimation:forKey:]` 的
+  `UIActivityIndicatorView` 分支改完时长后没有打 `SIO_animScaled` 标记，
+  而通用分支的防重复缩放守卫正依赖该标记。转圈动画是无限重复动画、
+  会被 `-setAnimating:` 反复 `addAnimation:` 同一实例，缺标记等于该守卫
+  对它永久失效。同时补上原始时长取值判据（仅当保存值与当前值一致时采信）。
+- **[体验] 注入确认提示重试改为指数退避**：原固定 0.6s × 5 次全挤在头 3 秒，
+  而 toast 失败主因是「App 未起完」（秒级事件），必然全部落空等于没重试。
+  改为 0.5→0.75→1.1→1.7→2.5s，累计约 6.5s，总次数不变。
+- **[可观测性] 配置缺失时补日志**：`SIO_reload` 原本静默回落默认值，
+  用户无法区分「plist 缺失 / 路径错 / 权限不足」，现在会明确说明。
+- **[工具] 新增 `tools/static_check.py`**：编译前静态核查（括号配平、
+  原 IMP 判空、hook 符号配对）。本项目历史上多次因漏写 `SIO_REQUIRE_ORIG`
+  出错，静态阶段拦下比等 clang 报错更快。已接入 CI 与 `build.sh`。
+- **[工具] 新增 `tools/audit_dylib.py`**：Mach-O 结构审计，逐条目校验
+  FAT 架构表。起因是 v2.0.6 产物里 FAT 头第 2 个架构条目畸形
+  （声明 x86_64，实际指向 ASCII 字符串 `ppOverride`），
+  而 `lipo -info` 不校验这个，能一路过 CI。已接入 CI 与 `build.sh`。
+
+详见 [ANALYSIS.md](ANALYSIS.md)。
 
 ## v2.0.1 修复（配置真实性审计 · 假功能清零）
 逐键核对「配置 App 写 plist → dylib 读 plist → hook 真实生效」全链路：
