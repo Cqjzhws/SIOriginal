@@ -674,6 +674,7 @@ static int LayerIndexForBoost(double b) {
                          ?: @"com.sfic.knight");
     
     _ovBundle = [[UITextField alloc] init];
+    _ovBundle.translatesAutoresizingMaskIntoConstraints = NO;   // 必须设 NO，否则与高度/四边约束冲突被压成 0 高度
     _ovBundle.text = ovFirst;
     _ovBundle.placeholder = @"com.sfic.knight";
     _ovBundle.borderStyle = UITextBorderStyleRoundedRect;
