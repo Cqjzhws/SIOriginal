@@ -967,27 +967,16 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
 
     // 注入/环境自检
     [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"注入/环境自检" subtitle:nil]];
-    SIOCardView *c2 = [[SIOCardView alloc] init];
     UIButton *recheck = [UIButton buttonWithType:UIButtonTypeSystem];
     [recheck setTitle:@"🔍 重新检测" forState:UIControlStateNormal];
     recheck.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    recheck.backgroundColor = [UIColor tertiarySystemGroupedBackgroundColor];
-    recheck.layer.cornerRadius = 10;
+    recheck.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    recheck.layer.cornerRadius = 14;
     recheck.translatesAutoresizingMaskIntoConstraints = NO;
     [recheck addTarget:self action:@selector(onSelfCheck) forControlEvents:UIControlEventTouchUpInside];
-    [NSLayoutConstraint activateConstraints:@[
-        [recheck.heightAnchor constraintEqualToConstant:44],
-    ]];
-    UIView *recheckPad = [[UIView alloc] init];
-    recheckPad.translatesAutoresizingMaskIntoConstraints = NO;
-    [recheckPad addSubview:recheck];
-    [NSLayoutConstraint activateConstraints:@[
-        [recheck.topAnchor constraintEqualToAnchor:recheckPad.topAnchor constant:8],
-        [recheck.leadingAnchor constraintEqualToAnchor:recheckPad.leadingAnchor constant:16],
-        [recheck.trailingAnchor constraintEqualToAnchor:recheckPad.trailingAnchor constant:-16],
-        [recheck.bottomAnchor constraintEqualToAnchor:recheckPad.bottomAnchor constant:-8],
-    ]];
-    [c2 addRow:recheckPad isLast:NO];
+    [recheck.heightAnchor constraintEqualToConstant:50].active = YES;
+    [stack addArrangedSubview:recheck];
+    SIOCardView *c2 = [[SIOCardView alloc] init];
     _selfCheck = [self label:@"" size:12 dim:YES];
     _selfCheck.numberOfLines = 0;
     [c2 addRow:[self hintRow:_selfCheck] isLast:YES];
