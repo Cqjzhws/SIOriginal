@@ -157,11 +157,40 @@
 //   「按全局倍率加速、但钳制 0.4s 下限」：60Hz 下每圈约 24 帧仍平滑，彻底消除
 //   ×5 下转圈反而显得最慢的违和感；不吃 LayerBoost；慢放模式依旧慢放。
 // =========================================================================
+//
+// ==================== v2.0.7 bug 修复 + 性能优化 + UI 加速增强 ====================
+// [真 bug] CATransaction set→get 双重缩放。v2.0.4 加的 +animationDuration
+//   getter hook 会对「已经被 setter hook 缩放过的值」再缩一次：
+//   App set 0.5 → setter 存 0.1（×5）→ 任何读取再缩成 0.02。两条写入路径
+//   （sio_CATransaction_setDur 缩放写入 / SIO_setTransactionDuration 原样写入）
+//   都会中招。修法：CATransaction 状态本身是线程私有的，用 __thread 记录本线程
+//   最近一次写入值，getter 命中即原样返回，只缩「未经我们写入的默认值」。
+// [性能·加载提速] dylib 不再链接 AVFoundation / UserNotifications。
+//   链接期依赖会让 dyld 在**每个**被注入 App 的冷启动路径上加载整套
+//   AVFoundation（连带 CoreMedia/CoreAudio 依赖链），即使该 App 从不用保活。
+//   改为首次进入后台、真正需要音频断言时才 dlopen + dlsym 解析符号；
+//   UserNotifications 类改为 objc_getClass 惰性获取（宿主不用通知时零成本）。
+// [性能·热路径] gAnimNoop 恒等快速路径。加速模式 ×1 时所有时长换算都是
+//   恒等变换，但 42 个 CATransaction 包裹点（触控高亮/单元格选中/滚动偏移…）
+//   每次仍要 begin/set/commit 事务栈，纯开销还会把上下文时长强制成 0.25。
+//   恒等时直接透传，恢复系统原生行为。
+// [性能·热路径] CAAnimation setDuration: 恒等时跳过关联对象读写；
+//   CALayer addAnimation: 恒等时跳过整条转圈检测链（superlayer 遍历 +
+//   NSStringFromClass 分配）；_fbg_appState 的 dladdr 调用点判定加 8 槽
+//   直映缓存（后台期 applicationState 是高频查询，dladdr 要遍历镜像表）。
+// [新覆盖] UIViewPropertyAnimator startAnimationAfterDelay: 延迟同比缩放
+//   （此前 init 时长已缩放、start 延迟原样放行，行为不一致）。
+// [新覆盖] UIDocumentInteractionController presentOptionsMenuFromRect:/
+//   presentOpenInMenuFromRect:（v1.8.18 只接了 presentPreviewAnimated:）。
+// [新功能] LayoutAccel 开关（默认关）：包裹 -[UIView layoutIfNeeded]，
+//   加速 SwiftUI/自动布局的隐式布局动画（CATransaction getter hook 覆盖
+//   不到的读取路径）。实验性，配置 App 显式开启。
+// =========================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
-#import <AVFoundation/AVFoundation.h>
-#import <UserNotifications/UserNotifications.h>
+// v2.0.7：不再 import AVFoundation / UserNotifications —— 二者改为运行时惰性
+// 解析（dlopen + dlsym / objc_getClass），把链接依赖从注入 App 的启动路径上拿掉。
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <math.h>
@@ -191,6 +220,11 @@ static double   gTransitionBoost = 1.0; // v2.0.0：转场独立额外倍率，�
 static BOOL     gLongPress = YES;    // v2.0.1：长按手势加速（默认 0.5s → 配置时长），默认开
 static double   gLongPressDuration = 0.30; // v2.0.1：长按触发时长，默认 0.30s
 static BOOL     gNotify = YES;       // v2.0.1：保存配置后在前台目标 App 顶部弹 1.5s 提示
+static BOOL     gLayoutAccel = NO;   // v2.0.7：layoutIfNeeded 隐式布局动画加速（实验），默认关
+// v2.0.7：加速模式 ×1 时所有时长换算均为恒等变换 —— CATransaction 包裹类 hook
+// 此时 begin/set/commit 纯属开销（且会把上下文时长强制成 0.25/0.35），统一短路。
+// 在 SIO_reload 末尾按最终生效值（含 App 覆盖）计算。
+static BOOL     gAnimNoop = NO;
 // v2.0.1：转圈（UIActivityIndicatorView）专属时长下限。旋转动画低于该值会因
 // 帧率采样混叠出现频闪/视觉倒转（×5 把 1s 压到 0.2s 时肉眼像"越转越慢"）。
 // 0.4s ≈ 每秒 2.5 圈，60Hz 下每圈约 24 帧，平滑且明显比系统默认快。
@@ -378,10 +412,12 @@ static void SIO_reload(void) {
         gLongPress = YES;
         gLongPressDuration = 0.30;
         gNotify = YES;
+        gLayoutAccel = NO;
         gSelfBlacklisted = NO;
         gHasAppOverride  = NO;
         gListHardGuarded = SIO_listHardBlocked();
         if (gListHardGuarded) gListAccel = NO;
+        gAnimNoop = (gMode == 0 && gSpeed <= 1.0001);
         return;
     }
     gEnabled = [d[@"Enabled"] boolValue];
@@ -417,6 +453,8 @@ static void SIO_reload(void) {
     gLongPressDuration = (lp >= 0.1 && lp <= 2.0) ? lp : 0.30;
     // v2.0.1：保存后顶部生效提示，缺键默认开
     gNotify = d[@"Notify"] ? [d[@"Notify"] boolValue] : YES;
+    // v2.0.7：layoutIfNeeded 隐式布局动画加速（实验），缺键默认关
+    gLayoutAccel = d[@"LayoutAccel"] ? [d[@"LayoutAccel"] boolValue] : NO;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -479,6 +517,8 @@ static void SIO_reload(void) {
             double lp2 = [ovr[@"LongPressDuration"] doubleValue];
             if (lp2 >= 0.1 && lp2 <= 2.0) gLongPressDuration = lp2;
         }
+        // v2.0.7：LayoutAccel 的 App 级覆盖
+        if (ovr[@"LayoutAccel"]) gLayoutAccel = [ovr[@"LayoutAccel"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -488,6 +528,8 @@ static void SIO_reload(void) {
               @"(list hooks break this app's list state machine)", SIO_bundleID());
         gListAccel = NO;
     }
+    // v2.0.7：按最终生效值（含 App 覆盖）计算恒等标记，热路径快速短路用
+    gAnimNoop = (gMode == 0 && gSpeed <= 1.0001);
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -770,6 +812,8 @@ static id     (*o_pa_initWithDurTP)(id, SEL, double, id, void (^)(void));
 static id     (*o_pa_initWithDurCP)(id, SEL, double, CGPoint, CGPoint, void (^)(void));
 static id     (*o_pa_initWithDurSpring)(id, SEL, double, double, void (^)(void));
 static id     (*o_pa_runningPA)(id, SEL, double, double, UIViewAnimationOptions, void (^)(void), void (^)(BOOL));
+// v2.0.7：startAnimationAfterDelay: 的延迟此前原样放行，与块动画延迟缩放不一致
+static void   (*o_pa_startAfterDelay)(id, SEL, double);
 
 // ---- UIScrollView 滚动动画 ----
 static void   (*o_sv_setContentOffset)(id, SEL, CGPoint, BOOL);
@@ -816,6 +860,11 @@ static void   (*o_navItem_setLargeTitle)(id, SEL, NSInteger);
 // v1.8.19：真实 API 为 setViewControllers:direction:animated:completion:（带 animated 与 completion）
 static void   (*o_pageVC_setVC)(id, SEL, NSArray *, UIPageViewControllerNavigationDirection, BOOL, void (^)(void));
 static void   (*o_docInteract_present)(id, SEL, BOOL);
+// v2.0.7：文档交互控制器补全（选项菜单 / 打开方式菜单，均返回 BOOL）
+static BOOL   (*o_docInteract_optionsMenu)(id, SEL, CGRect, id, BOOL);
+static BOOL   (*o_docInteract_openInMenu)(id, SEL, CGRect, id, BOOL);
+// v2.0.7：LayoutAccel 实验开关的 hook 点（隐式布局动画）
+static void   (*o_view_layoutIfNeeded)(id, SEL);
 // v2.0.4：加载图标 / 隐式动画盲区
 static NSTimeInterval (*o_CATransaction_getDur)(id, SEL);
 static void   (*o_indicator_start)(id, SEL);
@@ -852,25 +901,40 @@ static void   (*o_cv_setLayoutComp)(id, SEL, id, BOOL, void (^)(BOOL));
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
+    // v2.0.7：恒等快速路径。换算结果与传入值相同（如加速 ×1、LayerBoost=1）时，
+    // 跳过关联对象的 save/mark（每显式动画一次 NSNumber 分配 + 两次 assoc 写）。
+    // 跳过是安全的：addAnimation: 兜底分支在恒等配置下同样算不出新值，不会漏缩。
+    double nd = SIO_targetDurationLayer(d);
+    if (nd == d) { o_CAAnim_setDuration(self, _cmd, d); return; }
     // v2.0.0：保存原始时长，供 addAnimation: 路径还原 UIActivityIndicatorView 等
     // 不应被加速的动画使用
     SIO_saveOrigDur(self, d);
     // v1.8.15：显式设时长视为新意图，按传入值缩放并重新打标
     //（不因已有标记而跳过，否则「add 之后再改时长」会被错误忽略）
     // v1.8.17：走 LayerBoost 版本（显式动画可单独加倍率）
-    o_CAAnim_setDuration(self, _cmd, SIO_targetDurationLayer(d));
+    o_CAAnim_setDuration(self, _cmd, nd);
     SIO_markAnimScaled(self);
 }
 
 #pragma mark - CATransaction
 
+// v2.0.7：记录本线程最近一次经我们写入 CATransaction 的时长。
+// CATransaction 的事务状态是线程私有的，写入与隐式动画的读取必然同线程，
+// 因此 __thread 记录即可精确对齐「这个值是不是我们刚写进去的」。
+// 供 getter hook 识别，避免对已有值二次缩放（见 sio_CATransaction_getDur）。
+static __thread double gTxLastSetDur = -1.0;
+
 static void sio_CATransaction_setDur(id self, SEL _cmd, double d) {
     SIO_REQUIRE_ORIG(o_CATransaction_setDur);
     if (SIO_inUIViewAnim() || SIO_blocked()) {
+        // SIO_setTransactionDuration 走这里：d 是调用方已算好的终值，原样写入
+        gTxLastSetDur = d;
         o_CATransaction_setDur(self, _cmd, d);
         return;
     }
-    o_CATransaction_setDur(self, _cmd, SIO_targetDuration(d));
+    double nd = SIO_targetDuration(d);
+    gTxLastSetDur = nd;
+    o_CATransaction_setDur(self, _cmd, nd);
 }
 
 #pragma mark - UIView 块动画（class methods）
@@ -1145,6 +1209,10 @@ static void sio_tab_setVC(id self, SEL _cmd, UIViewController *vc) {
 static BOOL SIO_listOK(void) { return gListAccel && !SIO_blocked(); }
 
 static void SIO_listWrap(void (^block)(void)) {
+    // v2.0.7：恒等快速路径。42 个调用点里含触控级频率的（UIControl 高亮/选中、
+    // 单元格选中），加速 ×1 时 begin/set/commit 事务栈是纯开销，且会把
+    // 上下文时长强制成 0.25（比系统原生行为还多一层干预）。恒等时直接放行。
+    if (gAnimNoop) { block(); return; }
     [CATransaction begin];
     // v1.8.12：改走 SIO_setTransactionDuration。原来直接调 setAnimationDuration:，
     // 被自己的 hook 再缩放一次（0.25 在 ×5 下变成 0.01 而非预期的 0.05）。
@@ -1360,10 +1428,49 @@ static void sio_pageVC_setVC(id self, SEL _cmd, NSArray *vcs,
 // UIDocumentInteractionController：文档预览弹出动画
 static void sio_docInteract_present(id self, SEL _cmd, BOOL animated) {
     SIO_REQUIRE_ORIG(o_docInteract_present);
-    if (SIO_blocked() || !animated) { o_docInteract_present(self, _cmd, animated); return; }
+    if (SIO_blocked() || !animated || gAnimNoop) { o_docInteract_present(self, _cmd, animated); return; }
     [CATransaction begin];
     SIO_setTransactionDuration(SIO_targetDuration(0.3));
     o_docInteract_present(self, _cmd, animated);
+    [CATransaction commit];
+}
+
+// v2.0.7：同族补全 —— 选项菜单 / 「打开方式」菜单（分享/导出文档场景常用，
+// 此前只有 presentPreviewAnimated: 被接管）。两者均返回 BOOL。
+static BOOL sio_docInteract_optionsMenu(id self, SEL _cmd, CGRect r, id v, BOOL anim) {
+    if (__builtin_expect(o_docInteract_optionsMenu == NULL, 0)) return NO;
+    if (SIO_blocked() || !anim || gAnimNoop) return o_docInteract_optionsMenu(self, _cmd, r, v, anim);
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.3));
+    BOOL ret = o_docInteract_optionsMenu(self, _cmd, r, v, anim);
+    [CATransaction commit];
+    return ret;
+}
+static BOOL sio_docInteract_openInMenu(id self, SEL _cmd, CGRect r, id v, BOOL anim) {
+    if (__builtin_expect(o_docInteract_openInMenu == NULL, 0)) return NO;
+    if (SIO_blocked() || !anim || gAnimNoop) return o_docInteract_openInMenu(self, _cmd, r, v, anim);
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.3));
+    BOOL ret = o_docInteract_openInMenu(self, _cmd, r, v, anim);
+    [CATransaction commit];
+    return ret;
+}
+
+// ==================== v2.0.7：LayoutAccel（实验，默认关）====================
+// -[UIView layoutIfNeeded] 是 SwiftUI/自动布局隐式动画的汇聚点：
+// App 改约束后调用它触发布局，期间产生的隐式动画时长取自当前事务
+// （v2.0.4 的 +animationDuration getter hook 只覆盖「读类方法」的路径，
+//  UIKit 内部直接读事务状态的读取拦截不到）。在这里统一包裹事务时长，
+// 让这些隐式布局动画真正吃到加速。
+// 风险说明（默认关的原因）：UIView 块动画的 animations 块内也常会调
+// layoutIfNeeded，嵌套事务会让这层布局动画改用我们的时长而非外层弹簧参数 ——
+// 方向仍是加速、量级一致，但与原生时序不同，故需显式开启。
+static void sio_view_layoutIfNeeded(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_view_layoutIfNeeded);
+    if (!gLayoutAccel || gAnimNoop || SIO_blocked()) { o_view_layoutIfNeeded(self, _cmd); return; }
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.25));
+    o_view_layoutIfNeeded(self, _cmd);
     [CATransaction commit];
 }
 
@@ -1374,6 +1481,11 @@ static NSTimeInterval sio_CATransaction_getDur(id self, SEL _cmd) {
     SIO_REQUIRE_ORIG_ZERO(o_CATransaction_getDur);
     NSTimeInterval d = o_CATransaction_getDur(self, _cmd);
     if (SIO_blocked()) return d;
+    // v2.0.7 真 bug 修复：若该值是本线程刚经我们写入的（setter 缩放写入或
+    // SIO_setTransactionDuration 原样写入的终值），它已经是缩放结果，
+    // 再缩一次就是 set→get 双重缩放（0.5 → 0.1 → 0.02）。命中即原样返回，
+    // 只对「未经我们写入的值」（典型：系统默认 0.25）做缩放。
+    if (gTxLastSetDur >= 0.0 && fabs(d - gTxLastSetDur) < 1e-9) return d;
     return SIO_targetDuration(d);
 }
 
@@ -1735,10 +1847,13 @@ static void SIOriginalInit(void) {
     // v2.0.6：控件/栏/单元格全路径覆盖（Switch/Slider/Progress/Picker/DatePicker/Segmented/
     //         PageControl/EffectView/Control/UINavigationBar/UIToolbar/UITabBar/Nav显隐/
     //         TVCell/CVCell/CV performBatchUpdates/setCollectionViewLayout）
-    NSLog(@"[SIOriginal] v2.0.6 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.7：修 CATransaction set→get 双重缩放；gAnimNoop 恒等快速路径；
+    //         AVFoundation/UserNotifications 惰性加载（启动提速）；
+    //         PA startAfterDelay 延迟缩放；文档菜单补全；LayoutAccel 实验开关
+    NSLog(@"[SIOriginal] v2.0.7 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
-          gLongPress, gLongPressDuration, gNotify, gHasAppOverride, gListHardGuarded);
+          gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop, gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
     }
@@ -1820,6 +1935,17 @@ static id sio_PA_runningPA(id self, SEL _cmd, double d, double delay, UIViewAnim
     return r;
 }
 
+// v2.0.7：-[UIViewPropertyAnimator startAnimationAfterDelay:]
+// 该入口的延迟此前原样放行 —— init 时长已被缩放而 start 延迟不缩，行为不一致
+// （链式动画在加速模式下会出现「动画飞快但间隔照旧」的违和）。延迟换算与
+// 块动画 animateWithDuration:delay: 保持同一套 SIO_targetDelay 语义：
+// 加速 ÷speed、慢放 ×slowFactor、瞬切归零。
+static void sio_PA_startAfterDelay(id self, SEL _cmd, double delay) {
+    SIO_REQUIRE_ORIG(o_pa_startAfterDelay);
+    if (SIO_blocked()) { o_pa_startAfterDelay(self, _cmd, delay); return; }
+    o_pa_startAfterDelay(self, _cmd, SIO_targetDelay(delay));
+}
+
 #pragma mark - UIScrollView 滚动动画
 
 // 图片预览缩放保护（v1.8.3 修复微信发图预览放大后无法返回）：
@@ -1848,7 +1974,8 @@ static BOOL SIO_svZoomEngaged(UIScrollView *sv) {
 
 static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated) {
     SIO_REQUIRE_ORIG(o_sv_setContentOffset);
-    if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
+    // v2.0.7：gAnimNoop（加速 ×1）时事务包裹是纯开销，直接透传
+    if (SIO_blocked() || !animated || gAnimNoop || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_setContentOffset(self, _cmd, p, animated); return;
     }
     // 瞬切模式下直接跳过动画（性能最优）
@@ -1868,7 +1995,7 @@ static void sio_SV_setContentOffset(id self, SEL _cmd, CGPoint p, BOOL animated)
 
 static void sio_SV_scrollRect(id self, SEL _cmd, CGRect r, BOOL animated) {
     SIO_REQUIRE_ORIG(o_sv_scrollRect);
-    if (SIO_blocked() || !animated || SIO_svZoomEngaged((UIScrollView *)self)) {
+    if (SIO_blocked() || !animated || gAnimNoop || SIO_svZoomEngaged((UIScrollView *)self)) {
         o_sv_scrollRect(self, _cmd, r, animated); return;
     }
     if (gEnabled && gMode == 2) {
@@ -2005,6 +2132,11 @@ static id sio_LPR_initCoder(id self, SEL _cmd, id coder) {
 
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     SIO_REQUIRE_ORIG(o_layer_addAnim);
+    // v2.0.7：恒等快速路径。加速 ×1 时下面的转圈检测（superlayer 链遍历 +
+    // NSStringFromClass 分配 + assoc 查询）对所有分支都算不出新时长，
+    // 纯属每个显式动画一次的固定开销，直接透传。
+    // （恒等配置下从未写入过缩放值，因此也无需走「还原」分支。）
+    if (gAnimNoop) { o_layer_addAnim(self, _cmd, anim, key); return; }
     // UIActivityIndicatorView 的转圈动画是无限重复的 transform.rotation。
     // v2.0.0 曾直接跳过不缩放，结果 ×5 下转圈反而成了界面上最慢的元素；
     // v2.0.1 改为「按全局倍率加速、钳制 0.4s 下限」，既明显变快又不频闪。
@@ -2101,6 +2233,7 @@ static void SIO_installiOS16Extras(void) {
     Class pa = objc_getClass("UIViewPropertyAnimator");
     Class sv = objc_getClass("UIScrollView");
     Class layer = objc_getClass("CALayer");
+    Class uv = objc_getClass("UIView");   // v2.0.7：LayoutAccel（layoutIfNeeded）用
 
     if (pa) {
         SIO_swizzleInstance(pa, @selector(setDuration:),
@@ -2119,6 +2252,9 @@ static void SIO_installiOS16Extras(void) {
         // 传元类等于去根元类查找，必然 NULL —— 原来这一行是静默失效的死代码。
         SIO_swizzleClass(pa, @selector(runningPropertyAnimatorWithDuration:delay:options:animations:completion:),
                          (IMP)sio_PA_runningPA, (IMP *)&o_pa_runningPA);
+        // v2.0.7：startAnimationAfterDelay: 延迟同比缩放（与 init 时长缩放配套）
+        SIO_swizzleInstance(pa, @selector(startAnimationAfterDelay:),
+                            (IMP)sio_PA_startAfterDelay, (IMP *)&o_pa_startAfterDelay);
     }
 
     if (sv) {
@@ -2188,6 +2324,18 @@ static void SIO_installiOS16Extras(void) {
     if (docInteract && class_getInstanceMethod(docInteract, @selector(presentPreviewAnimated:))) {
         SIO_swizzleInstance(docInteract, @selector(presentPreviewAnimated:),
                             (IMP)sio_docInteract_present, (IMP *)&o_docInteract_present);
+        // v2.0.7：选项菜单 / 打开方式菜单（选择器存在性由 swizzle 内部静默跳过保证）
+        SIO_swizzleInstance(docInteract, @selector(presentOptionsMenuFromRect:inView:animated:),
+                            (IMP)sio_docInteract_optionsMenu, (IMP *)&o_docInteract_optionsMenu);
+        SIO_swizzleInstance(docInteract, @selector(presentOpenInMenuFromRect:inView:animated:),
+                            (IMP)sio_docInteract_openInMenu, (IMP *)&o_docInteract_openInMenu);
+    }
+
+    // v2.0.7：LayoutAccel（实验，默认关）—— UIView layoutIfNeeded 在 UIView 本类
+    // 自有实现，swizzle 只换本类 IMP，全部子类继承，覆盖 nib/代码/SwiftUI 宿主视图。
+    if (uv && class_getInstanceMethod(uv, @selector(layoutIfNeeded))) {
+        SIO_swizzleInstance(uv, @selector(layoutIfNeeded),
+                            (IMP)sio_view_layoutIfNeeded, (IMP *)&o_view_layoutIfNeeded);
     }
 
     // ==================== v2.0.4：加载图标 / SwiftUI / 隐式动画盲区 ====================
@@ -2318,7 +2466,32 @@ static BOOL    gUseAudio  = NO;   // 本 App 是否启用音频断言
 static BOOL    gPhysBg    = NO;   // 物理上是否处于后台（由真实生命周期通知维护）
 static BOOL    gHasAudioMode = NO;
 
-static AVAudioPlayer *gPlayer = nil;
+// ---- v2.0.7：AVFoundation 惰性加载（启动提速）----
+// 此前 dylib 链接期依赖 AVFoundation —— dyld 会在**每个**被注入 App 的冷启动
+// 路径上加载整套框架（连带 CoreMedia/CoreAudio 一串依赖），即使该 App 从不
+// 进后台保活。改为首次真正需要音频断言时才 dlopen，类与字符串常量全部
+// 运行时解析；用到的枚举值是 iOS 6/10 起冻结的 ABI 常量，直接内联：
+//   AVAudioSessionCategoryOptionMixWithOthers               = 1
+//   AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation = 1
+//   AVAudioSessionInterruptionTypeEnded                     = 0
+//   AVAudioSessionInterruptionOptionShouldResume            = 1
+@protocol SIOAVPlayer <NSObject>
+- (instancetype)initWithData:(NSData *)data error:(NSError **)outError;
+- (BOOL)prepareToPlay;
+- (BOOL)play;
+- (void)pause;
+- (BOOL)isPlaying;
+- (void)setNumberOfLoops:(NSInteger)n;
+- (void)setVolume:(float)v;
+@end
+
+@protocol SIOAVSession <NSObject>
+- (BOOL)setCategory:(NSString *)category withOptions:(NSUInteger)options error:(NSError **)outError;
+- (BOOL)setActive:(BOOL)active error:(NSError **)outError;
+- (BOOL)setActive:(BOOL)active withOptions:(NSUInteger)options error:(NSError **)outError;
+@end
+
+static id<SIOAVPlayer> gPlayer = nil;
 static UIBackgroundTaskIdentifier gTask = 0;   // 0 = 无桥接任务（UIBackgroundTaskInvalid 非文件级编译期常量）
 static NSTimer *gWatchdog = nil;
 
@@ -2433,30 +2606,48 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
     if (gUseScene && gPhysBg) {
         // 推送/通知框架需要真实答案：前台态时它们不会建立后台接收通道
         void *ret = __builtin_extract_return_addr(__builtin_return_address(0));
-        Dl_info info;
-        if (dladdr(ret, &info) && info.dli_fname) {
-            NSString *image = [NSString stringWithUTF8String:info.dli_fname] ?: @"";
-            if ([image containsString:@"UserNotifications"] ||
-                [image containsString:@"PushKit"]) {
-                return UIApplicationStateBackground;
+        // v2.0.7：dladdr 需遍历已加载镜像表，而后台期 applicationState 是高频
+        // 查询（音频会话 / 定时器 / 推送框架轮询）。调用点地址是稳定的，
+        // 用 8 槽直映缓存记住「该调用点是否来自推送/通知框架」；
+        // 多线程并发写同一槽最坏只是重算一次，结果幂等，无需加锁。
+        static void *cacheAddr[8] = {0};
+        static BOOL  cacheIsPush[8] = {0};
+        uintptr_t slot = ((uintptr_t)ret >> 4) & 7;
+        BOOL isPush;
+        if (__builtin_expect(cacheAddr[slot] == ret, 1)) {
+            isPush = cacheIsPush[slot];
+        } else {
+            isPush = NO;
+            Dl_info info;
+            if (dladdr(ret, &info) && info.dli_fname) {
+                NSString *image = [NSString stringWithUTF8String:info.dli_fname] ?: @"";
+                if ([image containsString:@"UserNotifications"] ||
+                    [image containsString:@"PushKit"]) {
+                    isPush = YES;
+                }
             }
+            cacheAddr[slot] = ret;
+            cacheIsPush[slot] = isPush;
         }
+        if (isPush) return UIApplicationStateBackground;
         return UIApplicationStateActive;
     }
     return gOrigAppState ? gOrigAppState(self, _cmd) : UIApplicationStateActive;
 }
 
 // ---- 通知横幅伪装 ----
-static void (*gOrigWillPresent)(id, SEL, UNUserNotificationCenter *, UNNotification *,
-                                void (^)(UNNotificationPresentationOptions));
+// v2.0.7：UserNotifications 改为惰性解析（objc_getClass），类型一律用 id。
+// 展示选项常量为 iOS 10 起冻结的 ABI 值：Badge=1 Sound=2 Alert=4 Banner=16(iOS14+)。
+// 部署目标 iOS 14+，直接用 Banner；| Sound | Badge = 16|2|1 = 19。
+#define SIO_UN_PRESENT_BANNER_SOUND_BADGE ((NSUInteger)19)
 
-static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center,
-                             UNNotification *note,
-                             void (^handler)(UNNotificationPresentationOptions)) {
+static void (*gOrigWillPresent)(id, SEL, id, id, void (^)(NSUInteger));
+
+static void _fbg_willPresent(id self, SEL _cmd, id center,
+                             id note,
+                             void (^handler)(NSUInteger)) {
     if (gUseScene && gPhysBg) {
-        handler(UNNotificationPresentationOptionBanner |
-                UNNotificationPresentationOptionSound |
-                UNNotificationPresentationOptionBadge);
+        handler(SIO_UN_PRESENT_BANNER_SOUND_BADGE);
     } else if (gOrigWillPresent) {
         gOrigWillPresent(self, _cmd, center, note, handler);
     }
@@ -2464,7 +2655,7 @@ static void _fbg_willPresent(id self, SEL _cmd, UNUserNotificationCenter *center
 
 static void (*gOrigUNSetDelegate)(id, SEL, id);
 
-static void _fbg_unSetDelegate(id self, SEL _cmd, id<UNUserNotificationCenterDelegate> delegate) {
+static void _fbg_unSetDelegate(id self, SEL _cmd, id delegate) {
     if (gOrigUNSetDelegate) gOrigUNSetDelegate(self, _cmd, delegate);
     if (delegate) {
         Class dc = [delegate class];
@@ -2498,21 +2689,92 @@ static void _fbg_installSceneHooks(void) {
         method_setImplementation(stateM, (IMP)_fbg_appState);
     }
 
-    Class unClass = [UNUserNotificationCenter class];
-    Method delM = class_getInstanceMethod(unClass, @selector(setDelegate:));
-    if (delM) {
-        gOrigUNSetDelegate = (void (*)(id, SEL, id))method_getImplementation(delM);
-        method_setImplementation(delM, (IMP)_fbg_unSetDelegate);
+    // v2.0.7：objc_getClass 惰性获取 —— 宿主 App 不用通知框架时该类不存在，
+    // 横幅伪装本就无事可做，直接跳过（同时不再把框架拖进启动路径）。
+    Class unClass = objc_getClass("UNUserNotificationCenter");
+    if (unClass) {
+        Method delM = class_getInstanceMethod(unClass, @selector(setDelegate:));
+        if (delM) {
+            gOrigUNSetDelegate = (void (*)(id, SEL, id))method_getImplementation(delM);
+            method_setImplementation(delM, (IMP)_fbg_unSetDelegate);
+        }
     }
 }
 
 #pragma mark - 引擎二：音频断言
 
+// v2.0.7：惰性解析 AVFoundation。首次进入后台真正需要音频断言时才 dlopen，
+// 成功同时注册打断/路由变更两个通知（字符串常量此前不存在，不能提前注册 ——
+// 用 nil 名注册会订阅到全部通知）。宿主 App 自己已链接 AVFoundation 时
+// dlopen 只是引用计数 +1，零额外加载。
+static Class gAVPlayerCls  = Nil;
+static Class gAVSessionCls = Nil;
+static NSString *gAVCatPlayback  = nil;
+static NSString *gAVNoteInt      = nil;
+static NSString *gAVNoteRoute    = nil;
+static NSString *gAVKeyIntType   = nil;
+static NSString *gAVKeyIntOption = nil;
+
+static void _fbg_onInterruption(NSNotification *note); // 前向声明（惰性注册用）
+
+static BOOL _fbg_avEnsure(void) {
+    if (gAVSessionCls && gAVPlayerCls) return YES;
+    static dispatch_once_t once;
+    __block BOOL ok = NO;
+    dispatch_once(&once, ^{
+        @try {
+            void *h = dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation",
+                             RTLD_LAZY | RTLD_LOCAL);
+            if (!h) { NSLog(@"[FUBG] dlopen AVFoundation failed: %s", dlerror()); return; }
+            Class p = objc_getClass("AVAudioPlayer");
+            Class s = objc_getClass("AVAudioSession");
+            // 字符串常量从框架句柄解析（RTLD_LOCAL 下不能依赖 RTLD_DEFAULT 全局域）
+            NSString **cat = (NSString **)dlsym(h, "AVAudioSessionCategoryPlayback");
+            NSString **ni  = (NSString **)dlsym(h, "AVAudioSessionInterruptionNotification");
+            NSString **nr  = (NSString **)dlsym(h, "AVAudioSessionRouteChangeNotification");
+            NSString **kt  = (NSString **)dlsym(h, "AVAudioSessionInterruptionTypeKey");
+            NSString **ko  = (NSString **)dlsym(h, "AVAudioSessionInterruptionOptionKey");
+            if (!p || !s || !cat || !*cat || !ni || !*ni || !nr || !*nr ||
+                !kt || !*kt || !ko || !*ko) {
+                NSLog(@"[FUBG] AVFoundation symbols incomplete, audio engine disabled");
+                return;
+            }
+            gAVPlayerCls = p; gAVSessionCls = s;
+            gAVCatPlayback = *cat; gAVNoteInt = *ni; gAVNoteRoute = *nr;
+            gAVKeyIntType = *kt; gAVKeyIntOption = *ko;
+            // 打断/路由变更通知此时才注册（此前常量不存在）
+            [[NSNotificationCenter defaultCenter] addObserverForName:gAVNoteInt
+                object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *n){ _fbg_onInterruption(n); }];
+            [[NSNotificationCenter defaultCenter] addObserverForName:gAVNoteRoute
+                object:nil queue:[NSOperationQueue mainQueue]
+                usingBlock:^(__unused NSNotification *n){
+                    if (gUseAudio && gPhysBg) {
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            if (gPlayer && ![gPlayer isPlaying]) [gPlayer play];
+                        });
+                    }
+                }];
+            ok = YES;
+            NSLog(@"[FUBG] AVFoundation lazily loaded (audio engine ready)");
+        } @catch (__unused NSException *e) {}
+    });
+    return ok;
+}
+
+static id<SIOAVSession> _fbg_session(void) {
+    // +sharedInstance 是类方法，经 objc_msgSend 显式签名调用（无参、返回 id），
+    // 不依赖编译器对「id<协议> 上调类方法」的可见性推断。
+    return ((id<SIOAVSession> (*)(Class, SEL))objc_msgSend)(gAVSessionCls,
+                                                            @selector(sharedInstance));
+}
+
 static BOOL _fbg_activateSession(void) {
+    if (!_fbg_avEnsure()) return NO;
     NSError *e = nil;
-    AVAudioSession *s = [AVAudioSession sharedInstance];
-    if (![s setCategory:AVAudioSessionCategoryPlayback
-            withOptions:AVAudioSessionCategoryOptionMixWithOthers error:&e] || e) {
+    id<SIOAVSession> s = _fbg_session();
+    if (![s setCategory:gAVCatPlayback withOptions:1 /* MixWithOthers */ error:&e] || e) {
         NSLog(@"[FUBG] setCategory failed: %@", e); return NO;
     }
     e = nil;
@@ -2526,10 +2788,10 @@ static void _fbg_buildAndPlay(void) {
     @try {
         NSData *data = [[NSData alloc] initWithBase64EncodedString:kFBGNoiseB64
                                                           options:NSDataBase64DecodingIgnoreUnknownCharacters];
-        AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithData:data error:nil];
+        id<SIOAVPlayer> p = [[gAVPlayerCls alloc] initWithData:data error:nil];
         if (!p) return;
-        p.numberOfLoops = -1;
-        p.volume = 0.0f;
+        [p setNumberOfLoops:-1];
+        [p setVolume:0.0f];
         [p prepareToPlay];
         [p play];
         gPlayer = p;
@@ -2546,7 +2808,7 @@ static void _fbg_startAudio(void) {
                 if (gTask != 0) { [app endBackgroundTask:gTask]; gTask = 0; }
             }];
         }
-        if (_fbg_activateSession() && (!gPlayer || !gPlayer.isPlaying)) {
+        if (_fbg_activateSession() && (!gPlayer || ![gPlayer isPlaying])) {
             if (gPlayer) { [gPlayer play]; }
             else { _fbg_buildAndPlay(); }
         }
@@ -2556,13 +2818,11 @@ static void _fbg_startAudio(void) {
 
 static void _fbg_stopAudio(BOOL releaseSession) {
     @try {
-        if (gPlayer.isPlaying) [gPlayer pause];
+        if ([gPlayer isPlaying]) [gPlayer pause];
         // 经验（Immortalizer 作者）：mix 模式下保持 session 激活、不主动 setActive:NO，
         // 可避免与目标 App 自身音频会话打架造成的卡顿；仅彻底关闭时通知他人恢复。
-        if (releaseSession) {
-            [[AVAudioSession sharedInstance] setActive:NO
-                                          withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation
-                                                error:nil];
+        if (releaseSession && gAVSessionCls) {
+            [_fbg_session() setActive:NO withOptions:1 /* NotifyOthersOnDeactivation */ error:nil];
         }
         UIApplication *app = [UIApplication sharedApplication];
         if (gTask != 0) { [app endBackgroundTask:gTask]; gTask = 0; }
@@ -2573,7 +2833,7 @@ static void _fbg_stopAudio(BOOL releaseSession) {
 static void _fbg_watchdogFire(__unused NSTimer *t) {
     if (!gUseAudio || !gPhysBg) return;
     @try {
-        if (!gPlayer || !gPlayer.isPlaying) {
+        if (!gPlayer || ![gPlayer isPlaying]) {
             NSLog(@"[FUBG] watchdog: player stopped, rebuilding");
             _fbg_activateSession();
             if (gPlayer) { [gPlayer play]; }
@@ -2583,11 +2843,11 @@ static void _fbg_watchdogFire(__unused NSTimer *t) {
 }
 
 static void _fbg_onInterruption(NSNotification *note) {
-    if (!gUseAudio) return;
-    NSNumber *type = note.userInfo[AVAudioSessionInterruptionTypeKey];
-    if (type.unsignedIntegerValue != AVAudioSessionInterruptionTypeEnded) return;
-    NSNumber *opt = note.userInfo[AVAudioSessionInterruptionOptionKey];
-    if (opt.unsignedIntegerValue & AVAudioSessionInterruptionOptionShouldResume) {
+    if (!gUseAudio || !gAVKeyIntType) return;
+    NSNumber *type = note.userInfo[gAVKeyIntType];
+    if (type.unsignedIntegerValue != 0 /* AVAudioSessionInterruptionTypeEnded */) return;
+    NSNumber *opt = note.userInfo[gAVKeyIntOption];
+    if (opt.unsignedIntegerValue & 1 /* AVAudioSessionInterruptionOptionShouldResume */) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (gUseAudio && gPhysBg) {
@@ -2896,7 +3156,7 @@ static void _fbg_onEnterForeground(CFNotificationCenterRef c, void *o, CFStringR
     (void)c; (void)o; (void)n; (void)obj; (void)info;
     gPhysBg = NO;
     // 回前台只暂停播放、保留会话（mix 模式下不与 App 音频冲突）
-    if (gPlayer.isPlaying) [gPlayer pause];
+    if ([gPlayer isPlaying]) [gPlayer pause];
     if (gTask != 0) {
         [[UIApplication sharedApplication] endBackgroundTask:gTask];
         gTask = 0;
@@ -2911,7 +3171,7 @@ static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
           gActive, gUseScene, gUseAudio, gShowBall, gHasAppOverride);
     // v1.8.10：悬浮球全局禁用，无需刷新
     if (!gUseAudio && gPhysBg) _fbg_stopAudio(NO);
-    if (gUseAudio && gPhysBg && (!gPlayer || !gPlayer.isPlaying)) _fbg_startAudio();
+    if (gUseAudio && gPhysBg && (!gPlayer || ![gPlayer isPlaying])) _fbg_startAudio();
 }
 
 #pragma mark - 入口
@@ -2942,19 +3202,9 @@ static void FUBGEntry(void) {
             (__bridge CFStringRef)kNotifyName, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionInterruptionNotification
-            object:nil queue:[NSOperationQueue mainQueue]
-            usingBlock:^(NSNotification *n){ _fbg_onInterruption(n); }];
-        [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionRouteChangeNotification
-            object:nil queue:[NSOperationQueue mainQueue]
-            usingBlock:^(__unused NSNotification *n){
-                if (gUseAudio && gPhysBg) {
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        if (gPlayer && !gPlayer.isPlaying) [gPlayer play];
-                    });
-                }
-            }];
+        // v2.0.7：音频会话打断/路由变更通知不再在此注册 —— AVFoundation 改为惰性
+        // 加载后，通知名字符串常量此刻尚不存在（用 nil 名注册会订阅全部通知），
+        // 统一移到 _fbg_avEnsure() 内、框架真正加载成功时注册。
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (gUseAudio) {
@@ -2965,7 +3215,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.1 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.7 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

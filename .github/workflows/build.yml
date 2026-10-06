@@ -30,11 +30,14 @@ jobs:
         # A12+ 设备（iPhone XS 及以后）主程序默认加载 arm64e slice；
         # 注入的 dylib 若只有 arm64，TrollFools 注入后 dyld 会拒绝加载，
         # 表现为「注入成功但功能完全不生效」。必须双架构。
+        # v2.0.7：不再链接 AVFoundation / UserNotifications（启动提速）。
+        # 链接期依赖会让 dyld 在每个注入 App 的冷启动路径上加载整套框架，
+        # 二者已改为运行时惰性解析（dlopen+dlsym / objc_getClass）。
         clang -dynamiclib -O2 \
           -arch arm64 -arch arm64e \
           -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
           -target arm64-apple-ios14.0 \
-          -framework UIKit -framework QuartzCore -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
+          -framework UIKit -framework QuartzCore -framework CoreGraphics \
           -fobjc-arc \
           -Wl,-no_fixup_chains \
           -install_name @rpath/SIOriginal.dylib \
@@ -50,13 +53,20 @@ jobs:
         echo "--- dylib id:"; otool -D SIOriginal.dylib
         echo "--- dylib entitlements (必须为空):"; ldid -e SIOriginal.dylib || true
 
-        # v2.0.6 新增：构建后立即做结构审计。
-        # 起因：v2.0.6 发布的产物里，FAT 头第 2 个架构条目是**畸形的** ——
-        # 它声明为 x86_64，但指向的偏移处实际是 ASCII 字符串
-        # （"ppOverride\0_SIO_bundleID\0"），根本不是 Mach-O 头。
-        # `lipo -info` 只读 FAT 头的架构名列表，不校验每个条目是否真能解析，
-        # 因此这个缺陷能一路通过 CI，直到注入器实际读 slice 时才炸。
-        # 审计脚本会逐条目校验 magic / 段覆盖自洽性，并在发现畸形条目时直接失败。
+        # v2.0.7：链接依赖断言 —— dylib 不得再链接 AVFoundation/UserNotifications
+        if otool -L SIOriginal.dylib | grep -qE "AVFoundation|UserNotifications"; then
+          echo "::error::dylib 不应链接 AVFoundation/UserNotifications（v2.0.7 起惰性加载）"
+          otool -L SIOriginal.dylib
+          exit 1
+        fi
+        echo "--- 无 AVFoundation/UserNotifications 链接依赖 ✓"
+
+        # 构建后立即做结构审计：逐条目校验 FAT 架构表 magic / 段覆盖自洽性，
+        # 发现问题直接失败（lipo -info 只读架构名列表，不校验条目是否真能解析）。
+        # 先跑审计脚本自身的回归测试（历史教训：审计脚本 v1 曾把标准 20 字节
+        # fat_arch 误按 24 字节步长解析，把健康产物误报为畸形、误杀 CI）。
+        echo "--- 审计脚本回归测试:"
+        python3 tools/test_audit_dylib.py
         echo "--- 结构审计:"
         python3 tools/audit_dylib.py SIOriginal.dylib
 

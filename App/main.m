@@ -158,6 +158,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"LayerBoost"])       d[@"LayerBoost"]       = @1.0;
     if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @1.0;
     if (!d[@"Notify"])           d[@"Notify"]           = @YES;
+    if (!d[@"LayoutAccel"])      d[@"LayoutAccel"]      = @NO;
     if (!d[@"Blacklist"])        d[@"Blacklist"]        = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -176,6 +177,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist", @"ZoomAccel",
                           @"FastScroll", @"FastTap", @"LongPress", @"LongPressDuration",
                           @"Floor", @"LayerBoost", @"TransitionBoost", @"Notify",
+                          @"LayoutAccel",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
@@ -472,7 +474,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UISegmentedControl *_segFloor, *_segLayer, *_segTrans;
     UILabel *_floorHint, *_layerHint, *_transHint;
     // 手感
-    UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify;
+    UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout;
     UISegmentedControl *_segLongPress;
     UITextView *_blacklist;
     // 系统
@@ -482,7 +484,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UILabel *_dragHint;
     // 高级 - App覆盖
     UITextField *_ovBundle;
-    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom, *_ovFastScroll, *_ovFastTap, *_ovLongPress;
+    UISwitch *_ovOn, *_ovSpring, *_ovExtra, *_ovList, *_ovZoom, *_ovFastScroll, *_ovFastTap, *_ovLongPress, *_ovLayout;
     UISegmentedControl *_ovLayer, *_ovMode, *_ovFloor, *_ovTrans, *_ovLongPressDur;
     UISlider *_ovSpeed;
     UILabel *_ovSpeedLabel, *_ovGuard;
@@ -581,7 +583,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.0.6 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.0.7 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -767,7 +769,10 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     SIOCardView *c2 = [[SIOCardView alloc] init];
     _swZoom = [[UISwitch alloc] init];
     _swZoom.on = [cfg[@"ZoomAccel"] boolValue];
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画加速（实验，图片预览异常就关）" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_swZoom] isLast:YES];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画加速（实验，图片预览异常就关）" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_swZoom] isLast:NO];
+    _swLayout = [[UISwitch alloc] init];
+    _swLayout.on = [cfg[@"LayoutAccel"] boolValue];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"布局动画加速（实验，SwiftUI/约束布局）" icon:@"squareshape.split.3x3" iconColor:[UIColor systemIndigoColor] control:_swLayout] isLast:YES];
     [stack addArrangedSubview:c2];
 
     // 高危项
@@ -929,6 +934,8 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"列表加速（高危）" icon:@"list.bullet" iconColor:[UIColor systemRedColor] control:_ovList] isLast:NO];
     _ovZoom = [[UISwitch alloc] init]; _ovZoom.on = NO;
     [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画加速" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_ovZoom] isLast:NO];
+    _ovLayout = [[UISwitch alloc] init]; _ovLayout.on = NO;
+    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"布局动画加速（实验）" icon:@"squareshape.split.3x3" iconColor:[UIColor systemIndigoColor] control:_ovLayout] isLast:NO];
     _ovFastScroll = [[UISwitch alloc] init]; _ovFastScroll.on = NO;
     [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"滑行惯性加急" icon:@"hand.swipe.left.fill" iconColor:[UIColor systemOrangeColor] control:_ovFastScroll] isLast:NO];
     _ovFastTap = [[UISwitch alloc] init]; _ovFastTap.on = NO;
@@ -1092,6 +1099,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         _ovExtra.on = [mine[@"Extra"] boolValue];
         _ovList.on = [mine[@"ListAccel"] boolValue];
         _ovZoom.on = [mine[@"ZoomAccel"] boolValue];
+        _ovLayout.on = [mine[@"LayoutAccel"] boolValue];
         _ovFastScroll.on = [mine[@"FastScroll"] boolValue];
         _ovFastTap.on = [mine[@"FastTap"] boolValue];
         _ovLongPress.on = [mine[@"LongPress"] boolValue];
@@ -1110,6 +1118,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         _ovExtra.on = [cfg[@"Extra"] boolValue];
         _ovList.on = [cfg[@"ListAccel"] boolValue];
         _ovZoom.on = [cfg[@"ZoomAccel"] boolValue];
+        _ovLayout.on = [cfg[@"LayoutAccel"] boolValue];
         _ovFastScroll.on = [cfg[@"FastScroll"] boolValue];
         _ovFastTap.on = [cfg[@"FastTap"] boolValue];
         _ovLongPress.on = [cfg[@"LongPress"] boolValue];
@@ -1146,7 +1155,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
 - (void)ovToggled {
     BOOL on = _ovOn.on;
     NSArray *ovControls = @[ _ovMode, _ovSpeed, _ovSpring, _ovExtra,
-                             _ovList, _ovZoom, _ovFastScroll, _ovFastTap,
+                             _ovList, _ovZoom, _ovLayout, _ovFastScroll, _ovFastTap,
                              _ovLongPress, _ovLayer, _ovFloor, _ovTrans, _ovLongPressDur ];
     for (UIControl *c in ovControls) {
         c.enabled = on;
@@ -1175,6 +1184,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (_swLongPress) { cfg[@"LongPress"] = @(_swLongPress.on); }
     if (_segLongPress) { cfg[@"LongPressDuration"] = @(LongPressDurationForIndex((int)_segLongPress.selectedSegmentIndex)); }
     if (_swZoom) { cfg[@"ZoomAccel"] = @(_swZoom.on); }
+    if (_swLayout) { cfg[@"LayoutAccel"] = @(_swLayout.on); }
     if (_swList) { cfg[@"ListAccel"] = @(_swList.on); }
     if (_swNotify) { cfg[@"Notify"] = @(_swNotify.on); }
     // 系统 tab
@@ -1207,6 +1217,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
                 mine[@"Extra"] = @(_ovExtra.on);
                 mine[@"ListAccel"] = @(_ovList.on);
                 mine[@"ZoomAccel"] = @(_ovZoom.on);
+                mine[@"LayoutAccel"] = @(_ovLayout.on);
                 mine[@"FastScroll"] = @(_ovFastScroll.on);
                 mine[@"FastTap"] = @(_ovFastTap.on);
                 mine[@"LongPress"] = @(_ovLongPress.on);
@@ -1312,7 +1323,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.0.6 (build 50)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 2.0.7 (build 51)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"

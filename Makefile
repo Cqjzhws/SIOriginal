@@ -9,6 +9,9 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = SIOriginal
 SIOriginal_FILES = Tweak/SIOriginal.m
 SIOriginal_CFLAGS = -fobjc-arc
-SIOriginal_FRAMEWORKS = UIKit QuartzCore AVFoundation UserNotifications
+# v2.0.7：不再链接 AVFoundation / UserNotifications —— 链接期依赖会让 dyld 在
+# 每个被注入 App 的冷启动路径上加载整套框架。二者已改为运行时惰性解析
+# （dlopen+dlsym / objc_getClass），首次进后台真正需要保活时才加载。
+SIOriginal_FRAMEWORKS = UIKit QuartzCore
 
 include $(THEOS_MAKE_PATH)/tweak.mk

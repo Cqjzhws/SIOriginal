@@ -4,7 +4,7 @@
 
 set -e
 
-echo "=== SIOriginal v2.0.6 构建 ==="
+echo "=== SIOriginal v2.0.7 构建 ==="
 
 # 静态核查先行：括号配平 / 原 IMP 判空 / hook 符号配对。
 # 本项目历史上多次因「漏写 SIO_REQUIRE_ORIG」「括号不配平」导致编译失败或
@@ -40,10 +40,12 @@ echo "SDK: $SDK_PATH"
 echo ""
 echo ">>> 构建 SIOriginal.dylib ..."
 # v2.0.2：arm64+arm64e 双架构（A12+ 设备注入要求）
+# v2.0.7：不再链接 AVFoundation / UserNotifications（启动提速 —— 链接期依赖会被
+# dyld 拖进每个注入 App 的冷启动路径；二者已改为运行时惰性解析）
 clang -dynamiclib -O2 -arch arm64 -arch arm64e \
     -isysroot "$SDK_PATH" \
     -target arm64-apple-ios14.0 \
-    -framework UIKit -framework QuartzCore -framework CoreGraphics -framework AVFoundation -framework UserNotifications \
+    -framework UIKit -framework QuartzCore -framework CoreGraphics \
     -fobjc-arc \
     -Wl,-no_fixup_chains \
     -install_name @rpath/SIOriginal.dylib \
@@ -98,12 +100,20 @@ echo "✓ IPA 已构建"
 # 校验
 echo ""
 echo ">>> 校验产物 ..."
-# 结构审计：逐条目校验 FAT 架构表。
-# 起因：v2.0.6 发布产物里 FAT 头第 2 个条目声明 x86_64，但指向的偏移处
-# 实际是 ASCII 字符串而非 Mach-O 头。lipo -info 不校验这个，能一路过 CI。
+# 结构审计：逐条目校验 FAT 架构表 + 段覆盖自洽 + 链接依赖体检。
+# （历史教训：审计脚本 v1 曾把标准 20 字节 fat_arch 误按 24 字节步长解析，
+#  把健康的 arm64e 条目误报为畸形 —— 现有回归测试 tools/test_audit_dylib.py
+#  专门防这类解析器自身回归。）
 if command -v python3 &> /dev/null; then
+    python3 tools/test_audit_dylib.py
     python3 tools/audit_dylib.py SIOriginal.dylib
 fi
+# v2.0.7：链接依赖断言 —— dylib 不得再链接 AVFoundation / UserNotifications
+if otool -L SIOriginal.dylib | grep -qE "AVFoundation|UserNotifications"; then
+    echo "✗ dylib 不应链接 AVFoundation/UserNotifications（v2.0.7 起惰性加载）"
+    exit 1
+fi
+echo "✓ 无 AVFoundation/UserNotifications 链接依赖（惰性加载）"
 otool -D SIOriginal.dylib | grep -q '@rpath/SIOriginal.dylib' && echo "✓ install_name = @rpath/SIOriginal.dylib"
 unzip -l SIOriginal.ipa | grep -q '_CodeSignature/CodeResources' && echo "✓ CodeResources 存在" || echo "⚠ IPA 缺少 CodeResources"
 

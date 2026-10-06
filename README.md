@@ -1,6 +1,29 @@
 # SIOriginal — iOS 动画加速 + 真后台保活
 
-面向 iOS 14–17（含 iOS 16/17）的动画加速方案，共 **70+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
+面向 iOS 14–17（含 iOS 16/17）的动画加速方案，共 **100+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
+
+## v2.0.7 修复 + 性能优化 + UI 加速增强
+
+- **[真 bug] CATransaction set→get 双重缩放**：v2.0.4 的 `+animationDuration`
+  getter hook 会对已被 setter hook 缩放过的值再缩一次（0.5→0.1→0.02）。
+  现用 `__thread` 记录本线程最近一次写入值，getter 命中即原样返回，
+  只缩「未经我们写入的默认值」（CATransaction 状态线程私有，天然对齐）。
+- **[性能·启动提速] dylib 不再链接 AVFoundation / UserNotifications**：
+  链接期依赖会让 dyld 在**每个**被注入 App 的冷启动路径上加载整套
+  AVFoundation（连带 CoreMedia/CoreAudio 依赖链），即使该 App 从不用保活。
+  改为首次进入后台、真正需要音频断言时才 `dlopen`+`dlsym`；
+  UserNotifications 类改为 `objc_getClass` 惰性获取。CI 新增 `otool -L` 断言防回退。
+- **[性能·热路径] gAnimNoop 恒等快速路径**：加速 ×1 时所有时长换算都是
+  恒等变换，但 42 个 CATransaction 包裹点（触控高亮/单元格选中/滚动偏移…）
+  每次仍要 begin/set/commit 事务栈。恒等时直接透传，恢复系统原生行为。
+  另：CAAnimation setDuration: 恒等时跳过关联对象读写；CALayer addAnimation:
+  恒等时跳过整条转圈检测链；保活侧 applicationState 的 dladdr 判定加 8 槽缓存。
+- **[新覆盖]** `UIViewPropertyAnimator startAnimationAfterDelay:` 延迟同比缩放
+  （此前 init 时长缩放、start 延迟原样放行，行为不一致）；
+  `UIDocumentInteractionController` 补全选项菜单 / 打开方式菜单两个入口。
+- **[新功能] LayoutAccel 开关（实验，默认关）**：包裹 `-[UIView layoutIfNeeded]`，
+  加速 SwiftUI/自动布局的隐式布局动画（getter hook 覆盖不到的读取路径），
+  支持全局开关与 App 专属覆盖。
 
 ## v2.0.6 修复
 
@@ -20,9 +43,13 @@
   原 IMP 判空、hook 符号配对）。本项目历史上多次因漏写 `SIO_REQUIRE_ORIG`
   出错，静态阶段拦下比等 clang 报错更快。已接入 CI 与 `build.sh`。
 - **[工具] 新增 `tools/audit_dylib.py`**：Mach-O 结构审计，逐条目校验
-  FAT 架构表。起因是 v2.0.6 产物里 FAT 头第 2 个架构条目畸形
-  （声明 x86_64，实际指向 ASCII 字符串 `ppOverride`），
-  而 `lipo -info` 不校验这个，能一路过 CI。已接入 CI 与 `build.sh`。
+  FAT 架构表（`lipo -info` 只读架构名列表、不校验条目是否真能解析）。
+  已接入 CI 与 `build.sh`。
+- **[更正] 审计脚本 v1 曾误报「v2.0.6 产物 FAT 第 2 条目畸形」**：
+  真相是解析器自身 bug —— 把标准的 20 字节 `fat_arch` 条目误按 24 字节
+  步长解析，第 2 条目错位 4 字节（arm64e 的 cpusubtype 0x80000002 被读成
+  cputype、size 被读成 offset）。发布的 dylib 一直健康（arm64+arm64e）。
+  现有 `tools/test_audit_dylib.py` 回归测试防解析器自身回归。
 
 详见 [ANALYSIS.md](ANALYSIS.md)。
 
@@ -113,6 +140,7 @@
 <key>Floor</key><real>0.02</real>
 <key>TransitionBoost</key><real>1.0</real>
 <key>Notify</key><true/>
+<key>LayoutAccel</key><false/>
 <key>Blacklist</key><array><string>com.tencent.wework</string></array>
 <key>FUBGEnabled</key><true/>
 <key>FUBGSceneFake</key><true/>

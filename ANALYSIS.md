@@ -7,52 +7,54 @@
 
 ## 一、dylib 文件布局
 
-v2.0.6 发布的 dylib 采用双 slice 结构，其中**只有第一个是 FAT 头指向的有效 slice**：
+v2.0.6 发布的 dylib 是标准的双架构 FAT 二进制，**两个 slice 均有效**：
 
 ```
 偏移        大小         内容
-0x00000     56 B         FAT 头（声明 2 个架构）
-0x00038     16,346 B     零填充（对齐到 2^14）
-0x04000     238,016 B    slice A — arm64，FAT 条目 [0] 指向此处
-0x3E000     7,744 B      零填充
+0x00000     48 B         FAT 头（8B 头 + 2 × 20B fat_arch 条目）
+0x00030     16,336 B     零填充（对齐到 2^14）
+0x04000     238,016 B    slice A — arm64
+0x3DFC0     7,744 B      零填充（slice B 对齐到 2^14 所需）
 0x40000     235,920 B    slice B — arm64e，含 __auth_stubs / __auth_got
-0x79BB0     —            文件结束
+0x79990     —            文件结束（262,144 + 235,920 = 498,064，精确到字节）
 ```
 
-两个 slice 各含 **139 个 `_sio_*` 符号**，功能完全相同（日志文案逐字一致：
-`[SIOriginal] v2.0.6 hooks installed in %@ (enabled=%d mode=%d speed=%.1f ...)`），
-差别仅在 slice B 多了 arm64e 指针认证段。`arm64` 与 `arm64e` 在 139 个功能符号上
-**逐一对应，无一方独有**。
-
-### 确认的缺陷：FAT 头第 2 个架构条目畸形
+正确的 FAT 架构表（大端）：
 
 ```
 [0] cputype=0x0100000C (arm64)  subtype=0x0        offset=16,384  size=238,016  align=2^14
-[1] cputype=0x80000002 (x86_64) subtype=0x40000    offset=235,920  size=14      align=2^0
+[1] cputype=0x0100000C (arm64e) subtype=0x80000002 offset=262,144 size=235,920  align=2^14
 ```
 
-第 2 条目指向的偏移 235,920 处并非 Mach-O 头，而是 ASCII 文本：
+两个 slice 各含 **139 个 `_sio_*` 符号**，功能完全相同（日志文案逐字一致），
+差别仅在 slice B 多了 arm64e 指针认证段。`arm64` 与 `arm64e` 在 139 个功能符号上
+**逐一对应，无一方独有**。
 
-```
-70 70 4f 76 65 72 72 69 64 65 00  =  "ppOverride\0"
-5f 53 49 4f 5f 62 75 6e 64 6c 65  =  "_SIO_bundleID"
-```
+### 更正：本节此前「FAT 第 2 条目畸形」的结论是错的
 
-即该条目落在 `__objc_methname` 字符串区中间。`0x80000002` 也不是合法的
-`CPU_ARCH_ABI64|CPU_TYPE_X86_64`（应为 `0x01000007`）。
+本报告旧版本声称第 2 条目「声明 x86_64、offset=235,920 指向 ASCII 字符串
+`ppOverride`、是畸形条目」，并据此推断「文件尾部 243,664 字节（48.9%）冗余」。
+**两条都是审计脚本 v1 的解析 bug 造成的误报，产物本身完全健康**：
 
-**影响**：`lipo -info` 只读取 FAT 头里的架构名列表、不校验每个条目能否解析，
-所以这个缺陷能一路通过 CI 的 `lipo -info | grep arm64` 检查，直到注入器实际
-遍历 slice 时才暴露。`tools/audit_dylib.py` 已加入构建流程拦截此类问题。
+1. Apple 标准 `struct fat_arch` 就是 **20 字节、无 reserved**（reserved 只存在于
+   `fat_arch_64` 的 32 字节条目）。审计脚本 v1 误按 24 字节步长解析，
+   第 2 条目整体错位 4 字节：arm64e 的 cpusubtype `0x80000002` 被读成 cputype
+   （于是错标为 x86_64）、size `235,920` 被读成 offset。
+2. 偏移 235,920 落在 slice A（16,384..254,400）内部的 `__objc_methname`
+   字符串区 —— 所以"指向 ASCII 文本"是错位解析的必然结果，而非条目损坏。
+3. 「尾部 243,664 字节冗余」同样是误算：把第 2 条目的 size 误读为 14 后，
+   覆盖区间在 254,400 处中断，498,064 − 254,400 = 243,664 被错算成"冗余"。
+   实际两个条目 size 之和 + 头部与对齐空隙 = 文件全长，精确吻合，无冗余。
 
-### 冗余数据
+字节级验证：262,144 + 235,920 = 498,064 = 文件总长，且偏移 262,144 处是合法的
+小端 Mach-O 64 头（cputype/subtype 与 FAT 表声明一致）。
+`tools/audit_dylib.py` 已修正解析，并配 `tools/test_audit_dylib.py` 回归测试。
 
-- FAT 条目合计声明 238,030 字节，实际有效内容到 254,400 字节
-- 文件尾部 243,664 字节（占 48.9%）未被任何 slice 覆盖
-- slice A 与 slice B 之间有 7,744 字节零填充
+### 空隙说明
 
-这些不导致功能故障，但会让 dyld 多映射近一半文件。对应你提的「加载提速」：
-产物瘦身是有效方向，详见第五节。
+slice A 与 slice B 之间的 7,744 字节零填充是 2^14（16KB）段对齐的必然结果
+（slice A 结束于 254,400，下一个 16KB 边界为 262,144）。现代 iOS arm64 二进制
+普遍使用 16KB 页对齐，属正常现象，不建议为了省这 ~8KB 改用更小对齐。
 
 ---
 
@@ -68,7 +70,7 @@ Payload/SIOriginal.app/
 
 | 检查项 | 结果 |
 |---|---|
-| 主程序架构 | FAT，2 条目（同样存在畸形 x86_64 条目，offset=177,312 size=14） |
+| 主程序架构 | FAT，2 条目（arm64 + arm64e，健康；旧报告的"畸形 x86_64 条目"同为步长误解析，offset=177,312 实为 arm64e slice 的 size 被错读为 offset） |
 | 主程序 filetype | 2 = `MH_EXECUTE`，正常 |
 | 最低系统 | iOS 14.0（`minos=0xe0000`），SDK 18.5（`sdk=0x120500`） |
 | `embedded.mobileprovision` | **不存在** |
@@ -181,28 +183,37 @@ tagged pointer（arm64 上为 `0x4`，非 nil），因此 `@NO` 能正确写入�
 Mach-O 结构审计，逐条目校验 FAT 架构表。已接入 `build.sh` 与
 `.github/workflows/build.yml`，畸形架构条目会直接让构建失败。
 
-对当前 v2.0.6 产物运行的结果：
+修正步长解析后，对 v2.0.6 产物运行的结果（健康）：
 
 ```
 [0] arm64      offset=16,384  size=238,016  align=2^14
-[1] x86_64(h)  offset=235,920 size=14       align=2^0
-✗ arch[1]: slice 偏移 235920 处不是 Mach-O，实际内容是 ASCII 文本 'ppOverride'
+[1] arm64e     offset=262,144 size=235,920  align=2^14
+✓ 结构健康：所有 FAT 条目均指向合法 Mach-O，段覆盖自洽。
 ```
+
+配套 `tools/test_audit_dylib.py`：用 struct 手工构造 3 个合法样本（双架构 FAT、
+单架构瘦 Mach-O、MH_EXECUTE）与多个畸形样本（offset 越界、size 越界、
+magic 损坏、条目指向 ASCII 区等），断言退出码与关键输出，防止解析器自身回归。
 
 ---
 
 ## 五、后续建议
 
-**加载提速（产物瘦身）**
+**加载提速**
 
-当前 498KB 中约 49% 是未被任何 slice 覆盖的尾部数据。可行方向：
+~~旧版本节基于"49% 尾部冗余"的误算给出瘦身建议，已随第一节更正作废。~~
+真实的提速杠杆在 v2.0.7 已落地两条、剩余一条可选：
 
-1. 用 `ldid` 重新签名后追加的签名区（`LC_CODE_SIGNATURE`）是否可压缩
-2. 确认构建产物为何比源码逻辑所需体积大 2 倍——两个 slice 功能完全相同，
-   理论上只需保留 arm64e 一个（A12+ 为主流），但会牺牲 armv8 老设备兼容性
-3. 剥离调试段：`__DWARF` 不存在，但可检查 `LC_FUNCTION_STARTS` 覆盖范围
+1. ✅ 已做（v2.0.7）：dylib 不再链接 AVFoundation / UserNotifications ——
+   链接期依赖会被 dyld 拖进每个注入 App 的冷启动路径；改为运行时惰性解析后，
+   不用保活的 App 启动路径上完全不再加载这两个框架。
+2. ✅ 已做（v2.0.7）：热路径恒等快速路径（gAnimNoop），加速 ×1 时全部
+   CATransaction 包裹点零包裹开销。
+3. 可选（需用户决策）：arm64e 单架构产物可把体积从 ~486KB 降到 ~236KB，
+   代价是放弃 A11 及更早设备（arm64）。A12+ 已占绝对主流，但属兼容性取舍，
+   不默认改。
 
-这三项都需要真机验证取舍，不建议盲改。
+**功能增强的合理方向**
 
 **功能增强的合理方向**
 
@@ -217,5 +228,23 @@ Mach-O 结构审计，逐条目校验 FAT 架构表。已接入 `build.sh` 与
 
 ---
 
-*本报告基于静态分析生成，未经编译或真机验证。修复 1、2、3 建议在 macOS 上
-构建后于真机确认。*
+## 六、v2.0.7 变更（源码级，待 GitHub Actions 构建验证）
+
+- **真 bug 修复**：CATransaction set→get 双重缩放。v2.0.4 的
+  `+animationDuration` getter hook 对已被 setter 缩放（或经
+  `SIO_setTransactionDuration` 原样写入）的值再缩一次。修：`__thread`
+  记录本线程最近写入值 `gTxLastSetDur`，getter 命中即原样返回。
+- **启动提速**：dylib 解除对 AVFoundation / UserNotifications 的链接依赖，
+  音频引擎首次启用时才 `dlopen` + `dlsym`（`SIOAVPlayer`/`SIOAVSession`
+  协议提供编译期签名，枚举值用冻结 ABI 常量内联）；UN 类 `objc_getClass`
+  惰性获取。CI `otool -L` 断言防回退。
+- **热路径**：`gAnimNoop`（加速 ×1 恒等）短路 42 个 CATransaction 包裹点、
+  UIScrollView 滚动 hook、`addAnimation:` 转圈检测链；`setDuration:` 恒等时
+  免关联对象读写；`_fbg_appState` 的 dladdr 判定加 8 槽直映缓存。
+- **新覆盖**：`startAnimationAfterDelay:` 延迟缩放；
+  UIDocumentInteractionController 选项/打开方式菜单。
+- **新功能**：LayoutAccel 开关（默认关）—— `-[UIView layoutIfNeeded]` 包裹，
+  加速 SwiftUI/自动布局隐式动画；配置 App 全局开关 + App 专属覆盖均已落地。
+
+*本报告基于静态分析生成，未经编译或真机验证。修复 1、2、3 与 v2.0.7 全部
+变更建议在 macOS（GitHub Actions）构建后于真机确认。*
