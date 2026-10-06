@@ -577,7 +577,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.0.3 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.0.4 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -972,8 +972,11 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UIButton *recheck = [UIButton buttonWithType:UIButtonTypeSystem];
     [recheck setTitle:@"🔍 重新检测" forState:UIControlStateNormal];
     recheck.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    recheck.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    recheck.backgroundColor = [UIColor systemBlueColor];
+    [recheck setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     recheck.layer.cornerRadius = 14;
+    recheck.layer.borderWidth = 1;
+    recheck.layer.borderColor = [UIColor systemBlueColor].CGColor;
     recheck.translatesAutoresizingMaskIntoConstraints = NO;
     [recheck addTarget:self action:@selector(onSelfCheck) forControlEvents:UIControlEventTouchUpInside];
     [recheck.heightAnchor constraintEqualToConstant:50].active = YES;
@@ -1305,7 +1308,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.0.3 (build 47)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 2.0.4 (build 48)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"

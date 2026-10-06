@@ -211,6 +211,7 @@ static inline void SIO_setPAInit(BOOL v)    { pthread_setspecific(gInPAInitKey, 
 // 万一 orig 为空，直接放弃本次拦截，绝不对空指针发消息。
 #define SIO_REQUIRE_ORIG(imp)      do { if (__builtin_expect((imp) == NULL, 0)) return; } while (0)
 #define SIO_REQUIRE_ORIG_NIL(imp)  do { if (__builtin_expect((imp) == NULL, 0)) return nil; } while (0)
+#define SIO_REQUIRE_ORIG_ZERO(imp) do { if (__builtin_expect((imp) == NULL, 0)) return 0; } while (0)
 
 // ---------- v1.8.15：CAAnimation 时长缩放幂等标记 ----------
 // 两个入口都会缩放时长：CAAnimation 的 setDuration: 属性 setter，以及
@@ -798,6 +799,9 @@ static void   (*o_navItem_setLargeTitle)(id, SEL, NSInteger);
 // v1.8.19：真实 API 为 setViewControllers:direction:animated:completion:（带 animated 与 completion）
 static void   (*o_pageVC_setVC)(id, SEL, NSArray *, UIPageViewControllerNavigationDirection, BOOL, void (^)(void));
 static void   (*o_docInteract_present)(id, SEL, BOOL);
+// v2.0.4：加载图标 / 隐式动画盲区
+static NSTimeInterval (*o_CATransaction_getDur)(id, SEL);
+static void   (*o_indicator_start)(id, SEL);
 
 #pragma mark - CAAnimation（核心：仅基类，子类自动继承）
 
@@ -1319,6 +1323,27 @@ static void sio_docInteract_present(id self, SEL _cmd, BOOL animated) {
     [CATransaction commit];
 }
 
+// ==================== v2.0.4：加载图标 / 隐式动画盲区实现 ====================
+
+// CATransaction animationDuration getter：SwiftUI/CALayer 隐式动画读取默认时长时缩放
+static NSTimeInterval sio_CATransaction_getDur(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG_ZERO(o_CATransaction_getDur);
+    NSTimeInterval d = o_CATransaction_getDur(self, _cmd);
+    if (SIO_blocked()) return d;
+    return SIO_targetDuration(d);
+}
+
+// UIActivityIndicatorView startAnimating：确保启动时动画时长已缩放
+static void sio_indicator_start(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_indicator_start);
+    if (SIO_blocked()) { o_indicator_start(self, _cmd); return; }
+    // 强制设置当前事务时长为缩放后的值，再启动动画
+    [CATransaction begin];
+    SIO_setTransactionDuration(SIO_targetDuration(0.3));
+    o_indicator_start(self, _cmd);
+    [CATransaction commit];
+}
+
 #pragma mark - 安装
 
 __attribute__((constructor))
@@ -1484,7 +1509,8 @@ static void SIOriginalInit(void) {
     // v2.0.1：落实 LongPress/Notify 两个假功能、FastScroll/FastTap setter 强黏、转圈平滑加速
     // v2.0.2：启动注入确认 toast（消除「是否生效」盲区）；双架构 arm64+arm64e
     // v2.0.3：修复 toast 中文乱码（C 字符串 %s → NSString %@）
-    NSLog(@"[SIOriginal] v2.0.3 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
+    // v2.0.4：补 SwiftUI/CALayer 隐式动画盲区（CATransaction getter + UIActivityIndicatorView startAnimating）
+    NSLog(@"[SIOriginal] v2.0.4 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
           gLongPress, gLongPressDuration, gNotify, gHasAppOverride, gListHardGuarded);
@@ -1924,6 +1950,30 @@ static void SIO_installiOS16Extras(void) {
         SIO_swizzleInstance(docInteract, @selector(presentPreviewAnimated:),
                             (IMP)sio_docInteract_present, (IMP *)&o_docInteract_present);
     }
+
+    // ==================== v2.0.4：加载图标 / SwiftUI / 隐式动画盲区 ====================
+    // 问题：瞬切模式下微信/系统 App 的加载图标（转圈）仍然慢。
+    // 根因：这些动画走 SwiftUI 或 CALayer 隐式动画路径，不经过我们已 hook 的显式 API。
+    //
+    // [盲区 1] CATransaction 默认动画时长：CALayer 属性改变（如 transform.rotation.z）
+    // 时如果没有显式动画，系统会创建默认 CABasicAnimation，时长由 CATransaction
+    // 的 animationDuration 决定。虽然已 hook setAnimationDuration:，但 getter
+    // 也需要 hook——否则 SwiftUI/系统内部读取默认时长时会拿到未缩放的原值。
+    if (catx && class_getClassMethod(catx, @selector(animationDuration))) {
+        SIO_swizzleClass(catx, @selector(animationDuration),
+                         (IMP)sio_CATransaction_getDur, (IMP *)&o_CATransaction_getDur);
+    }
+    // [盲区 2] UIActivityIndicatorView startAnimating：v2.0.1 只处理了动画时长，
+    // 但 startAnimating 会重置动画，确保启动时也应用缩放。
+    Class indicator = objc_getClass("UIActivityIndicatorView");
+    if (indicator) {
+        SIO_swizzleInstance(indicator, @selector(startAnimating),
+                            (IMP)sio_indicator_start, (IMP *)&o_indicator_start);
+    }
+    // [盲区 3] SwiftUI 动画桥接：SwiftUI 的 Animation 是 struct，不能直接 hook。
+    // 但 SwiftUI 最终会通过 UIView/CALayer 的隐式动画执行，上面的 CATransaction
+    // getter hook 会覆盖这条路径。
+    // =========================================================================
 }
 
 #pragma mark - FUBackground v2.0.0 Max 整合（真后台保活）
