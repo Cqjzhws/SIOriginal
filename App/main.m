@@ -564,13 +564,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     hero.translatesAutoresizingMaskIntoConstraints = NO;
     hero.layer.cornerRadius = 16;
     hero.layer.masksToBounds = YES;
-    CAGradientLayer *grad = [CAGradientLayer layer];
-    grad.colors = @[(__bridge id)[UIColor colorWithRed:0.10 green:0.35 blue:0.25 alpha:1.0].CGColor,
-                    (__bridge id)[UIColor colorWithRed:0.05 green:0.15 blue:0.12 alpha:1.0].CGColor];
-    grad.startPoint = CGPointMake(0, 0);
-    grad.endPoint = CGPointMake(1, 1);
-    grad.frame = CGRectMake(0, 0, 360, 90);
-    [hero.layer insertSublayer:grad atIndex:0];
+    hero.backgroundColor = [UIColor colorWithRed:0.08 green:0.28 blue:0.20 alpha:1.0];
     [hero.heightAnchor constraintEqualToConstant:90].active = YES;
 
     UILabel *heroTitle = [[UILabel alloc] init];
