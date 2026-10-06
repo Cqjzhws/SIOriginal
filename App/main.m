@@ -1,5 +1,5 @@
 // SIOriginal — 配置 App（TrollStore 安装）
-// v1.8.18 现代化 UI 重制：分组卡片 + SF Symbol + 动态颜色 + 完整功能
+// v1.8.19：修复 iOS 14 上 systemCyanColor/systemMintColor 崩溃；随 tweak ABI 修复同步发版
 #import <UIKit/UIKit.h>
 #import <spawn.h>
 #import <sys/wait.h>
@@ -25,6 +25,18 @@ extern int reboot(int);
 
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
+
+// v1.8.19：systemCyanColor / systemMintColor 是 iOS 15+ API，在 iOS 14 上调用会
+// unrecognized selector 直接崩溃（README 声明支持 iOS 14）。用 @available 守卫，
+// 旧系统回退到等价的 RGB 颜色。
+static UIColor *SIOCyanColor(void) {
+    if (@available(iOS 15.0, *)) return [UIColor systemCyanColor];
+    return [UIColor colorWithRed:0.0 green:0.75 blue:0.83 alpha:1.0];
+}
+static UIColor *SIOMintColor(void) {
+    if (@available(iOS 15.0, *)) return [UIColor systemMintColor];
+    return [UIColor colorWithRed:0.0 green:0.72 blue:0.65 alpha:1.0];
+}
 
 static NSArray *HardGuardBundles(void) {
     static NSArray *a;
@@ -560,7 +572,7 @@ static int LayerIndexForBoost(double b) {
     _segLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
     _segLayer.selectedSegmentIndex = LayerIndexForBoost([cfg[@"LayerBoost"] doubleValue]);
     [_segLayer addTarget:self action:@selector(layerChanged) forControlEvents:UIControlEventValueChanged];
-    SIOSettingRow *rLayer = [[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:[UIColor systemCyanColor] control:_segLayer];
+    SIOSettingRow *rLayer = [[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:SIOCyanColor() control:_segLayer];
     [card3 addRow:rLayer isLast:NO];
     
     _layerLabel = [self label:@"" size:12 dim:YES];
@@ -606,7 +618,7 @@ static int LayerIndexForBoost(double b) {
     _segDrag = [[UISegmentedControl alloc] initWithItems:@[ @"关", @"×5", @"×10", @"×20", @"极端" ]];
     _segDrag.selectedSegmentIndex = curDragIdx;
     [_segDrag addTarget:self action:@selector(dragChanged) forControlEvents:UIControlEventValueChanged];
-    SIOSettingRow *rDrag = [[SIOSettingRow alloc] initWithTitle:@"全局动画系数" icon:@"slider.horizontal.3" iconColor:[UIColor systemMintColor] control:_segDrag];
+    SIOSettingRow *rDrag = [[SIOSettingRow alloc] initWithTitle:@"全局动画系数" icon:@"slider.horizontal.3" iconColor:SIOMintColor() control:_segDrag];
     [card5 addRow:rDrag isLast:NO];
     
     _dragLabel = [self label:@"" size:12 dim:YES];
@@ -729,7 +741,7 @@ static int LayerIndexForBoost(double b) {
     
     _ovLayer = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×2", @"×3", @"×5", @"×10" ]];
     _ovLayer.selectedSegmentIndex = 0;
-    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:[UIColor systemCyanColor] control:_ovLayer] isLast:NO];
+    [card7 addRow:[[SIOSettingRow alloc] initWithTitle:@"显式动画倍率" icon:@"layers.fill" iconColor:SIOCyanColor() control:_ovLayer] isLast:NO];
     
     _ovGuard = [self label:@"" size:12 dim:YES];
     _ovGuard.textColor = [UIColor systemRedColor];
