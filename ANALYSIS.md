@@ -246,5 +246,16 @@ magic 损坏、条目指向 ASCII 区等），断言退出码与关键输出，�
 - **新功能**：LayoutAccel 开关（默认关）—— `-[UIView layoutIfNeeded]` 包裹，
   加速 SwiftUI/自动布局隐式动画；配置 App 全局开关 + App 专属覆盖均已落地。
 
-*本报告基于静态分析生成，未经编译或真机验证。修复 1、2、3 与 v2.0.7 全部
-变更建议在 macOS（GitHub Actions）构建后于真机确认。*
+## 七、v2.0.8 变更：ProMotion 120Hz 强制
+
+- **新功能 ProMotion120**（默认关，全局，无 App 覆盖）：hook
+  `-[CADisplayLink setPreferredFramesPerSecond:]`（恰好 60 → 设备上限）与
+  `-[CADisplayLink setPreferredFrameRateRange:]`（上限 ≤60 → maximum/preferred
+  拓宽到设备上限，minimum 不动）。这三类安全边界全部落地：
+  刻意低帧（<60，视频同步）不动；60Hz 机型 `maximumFramesPerSecond ≤ 60`
+  → `SIO_pmTarget()` 恒为 0，hook 纯透传、功能零开销；iOS 14 无 range 入口 →
+  swizzle 静默跳过。`CAFrameRateRange` 用 ABI 一致的 3×float 副本
+  （`SIOFrameRateRange`）规避 SDK 的 iOS 15 可用性标注，部署目标保持 iOS 14。
+
+*本报告基于静态分析生成，未经编译或真机验证。修复 1、2、3 与 v2.0.7/v2.0.8
+全部变更建议在 macOS（GitHub Actions）构建后于真机确认。*

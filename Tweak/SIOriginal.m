@@ -186,6 +186,23 @@
 //   加速 SwiftUI/自动布局的隐式布局动画（CATransaction getter hook 覆盖
 //   不到的读取路径）。实验性，配置 App 显式开启。
 // =========================================================================
+//
+// ==================== v2.0.8 ProMotion 120Hz 强制 ====================
+// [新功能] ProMotion120 开关（默认关，全局，无 App 覆盖）：
+//   很多 App 用 CADisplayLink 把渲染循环锁在 60Hz ——
+//     · -[CADisplayLink setPreferredFramesPerSecond:] 传 60；
+//     · iOS 15+ 用 -[CADisplayLink setPreferredFrameRateRange:] 传上限 60。
+//   开关打开后：60 被改写为设备实际上限（ProMotion 机型为 120）；
+//   setPreferredFrameRateRange 上限 ≤60 时把 maximum/preferred 拓宽到设备上限
+//   （minimum 保持不动，维持区间语义）。
+//   [安全边界] 刻意的低帧请求（视频同步 30/24 等，<60）一律不动；
+//   [安全边界] 60Hz 设备 maximumFramesPerSecond=60，整个功能自动无效；
+//   [安全边界] iOS 14 无 setPreferredFrameRateRange:，swizzle 内部静默跳过。
+//   CAFrameRateRange 结构体在 SDK 头文件带 iOS 15 可用性标注，这里用
+//   自定义 3×float 副本（ABI 一致，arm64 HFA 走 s0/s1/s2 寄存器）。
+//   副作用提示：全局 120Hz 会增加功耗；依赖 60 帧节奏的动画计步逻辑
+//   可能行为变化 —— 所以默认关，由用户显式开启。
+// =========================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -221,6 +238,9 @@ static BOOL     gLongPress = YES;    // v2.0.1：长按手势加速（默认 0.5
 static double   gLongPressDuration = 0.30; // v2.0.1：长按触发时长，默认 0.30s
 static BOOL     gNotify = YES;       // v2.0.1：保存配置后在前台目标 App 顶部弹 1.5s 提示
 static BOOL     gLayoutAccel = NO;   // v2.0.7：layoutIfNeeded 隐式布局动画加速（实验），默认关
+// v2.0.8：ProMotion 120Hz 强制。gPM120 仅为配置开关；设备是否真的支持 >60Hz
+// 由 SIO_pmMaxFPS() 惰性判定（60Hz 设备整个功能自动无效）。全局开关，无 App 覆盖。
+static BOOL     gPM120 = NO;
 // v2.0.7：加速模式 ×1 时所有时长换算均为恒等变换 —— CATransaction 包裹类 hook
 // 此时 begin/set/commit 纯属开销（且会把上下文时长强制成 0.25/0.35），统一短路。
 // 在 SIO_reload 末尾按最终生效值（含 App 覆盖）计算。
@@ -413,6 +433,7 @@ static void SIO_reload(void) {
         gLongPressDuration = 0.30;
         gNotify = YES;
         gLayoutAccel = NO;
+        gPM120 = NO;
         gSelfBlacklisted = NO;
         gHasAppOverride  = NO;
         gListHardGuarded = SIO_listHardBlocked();
@@ -455,6 +476,8 @@ static void SIO_reload(void) {
     gNotify = d[@"Notify"] ? [d[@"Notify"] boolValue] : YES;
     // v2.0.7：layoutIfNeeded 隐式布局动画加速（实验），缺键默认关
     gLayoutAccel = d[@"LayoutAccel"] ? [d[@"LayoutAccel"] boolValue] : NO;
+    // v2.0.8：ProMotion 120Hz 强制，缺键默认关（全局开关，无 App 覆盖）
+    gPM120 = d[@"ProMotion120"] ? [d[@"ProMotion120"] boolValue] : NO;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -865,6 +888,12 @@ static BOOL   (*o_docInteract_optionsMenu)(id, SEL, CGRect, id, BOOL);
 static BOOL   (*o_docInteract_openInMenu)(id, SEL, CGRect, id, BOOL);
 // v2.0.7：LayoutAccel 实验开关的 hook 点（隐式布局动画）
 static void   (*o_view_layoutIfNeeded)(id, SEL);
+// v2.0.8：ProMotion 120Hz（CADisplayLink 两处帧率上限入口）
+static void   (*o_dl_setFPS)(id, SEL, NSInteger);
+// CAFrameRateRange ABI：3 × float（arm64 HFA，s0/s1/s2 传参）。自定义副本
+// 规避 SDK 头文件里 iOS 15 的 API 可用性标注，部署目标 iOS 14 也能直接编译。
+typedef struct { float minimum; float maximum; float preferred; } SIOFrameRateRange;
+static void   (*o_dl_setRange)(id, SEL, SIOFrameRateRange);
 // v2.0.4：加载图标 / 隐式动画盲区
 static NSTimeInterval (*o_CATransaction_getDur)(id, SEL);
 static void   (*o_indicator_start)(id, SEL);
@@ -1474,6 +1503,51 @@ static void sio_view_layoutIfNeeded(id self, SEL _cmd) {
     [CATransaction commit];
 }
 
+// ==================== v2.0.8：ProMotion 120Hz 强制（默认关）====================
+// 设备实际上限：maximumFramesPerSecond（iOS 10.3+）。>60 视为 ProMotion 机型；
+// 60Hz 设备返回 0，SIO_pmTarget 随之返回 0，两个 hook 都成为纯透传 ——
+// 老设备上这个功能不产生任何开销（开关之外的判定只有一次布尔读）。
+static NSInteger SIO_pmMaxFPS(void) {
+    static NSInteger maxFPS = 0;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        @try {
+            NSInteger m = [[UIScreen mainScreen] maximumFramesPerSecond];
+            maxFPS = (m > 60) ? m : 0;
+        } @catch (__unused NSException *e) { maxFPS = 0; }
+    });
+    return maxFPS;
+}
+
+// 生效目标帧率：0 = 功能不生效（开关关 / 设备不支持）。hook 每次调用先取它。
+static inline NSInteger SIO_pmTarget(void) {
+    if (!gPM120) return 0;
+    return SIO_pmMaxFPS();
+}
+
+// -[CADisplayLink setPreferredFramesPerSecond:]：只把恰好 60 的上限抬到设备上限。
+// 0（跟随系统，ProMotion 上本就是 120）与 <60 的刻意低帧（视频 30/24 同步）不动。
+static void sio_DL_setFPS(id self, SEL _cmd, NSInteger fps) {
+    SIO_REQUIRE_ORIG(o_dl_setFPS);
+    NSInteger m = SIO_pmTarget();
+    if (m > 60 && fps == 60) fps = m;
+    o_dl_setFPS(self, _cmd, fps);
+}
+
+// -[CADisplayLink setPreferredFrameRateRange:]（iOS 15+）：上限 ≤60 的区间
+// 拓宽到设备上限（maximum、preferred 抬到 m，minimum 保持不动维持区间语义；
+// minimum 本就 ≤60 < m，区间仍合法）。上限 >60 或 0 的请求原样透传。
+static void sio_DL_setRange(id self, SEL _cmd, SIOFrameRateRange range) {
+    SIO_REQUIRE_ORIG(o_dl_setRange);
+    NSInteger m = SIO_pmTarget();
+    if (m > 60 && range.maximum > 0.0f && range.maximum <= 60.0f) {
+        float f = (float)m;
+        range.maximum = f;
+        if (range.preferred < f) range.preferred = f;
+    }
+    o_dl_setRange(self, _cmd, range);
+}
+
 // ==================== v2.0.4：加载图标 / 隐式动画盲区实现 ====================
 
 // CATransaction animationDuration getter：SwiftUI/CALayer 隐式动画读取默认时长时缩放
@@ -1850,10 +1924,11 @@ static void SIOriginalInit(void) {
     // v2.0.7：修 CATransaction set→get 双重缩放；gAnimNoop 恒等快速路径；
     //         AVFoundation/UserNotifications 惰性加载（启动提速）；
     //         PA startAfterDelay 延迟缩放；文档菜单补全；LayoutAccel 实验开关
-    NSLog(@"[SIOriginal] v2.0.7 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d override=%d listGuard=%d)",
+    // v2.0.8：ProMotion120 —— CADisplayLink 60Hz 锁解除（60Hz 设备自动无效）
+    NSLog(@"[SIOriginal] v2.0.8 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d pm=%d override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
-          gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop, gHasAppOverride, gListHardGuarded);
+          gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop, gPM120, gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
     }
@@ -2336,6 +2411,17 @@ static void SIO_installiOS16Extras(void) {
     if (uv && class_getInstanceMethod(uv, @selector(layoutIfNeeded))) {
         SIO_swizzleInstance(uv, @selector(layoutIfNeeded),
                             (IMP)sio_view_layoutIfNeeded, (IMP *)&o_view_layoutIfNeeded);
+    }
+
+    // v2.0.8：ProMotion 120Hz 强制（默认关）。CADisplayLink 的两个帧率上限入口；
+    // setPreferredFrameRateRange: 在 iOS 14 不存在 → class_getInstanceMethod 返回
+    // NULL → swizzle 静默跳过，无需运行版本判断。
+    Class dl = objc_getClass("CADisplayLink");
+    if (dl) {
+        SIO_swizzleInstance(dl, @selector(setPreferredFramesPerSecond:),
+                            (IMP)sio_DL_setFPS, (IMP *)&o_dl_setFPS);
+        SIO_swizzleInstance(dl, @selector(setPreferredFrameRateRange:),
+                            (IMP)sio_DL_setRange, (IMP *)&o_dl_setRange);
     }
 
     // ==================== v2.0.4：加载图标 / SwiftUI / 隐式动画盲区 ====================
@@ -3216,7 +3302,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.0.7 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.0.8 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

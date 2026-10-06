@@ -2,6 +2,20 @@
 
 面向 iOS 14–17（含 iOS 16/17）的动画加速方案，共 **100+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
+## v2.0.8 ProMotion 120Hz 强制
+
+- **[新功能] ProMotion120 开关（默认关，全局）**：很多 App 用 CADisplayLink 把渲染
+  循环锁在 60Hz —— `setPreferredFramesPerSecond:60` 或 iOS 15+ 的
+  `setPreferredFrameRateRange:`（上限 60）。开关打开后：
+  - `setPreferredFramesPerSecond:` 恰好 60 的请求改写为设备实际上限（ProMotion 120）；
+  - `setPreferredFrameRateRange:` 上限 ≤60 的区间把 maximum/preferred 拓宽到设备上限；
+  - **安全边界**：刻意低帧（视频同步 30/24，<60）一律不动；60Hz 机型
+    `maximumFramesPerSecond=60`，整个功能自动无效、零开销；iOS 14 无 range 入口，
+    swizzle 静默跳过；
+  - `CAFrameRateRange` 在 SDK 头文件带 iOS 15 可用性标注，dylib 用 ABI 一致的
+    3×float 结构体副本（arm64 HFA）编译，部署目标仍为 iOS 14；
+  - 副作用：全局 120Hz 增加功耗，依赖 60 帧节奏的动画计步可能变化 —— 默认关。
+
 ## v2.0.7 修复 + 性能优化 + UI 加速增强
 
 - **[真 bug] CATransaction set→get 双重缩放**：v2.0.4 的 `+animationDuration`
@@ -141,6 +155,7 @@
 <key>TransitionBoost</key><real>1.0</real>
 <key>Notify</key><true/>
 <key>LayoutAccel</key><false/>
+<key>ProMotion120</key><false/>
 <key>Blacklist</key><array><string>com.tencent.wework</string></array>
 <key>FUBGEnabled</key><true/>
 <key>FUBGSceneFake</key><true/>

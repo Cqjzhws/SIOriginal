@@ -1,8 +1,8 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.0.7
+Version: 2.0.8
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.0.7：修 CATransaction set→get 双重缩放；dylib 不再链接 AVFoundation/UserNotifications（启动提速，惰性加载）；gAnimNoop 恒等快速路径；新增 PA startAfterDelay 延迟缩放、文档菜单补全、LayoutAccel 实验开关；保留 v1.8.19 起全部安全修复
+Description: 动画加速 Tweak v2.0.8：新增 ProMotion120 强制 120Hz 开关（60Hz 机型自动无效、视频类低帧不动）；v2.0.7 修 CATransaction set→get 双重缩放、dylib 惰性加载 AVFoundation/UserNotifications（启动提速）、gAnimNoop 恒等快速路径、PA startAfterDelay/文档菜单/LayoutAccel 增强；保留 v1.8.19 起全部安全修复
 Maintainer: local
 Author: local
 Section: Tweaks

@@ -159,6 +159,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @1.0;
     if (!d[@"Notify"])           d[@"Notify"]           = @YES;
     if (!d[@"LayoutAccel"])      d[@"LayoutAccel"]      = @NO;
+    if (!d[@"ProMotion120"])     d[@"ProMotion120"]     = @NO;
     if (!d[@"Blacklist"])        d[@"Blacklist"]        = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -177,7 +178,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist", @"ZoomAccel",
                           @"FastScroll", @"FastTap", @"LongPress", @"LongPressDuration",
                           @"Floor", @"LayerBoost", @"TransitionBoost", @"Notify",
-                          @"LayoutAccel",
+                          @"LayoutAccel", @"ProMotion120",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
@@ -474,7 +475,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UISegmentedControl *_segFloor, *_segLayer, *_segTrans;
     UILabel *_floorHint, *_layerHint, *_transHint;
     // 手感
-    UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout;
+    UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout, *_swPM;
     UISegmentedControl *_segLongPress;
     UITextView *_blacklist;
     // 系统
@@ -583,7 +584,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.0.7 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.0.8 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -772,7 +773,10 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩放动画加速（实验，图片预览异常就关）" icon:@"magnifyingglass" iconColor:[UIColor systemTealColor] control:_swZoom] isLast:NO];
     _swLayout = [[UISwitch alloc] init];
     _swLayout.on = [cfg[@"LayoutAccel"] boolValue];
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"布局动画加速（实验，SwiftUI/约束布局）" icon:@"squareshape.split.3x3" iconColor:[UIColor systemIndigoColor] control:_swLayout] isLast:YES];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"布局动画加速（实验，SwiftUI/约束布局）" icon:@"squareshape.split.3x3" iconColor:[UIColor systemIndigoColor] control:_swLayout] isLast:NO];
+    _swPM = [[UISwitch alloc] init];
+    _swPM.on = [cfg[@"ProMotion120"] boolValue];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"强制 120Hz（ProMotion 机型，60Hz 机型无效）" icon:@"gauge.with.needle" iconColor:[UIColor systemGreenColor] control:_swPM] isLast:YES];
     [stack addArrangedSubview:c2];
 
     // 高危项
@@ -1185,6 +1189,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (_segLongPress) { cfg[@"LongPressDuration"] = @(LongPressDurationForIndex((int)_segLongPress.selectedSegmentIndex)); }
     if (_swZoom) { cfg[@"ZoomAccel"] = @(_swZoom.on); }
     if (_swLayout) { cfg[@"LayoutAccel"] = @(_swLayout.on); }
+    if (_swPM) { cfg[@"ProMotion120"] = @(_swPM.on); }
     if (_swList) { cfg[@"ListAccel"] = @(_swList.on); }
     if (_swNotify) { cfg[@"Notify"] = @(_swNotify.on); }
     // 系统 tab
@@ -1323,7 +1328,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.0.7 (build 51)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 2.0.8 (build 52)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"
