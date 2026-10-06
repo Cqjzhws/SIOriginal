@@ -20,6 +20,7 @@ import struct
 import sys
 
 FAT_MAGIC = 0xCAFEBABE
+FAT_MAGIC_64 = 0xCAFEBABF   # fat_arch_64：offset/size 为 8 字节，条目 32 字节
 MH_MAGIC_64 = 0xFEEDFACF
 CPU_ARCH_ABI64 = 0x01000000
 CPU_TYPE_X86 = 0x00000007
@@ -48,10 +49,11 @@ CPU_SUBTYPE_MASK = 0x00FFFFFF
 
 
 def cputype_name(ct, cs):
-    base = ARCH_NAMES.get(ct, f"unknown(0x{ct:x})")
-    if ct == 0x01000000C and (cs & 0x80000000):
+    # arm64 与 arm64e 的 cputype 相同（0x0100000C），靠 cpusubtype 区分：
+    # arm64e 的 subtype 低 24 位为 2 且带能力位 0x80000000
+    if ct == CPU_TYPE_ARM64 and (cs & 0x00FFFFFF) == 2 and (cs & 0x80000000):
         return "arm64e"
-    return base
+    return ARCH_NAMES.get(ct, f"unknown(0x{ct:x})")
 
 
 def parse_slice(d: bytes, off: int, problems: list, label: str):
@@ -146,7 +148,7 @@ def main() -> int:
     print()
 
     magic, narch = struct.unpack_from(">II", d, 0)
-    if magic != FAT_MAGIC:
+    if magic not in (FAT_MAGIC, FAT_MAGIC_64):
         print("非 FAT 二进制（单一 slice）")
         if magic == MH_MAGIC_64:
             info = parse_slice(d, 0, problems, "slice0")
@@ -157,9 +159,19 @@ def main() -> int:
             problems.append(f"根 magic=0x{magic:08x} 既非 FAT 也非 Mach-O 64")
     else:
         print(f"FAT 头: 声明 {narch} 个架构")
+        # fat_arch 条目 20 字节（cputype/subtype/offset/size/align，各 4 字节）；
+        # fat_arch_64 条目 32 字节（offset/size 为 8 字节 + reserved）。
+        # 老版本误按 24 字节步长解析，导致第 2 个条目错位 4 字节、误报畸形。
+        is64 = magic == FAT_MAGIC_64
+        stride = 32 if is64 else 20
         slices = []
         for i in range(narch):
-            ct, cs, off, sz, align, _res = struct.unpack_from(">IIIIII", d, 8 + 24 * i)
+            base = 8 + stride * i
+            ct, cs = struct.unpack_from(">II", d, base)
+            if is64:
+                off, sz, align, _res = struct.unpack_from(">QQII", d, base + 8)
+            else:
+                off, sz, align = struct.unpack_from(">III", d, base + 8)
             print(f"  [{i}] {cputype_name(ct, cs):10s} offset={off:>8,} size={sz:>8,} align=2^{align}")
             slices.append((i, ct, cs, off, sz))
         print()
