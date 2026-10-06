@@ -272,13 +272,13 @@ static NSDictionary *SIO_appOverride(NSDictionary *root) {
 // 名单内 App 的 ListAccel 恒为 NO：全局开关、App 覆盖都无法打开。
 // 名单来源为本项目实测记录 —— 这些 App 的列表 UI 与 TV/CV 变更类 hook 冲突，
 // 会破坏列表状态机导致卡死/崩溃。安全项 fail-safe，不接受"忘了关"。
+// v1.8.19：移除 com.sfic.knight（顺丰同城骑士），由用户在黑名单/覆盖中自行控制。
 static BOOL SIO_listHardBlocked(void) {
     static NSArray *blocked = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         blocked = @[
-            @"com.sfic.knight",        // 顺丰同城骑士（实测确认：列表 hook 导致卡死）
-            @"com.apple.springboard",  // v1.8.16：桌面进程，内部大量 TV/CV，一旦打开就是黑屏/白苹果
+            @"com.apple.springboard",  // 桌面进程，内部大量 TV/CV，一旦打开就是黑屏/白苹果
         ];
     });
     NSString *bid = SIO_bundleID();
