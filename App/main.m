@@ -971,17 +971,23 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UIButton *recheck = [UIButton buttonWithType:UIButtonTypeSystem];
     [recheck setTitle:@"🔍 重新检测" forState:UIControlStateNormal];
     recheck.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
-    [recheck addTarget:self action:@selector(onSelfCheck) forControlEvents:UIControlEventTouchUpInside];
-    UIView *recheckRow = [[UIView alloc] init];
-    recheckRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [recheckRow addSubview:recheck];
+    recheck.backgroundColor = [UIColor tertiarySystemGroupedBackgroundColor];
+    recheck.layer.cornerRadius = 10;
     recheck.translatesAutoresizingMaskIntoConstraints = NO;
+    [recheck addTarget:self action:@selector(onSelfCheck) forControlEvents:UIControlEventTouchUpInside];
     [NSLayoutConstraint activateConstraints:@[
-        [recheckRow.heightAnchor constraintEqualToConstant:50],
-        [recheck.centerXAnchor constraintEqualToAnchor:recheckRow.centerXAnchor],
-        [recheck.centerYAnchor constraintEqualToAnchor:recheckRow.centerYAnchor],
+        [recheck.heightAnchor constraintEqualToConstant:44],
     ]];
-    [c2 addRow:recheckRow isLast:NO];
+    UIView *recheckPad = [[UIView alloc] init];
+    recheckPad.translatesAutoresizingMaskIntoConstraints = NO;
+    [recheckPad addSubview:recheck];
+    [NSLayoutConstraint activateConstraints:@[
+        [recheck.topAnchor constraintEqualToAnchor:recheckPad.topAnchor constant:8],
+        [recheck.leadingAnchor constraintEqualToAnchor:recheckPad.leadingAnchor constant:16],
+        [recheck.trailingAnchor constraintEqualToAnchor:recheckPad.trailingAnchor constant:-16],
+        [recheck.bottomAnchor constraintEqualToAnchor:recheckPad.bottomAnchor constant:-8],
+    ]];
+    [c2 addRow:recheckPad isLast:NO];
     _selfCheck = [self label:@"" size:12 dim:YES];
     _selfCheck.numberOfLines = 0;
     [c2 addRow:[self hintRow:_selfCheck] isLast:YES];
@@ -1264,6 +1270,8 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
 }
 
 - (void)onSelfCheck {
+    UIImpactFeedbackGenerator *impact = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [impact impactOccurred];
     NSMutableDictionary *cfg = ReadConfig();
     BOOL prefsOK = [[NSFileManager defaultManager] isWritableFileAtPath:PrefPath];
     BOOL uikitOK = [[NSFileManager defaultManager] fileExistsAtPath:UIKitPath];
