@@ -1086,7 +1086,7 @@ static void sio_navItem_setLargeTitle(id self, SEL _cmd, NSInteger mode) {
 // 即便选择器存在，按旧 ABI 调用也会把寄存器垃圾当 completion block 跳转，必崩。
 static void sio_pageVC_setVC(id self, SEL _cmd, NSArray *vcs,
                               UIPageViewControllerNavigationDirection dir, BOOL animated,
-                              void (^)(void)completion) {
+                              void (^completion)(void)) {
     SIO_REQUIRE_ORIG(o_pageVC_setVC);
     if (SIO_blocked() || !animated) {
         o_pageVC_setVC(self, _cmd, vcs, dir, animated, completion);
