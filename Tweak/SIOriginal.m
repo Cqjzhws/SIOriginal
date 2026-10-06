@@ -157,6 +157,8 @@ static BOOL     gZoomAccel = NO;     // v1.8.15：UIScrollView 缩放动画（se
 static BOOL     gFastScroll = NO;    // v1.8.16：滑行惯性加急（decelerationRate=Fast），默认关
 static BOOL     gFastTap = NO;       // v1.8.16：取消列表点击延迟（delaysContentTouches=NO），默认关
 static double   gLayerBoost = 1.0;   // v1.8.17：显式动画（CAAnimation/CALayer）额外倍率，默认 1（不额外加速）
+static double   gFloor = 0.02;       // v2.0.0：动画时长下限（秒），默认 0.02
+static double   gTransitionBoost = 1.0; // v2.0.0：转场独立额外倍率，默认 1（不额外加速）
 static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
@@ -199,12 +201,12 @@ static inline double SIO_targetDuration(double orig) {
     double d;
     switch (gMode) {
         case 1:  d = orig * gSlowFactor; break;            // 慢放
-        case 2:  d = 0.01;               break;            // 瞬切 0.01s
+        case 2:  d = gFloor;             break;            // 瞬切（下限）
         default:
             if (gSpeed <= 1.0001) return orig;
             d = orig / gSpeed;         break;              // 加速
     }
-    if (d > 0.0 && d < 0.01) d = 0.01;                     // 时长下限 0.01s
+    if (d > 0.0 && d < gFloor) d = gFloor;                  // 时长下限（用户可配）
     return d;
 }
 
@@ -220,7 +222,7 @@ static inline double SIO_targetDurationLayer(double orig) {
     if (gMode == 1) return d;
     if (gLayerBoost > 1.0001 && d > 0.0) {
         d = d / gLayerBoost;
-        if (d < 0.01) d = 0.01;
+        if (d < gFloor) d = gFloor;
     }
     return d;
 }
@@ -317,6 +319,8 @@ static void SIO_reload(void) {
         gFastScroll = NO;
         gFastTap    = NO;
         gLayerBoost = 1.0;
+        gFloor = 0.02;
+        gTransitionBoost = 1.0;
         gSelfBlacklisted = NO;
         gHasAppOverride  = NO;
         gListHardGuarded = SIO_listHardBlocked();
@@ -344,6 +348,12 @@ static void SIO_reload(void) {
     // v1.8.17：显式动画额外倍率，缺键默认 1.0（不额外加速），范围 1.0–10.0
     double lb = d[@"LayerBoost"] ? [d[@"LayerBoost"] doubleValue] : 1.0;
     gLayerBoost = (lb >= 1.0 && lb <= 10.0) ? lb : 1.0;
+    // v2.0.0：动画时长下限，缺键默认 0.02，范围 0.005–0.05
+    double fl = d[@"Floor"] ? [d[@"Floor"] doubleValue] : 0.02;
+    gFloor = (fl >= 0.001 && fl <= 1.0) ? fl : 0.02;
+    // v2.0.0：转场独立额外倍率，缺键默认 1.0，范围 1.0–10.0
+    double tb = d[@"TransitionBoost"] ? [d[@"TransitionBoost"] doubleValue] : 1.0;
+    gTransitionBoost = (tb >= 1.0 && tb <= 10.0) ? tb : 1.0;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -391,6 +401,14 @@ static void SIO_reload(void) {
         if (ovr[@"LayerBoost"]) {
             double lb2 = [ovr[@"LayerBoost"] doubleValue];
             if (lb2 >= 1.0 && lb2 <= 10.0) gLayerBoost = lb2;
+        }
+        if (ovr[@"Floor"]) {
+            double fl2 = [ovr[@"Floor"] doubleValue];
+            if (fl2 >= 0.001 && fl2 <= 1.0) gFloor = fl2;
+        }
+        if (ovr[@"TransitionBoost"]) {
+            double tb2 = [ovr[@"TransitionBoost"] doubleValue];
+            if (tb2 >= 1.0 && tb2 <= 10.0) gTransitionBoost = tb2;
         }
     }
 
@@ -784,7 +802,16 @@ static void sio_CASpring_damp(id self, SEL _cmd, double v) {
 //   加速 ×5 → 0.07s（肉眼几乎无感，保持原有"秒过"体验）
 //   慢放 ×2 → 0.70s（慢放真正生效）
 //   瞬切    → 0.01s（直达）
-static inline double SIO_transitionDuration(void) { return SIO_targetDuration(0.35); }
+// v2.0.0：转场（导航 push/pop、模态 present/dismiss）独立倍率。
+// 在全局倍率之上再叠加 gTransitionBoost，慢放模式不叠加，受 gFloor 下限保护。
+static inline double SIO_transitionDuration(void) {
+    double d = SIO_targetDuration(0.35);
+    if (gEnabled && gMode != 1 && gTransitionBoost > 1.0001 && d > 0.0) {
+        d = d / gTransitionBoost;
+        if (d < gFloor) d = gFloor;
+    }
+    return d;
+}
 
 static void sio_nav_push(id self, SEL _cmd, UIViewController *vc, BOOL anim) {
     SIO_REQUIRE_ORIG(o_nav_push);
@@ -1270,8 +1297,8 @@ static void SIOriginalInit(void) {
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v1.8.18：新增 5 个系统级 hook（UIRefreshControl/UINavigationBar/UIPageViewController/UIDocumentInteractionController）
     // v1.8.19：修正 spring ABI 错位、3 个错误选择器、swizzle 继承污染；dylib 改为无 entitlement ad-hoc 签名
-    NSLog(@"[SIOriginal] v1.8.19 hooks installed in %@ (enabled=%d mode=%d speed=%.1f layerBoost=%.0f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gLayerBoost, gSpring, gExtra, gListAccel, gZoomAccel,
+    NSLog(@"[SIOriginal] v2.0.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d override=%d listGuard=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gFloor, gLayerBoost, gTransitionBoost, gSpring, gExtra, gListAccel, gZoomAccel,
           gFastScroll, gFastTap, gHasAppOverride, gListHardGuarded);
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
