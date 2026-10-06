@@ -184,6 +184,7 @@ static inline void SIO_setPAInit(BOOL v)    { pthread_setspecific(gInPAInitKey, 
 // 用关联对象打标：谁先处理谁打标，另一个看到标记就跳过。
 // 注意：显式 setDuration: 不受标记限制 —— 那是 App 的新意图，必须按新值重新缩放。
 static const void *kSIOScaledMark = &kSIOScaledMark;
+static const void *kSIOOrigDur = &kSIOOrigDur;
 
 static inline BOOL SIO_animScaled(id anim) {
     return anim != nil && objc_getAssociatedObject(anim, kSIOScaledMark) != nil;
@@ -194,6 +195,14 @@ static inline void SIO_markAnimScaled(id anim) {
     objc_setAssociatedObject(anim, kSIOScaledMark,
                              (__bridge id)kCFBooleanTrue,
                              OBJC_ASSOCIATION_ASSIGN);
+}
+static inline void SIO_saveOrigDur(id anim, double d) {
+    if (!anim) return;
+    objc_setAssociatedObject(anim, kSIOOrigDur, @(d), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+static inline double SIO_getOrigDur(id anim) {
+    NSNumber *n = objc_getAssociatedObject(anim, kSIOOrigDur);
+    return n ? [n doubleValue] : -1.0;
 }
 
 static inline double SIO_targetDuration(double orig) {
@@ -623,6 +632,9 @@ static void   (*o_docInteract_present)(id, SEL, BOOL);
 static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     SIO_REQUIRE_ORIG(o_CAAnim_setDuration);
     if (SIO_blocked()) { o_CAAnim_setDuration(self, _cmd, d); return; }
+    // v2.0.0：保存原始时长，供 addAnimation: 路径还原 UIActivityIndicatorView 等
+    // 不应被加速的动画使用
+    SIO_saveOrigDur(self, d);
     // v1.8.15：显式设时长视为新意图，按传入值缩放并重新打标
     //（不因已有标记而跳过，否则「add 之后再改时长」会被错误忽略）
     // v1.8.17：走 LayerBoost 版本（显式动画可单独加倍率）
@@ -1513,26 +1525,33 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     // 加速后转速过高会产生频闪/视觉倒退，用户感知为"转圈变慢"。直接跳过不缩放。
     if (anim && [anim isKindOfClass:[CAAnimation class]]) {
         CALayer *layer = (CALayer *)self;
-        id delegate = [layer delegate];
         BOOL isSpinner = NO;
-        if (delegate) {
-            Class c = [delegate class];
-            NSString *n = NSStringFromClass(c);
-            if ([n containsString:@"ActivityIndicator"] ||
-                [delegate isKindOfClass:[UIActivityIndicatorView class]]) {
-                isSpinner = YES;
-            } else {
+        // 检查当前 layer 及其 superlayer 链的 delegate
+        CALayer *l = layer;
+        while (l) {
+            id delegate = [l delegate];
+            if (delegate) {
+                Class c = [delegate class];
+                NSString *n = NSStringFromClass(c);
+                if ([n containsString:@"ActivityIndicator"] ||
+                    [delegate isKindOfClass:[UIActivityIndicatorView class]]) {
+                    isSpinner = YES;
+                    break;
+                }
                 UIView *v = (UIView *)delegate;
                 while (v) {
                     if ([v isKindOfClass:[UIActivityIndicatorView class]]) { isSpinner = YES; break; }
                     v = v.superview;
                 }
+                if (isSpinner) break;
             }
+            l = l.superlayer;
         }
         if (isSpinner) {
-            // 重置为标准 1 秒/圈，覆盖 setDuration: 路径可能已做的缩放
-            if (o_CAAnim_setDuration) {
-                o_CAAnim_setDuration(anim, @selector(setDuration:), 1.0);
+            // 还原为 setDuration: 时保存的原始时长，覆盖缩放
+            double orig = SIO_getOrigDur(anim);
+            if (orig > 0 && o_CAAnim_setDuration) {
+                o_CAAnim_setDuration(anim, @selector(setDuration:), orig);
             }
             o_layer_addAnim(self, _cmd, anim, key);
             return;
