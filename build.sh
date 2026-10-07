@@ -4,7 +4,7 @@
 
 set -e
 
-echo "=== SIOriginal v2.1.0 构建 ==="
+echo "=== SIOriginal v2.2.0 构建 ==="
 
 # 静态核查先行：括号配平 / 原 IMP 判空 / hook 符号配对。
 # 本项目历史上多次因「漏写 SIO_REQUIRE_ORIG」「括号不配平」导致编译失败或
