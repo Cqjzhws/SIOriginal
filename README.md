@@ -2,6 +2,73 @@
 
 面向 iOS 14–17（含 iOS 16/17）的动画加速方案，共 **100+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
+## v2.1.0 致命 bug 修复 + 无损加速引擎
+
+### 修复的真 bug（含 1 个致命）
+
+- **[致命] 真后台保活整条链路从未生效** —— 不是「效果弱」，是**一行代码都没跑过**。
+  `UIApplicationDidEnterBackgroundNotification` 是 **NSNotification** 名字，
+  却被注册到 `CFNotificationCenterGetDarwinNotifyCenter()`（Darwin 中心只投递
+  `notify_post()` 的名字，两套通知系统互不相通）。后果链条：
+  `gPhysBg` 永远 `NO` → `_fbg_startAudio` 永不调用 → `applicationState` 伪装条件恒假
+  → 自愈轮询首行即 return。
+  即配置界面上的「场景伪装 / 音频断言兜底 / 真后台保活」三个功能，自 v1.8.6 起
+  **从未在任何 App 里执行过一行代码**。改用 `NSNotificationCenter` + 主队列。
+- **[真 bug] 时长下限把动画变长**（与加速目的完全相反）：
+  原钳制 `if (d < gFloor) d = gFloor;` 无条件抬到下限。当原时长本就比下限更短
+  （App 的 0.005s 微动画，或下限调到 0.05 而 App 用 0.02s）时，
+  0.001s 被抬成 0.02s = **慢 20 倍**，凭空造出卡顿。瞬切模式更直接：
+  `case 2: d = gFloor` 无视原值一律替换。现统一为 `min(gFloor, orig)` ——
+  **加速只能让动画变快，绝不能变慢**。
+  同类问题另修`SIO_transitionDuration`：转场倍率压到下限以下时被下限抬回，
+  用户调了档位却看不到变化（假功能）。
+- **[真 bug] 黑名单两套匹配语义互相打脸**：`SIO_reload` 用精确匹配，
+  `_fbg_isExcluded` 用前缀匹配。配置默认写入的 `com.tencent.wework` 在前缀语义下
+  会连带排除 `com.tencent.weworkhelper` 等全部同前缀 App。现统一为精确匹配，
+  确需前缀时在条目末尾显式写 `*`。
+- **[真 bug] 本项目自己的 UI 动画被自己加速**：toast 淡入淡出走
+  `[UIView animateWithDuration:]`，命中自己的 hook 被二次缩放（×20 下 0.25s → 0.0125s），
+  「设置已生效」提示一闪而过，用户根本看不清。现新增线程局部「内部 UI」旁路标记。
+- **[真 bug] 瞬切模式改写 UIScrollView 的 animated 语义**：文件里 v1.8.3/v1.8.15
+  两处注释把这个做法列为微信预览卡死的根因（「绝不能改写 animated 语义」），
+  同一份代码里却一边写禁令一边实施，且这两个 hook 还不受 ListAccel 门控。现保留
+  `animated:YES` 只压事务时长，与全项目口径统一。
+
+### 新增功能
+
+- **[新功能] 速率加速引擎（SpeedMode，默认关，全局/可 App 覆盖）**：
+  此前唯一手段是压缩 duration，有两个绕不开的硬伤 —— 撞时长下限；
+  duration 极小时关键帧插值与弹簧物理积分失真（抽搐/跳变）。
+  新模式改 `CAAnimation.speed` / `CALayer.speed`：**时长与关键帧时间轴原样保留，
+  只提高播放速率**，插值与物理完全正确且无下限碰撞。
+  安全边界：App 显式设 `speed != 1.0`（视频/音频同步、慢动作特效）一律透传；
+  慢放换算为 `1/slowFactor`；与时长模式互斥（同时生效会造成倍率平方）。
+- **[新功能] 辅助功能让位（默认开）**：系统「减弱动态效果」为真时自动整体旁路。
+  用户开启该设置即表达「减少动效」意图，加速工具不应覆盖它。
+  判定用 `dlsym`惰性解析，不给 dylib 增加链接依赖（保持 v2.0.7 的启动提速成果）。
+- **[新覆盖] `UIViewPropertyAnimator continueAnimationWithTimingParameters:duration:`**：
+  iOS 11+ 链式续播入口。此前首段时长与 start 延迟都已缩放，唯独续播传入的新时长
+  原样放行 —— 一条链里首段加速、续段不加速。
+- **[新覆盖] `UIWindow setRootViewController:`**：换根页面（启动分流、登录→主页）
+  的交叉淡入此前无任何覆盖。
+- **[性能] 转圈检测去字符串分配**：原实现在 superlayer 链上每个 delegate 都做
+  `NSStringFromClass` + 两次 `containsString:`，每秒可达数十次。现改为
+  零分配的 `isSubclassOfClass:` 快速判定 + 16 槽「类指针 → 是否候选」直接映射缓存
+  + 遍历深度上限（8 层）。
+- **[性能] 原时长改 POD 盒子**：`SIO_saveOrigDur` 原用 `@(d)` 装箱，
+  每次显式动画的每次 `setDuration:` 都有一次堆分配。改为 8 字节 malloc 盒子，
+  同一动画重复设值时原地更新、零分配。
+- **[健壮] TLS key 创建判空**：三个 `pthread_key_create` 此前不检查返回值，
+  任一失败都会让后续 `SIO_inXXX` 读到未定义值。
+
+### 新增校验工具
+
+`tools/check_v210.py` —— 针对本轮改动做**语义级**交叉引用核查（`static_check.py`
+不做语义分析）。覆盖：原 IMP 声明/赋值配对、inline 定义先于使用（含前向声明识别）、
+TLS key 创建与判空、配置变量在 `SIO_reload` 两个分支均赋值、已删除函数无残留引用、
+括号配平，以及「时长下限不得反向拉长动画」这条关键不变量。
+已用故意注入错误验证过有效性（能抓出并返回退出码 1）。
+
 ## v2.0.8 ProMotion 120Hz 强制
 
 - **[新功能] ProMotion120 开关（默认关，全局）**：很多 App 用 CADisplayLink 把渲染

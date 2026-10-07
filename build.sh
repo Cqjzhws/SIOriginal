@@ -4,7 +4,7 @@
 
 set -e
 
-echo "=== SIOriginal v2.0.8 构建 ==="
+echo "=== SIOriginal v2.1.0 构建 ==="
 
 # 静态核查先行：括号配平 / 原 IMP 判空 / hook 符号配对。
 # 本项目历史上多次因「漏写 SIO_REQUIRE_ORIG」「括号不配平」导致编译失败或
@@ -12,6 +12,13 @@ echo "=== SIOriginal v2.0.8 构建 ==="
 if command -v python3 &> /dev/null; then
     echo ">>> 静态核查 ..."
     python3 tools/static_check.py .
+    # v2.1.0：增量交叉引用核查 —— 原 IMP 声明/赋值配对、inline 定义先于使用、
+    # TLS key 创建与判空、配置变量双分支覆盖、已删除函数无残留引用、
+    # 以及「时长下限不得反向拉长动画」这条关键不变量。
+    # 这类问题是static_check.py 覆盖不到的（它不做语义分析），
+    # 且历史上正是「漏前向声明」「下限钳位写反」导致过编译失败与功能失效。
+    echo ">>> v2.1.0 增量核查 ..."
+    python3 tools/check_v210.py Tweak/SIOriginal.m
 else
     echo "警告：未找到 python3，跳过静态核查"
 fi

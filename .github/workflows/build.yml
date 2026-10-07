@@ -131,6 +131,8 @@ jobs:
         # 这些是本项目历史上反复出现过的错误类别（见 README 的 v1.8.12 条目），
         # 静态阶段就能拦下，比等 clang 报错更快、报错信息也更直白。
         python3 tools/static_check.py .
+        # v2.1.0：增量语义核查（声明顺序 / TLS key / 配置双分支 / 下限不变量）
+        python3 tools/check_v210.py Tweak/SIOriginal.m
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

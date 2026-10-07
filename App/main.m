@@ -160,6 +160,8 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"Notify"])           d[@"Notify"]           = @YES;
     if (!d[@"LayoutAccel"])      d[@"LayoutAccel"]      = @NO;
     if (!d[@"ProMotion120"])     d[@"ProMotion120"]     = @NO;
+    if (!d[@"SpeedMode"])         d[@"SpeedMode"]         = @NO;
+    if (!d[@"RespectReduceMotion"]) d[@"RespectReduceMotion"] = @YES;
     if (!d[@"Blacklist"])        d[@"Blacklist"]        = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
@@ -179,6 +181,9 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                           @"FastScroll", @"FastTap", @"LongPress", @"LongPressDuration",
                           @"Floor", @"LayerBoost", @"TransitionBoost", @"Notify",
                           @"LayoutAccel", @"ProMotion120",
+                          // v2.1.0：新增两键。若忘记加入这个白名单，
+                          // dylib 侧永远读不到用户设置 —— 又是「界面有开关但无效」的假功能。
+                          @"SpeedMode", @"RespectReduceMotion",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
                           @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
@@ -476,6 +481,8 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UILabel *_floorHint, *_layerHint, *_transHint;
     // 手感
     UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout, *_swPM;
+    // v2.1.0：新增两个开关（速率引擎 / 辅助功能让位）
+    UISwitch *_swSpeedMode, *_swRespectRM;
     UISegmentedControl *_segLongPress;
     UITextView *_blacklist;
     // 系统
@@ -584,7 +591,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.0.8 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.1.0 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -776,7 +783,23 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"布局动画加速（实验，SwiftUI/约束布局）" icon:@"squareshape.split.3x3" iconColor:[UIColor systemIndigoColor] control:_swLayout] isLast:NO];
     _swPM = [[UISwitch alloc] init];
     _swPM.on = [cfg[@"ProMotion120"] boolValue];
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"强制 120Hz（ProMotion 机型，60Hz 机型无效）" icon:@"gauge.with.needle" iconColor:[UIColor systemGreenColor] control:_swPM] isLast:YES];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"强制 120Hz（ProMotion 机型，60Hz 机型无效）" icon:@"gauge.with.needle" iconColor:[UIColor systemGreenColor] control:_swPM] isLast:NO];
+
+    // v2.1.0[新功能 8]：速率加速引擎。
+    // 开关语义与「加速倍率」互斥：开启后不再压缩动画时长，改为提高播放速率。
+    // 好处是时长下限不再干扰、关键帧插值与弹簧物理保持原生正确（不抽搐）；
+    // 代价是对「非动画驱动」的动画（如自绘/视频帧序列）无效。
+    _swSpeedMode = [[UISwitch alloc] init];
+    _swSpeedMode.on = [cfg[@"SpeedMode"] boolValue];
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"速率引擎（无损加速，不改时长）" icon:@"speedometer" iconColor:[UIColor systemTealColor] control:_swSpeedMode] isLast:NO];
+
+    // v2.1.0[新功能 11]：辅助功能让位。
+    _swRespectRM = [[UISwitch alloc] init];
+    BOOL rmDef = cfg[@"RespectReduceMotion"] ? [cfg[@"RespectReduceMotion"] boolValue] : YES;
+    _swRespectRM.on = rmDef;
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"尊重系统「减弱动态效果」" icon:@"figure.walk.motion" iconColor:[UIColor systemIndigoColor] control:_swRespectRM] isLast:YES];
+    UILabel *rmHint = [self label:@"开启后，若系统已开启「减弱动态效果」，本工具自动让路（不加速）。想无视该系统设置请关闭。" size:12 dim:YES];
+    [c2 addRow:[self hintRow:rmHint] isLast:YES];
     [stack addArrangedSubview:c2];
 
     // 高危项
@@ -1190,6 +1213,9 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (_swZoom) { cfg[@"ZoomAccel"] = @(_swZoom.on); }
     if (_swLayout) { cfg[@"LayoutAccel"] = @(_swLayout.on); }
     if (_swPM) { cfg[@"ProMotion120"] = @(_swPM.on); }
+    // v2.1.0：新开关落盘
+    if (_swSpeedMode) { cfg[@"SpeedMode"] = @(_swSpeedMode.on); }
+    if (_swRespectRM) { cfg[@"RespectReduceMotion"] = @(_swRespectRM.on); }
     if (_swList) { cfg[@"ListAccel"] = @(_swList.on); }
     if (_swNotify) { cfg[@"Notify"] = @(_swNotify.on); }
     // 系统 tab
@@ -1328,7 +1354,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.0.8 (build 52)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 2.1.0 (build 60)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"

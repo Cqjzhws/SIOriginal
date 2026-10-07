@@ -257,5 +257,47 @@ magic 损坏、条目指向 ASCII 区等），断言退出码与关键输出，�
   swizzle 静默跳过。`CAFrameRateRange` 用 ABI 一致的 3×float 副本
   （`SIOFrameRateRange`）规避 SDK 的 iOS 15 可用性标注，部署目标保持 iOS 14。
 
-*本报告基于静态分析生成，未经编译或真机验证。修复 1、2、3 与 v2.0.7/v2.0.8
-全部变更建议在 macOS（GitHub Actions）构建后于真机确认。*
+## 八、v2.1.0 变更：致命 bug 修复 + 无损加速引擎
+
+### 8.1 逐行审计发现的问题
+
+对 v2.0.8（3369 行）做逐行审计，定位到 12 处问题，其中 1 处为致命。
+
+| # | 级别 | 问题 | 影响 |
+|---|------|------|------|
+| 1 | **致命** | `UIApplicationDidEnterBackgroundNotification` 被注册到 **Darwin** 通知中心 | NSNotification 名字只经 `NSNotificationCenter` 投递，两套系统互不相通 → `gPhysBg` 恒 `NO` → 音频断言保活/场景伪装/自愈轮询**三个功能全部从未执行** |
+| 2 | 真 bug | 时长下限无条件抬升（`if (d<gFloor) d=gFloor` 与 `case 2: d=gFloor`） | 比下限更短的动画被**拉长**（0.005s → 0.02s，慢 4 倍），凭空造出卡顿 |
+| 3 | 真 bug | 黑名单两套匹配语义（精确 vs 前缀） | `com.tencent.wework` 前缀语义下连带排除一批无关 App |
+| 4 | 真 bug | 自绘 toast 走 `[UIView animateWithDuration:]` 命中自己的 hook | 「设置已生效」提示被二次加速，×20 下 0.0125s，一闪而过 |
+| 5 | 真 bug | 瞬切模式改写 `UIScrollView` 的 `animated:` 语义 | 违反本文件 v1.8.3/v1.8.15 自己写下的禁令；且该hook 不受 ListAccel 门控 |
+| 6 | 性能 | 转圈检测每次 `addAnimation` 做 `NSStringFromClass` + 2× `containsString:` | 稳定堆分配，每秒数十次 |
+| 7 | 性能 | `SIO_saveOrigDur` 用 `@(d)` 装箱 | 显式动画热路径的稳定堆分配 |
+| 8 | 健壮 | 3 个 `pthread_key_create` 不检查返回值 | 任一失败则 `SIO_inXXX` 读到未定义值 |
+| 9 | 假功能 | `SIO_transitionDuration` 里转场倍率压到下限以下时被下限抬回 | 用户调档位看不到变化 |
+| 10 | 覆盖 | `continueAnimationWithTimingParameters:duration:` 未接管 | 链式动画首段加速、续段不加速 |
+| 11 | 覆盖 | `UIWindow setRootViewController:` 未接管 | 换根页面的交叉淡入无加速 |
+| 12 | 语义 | 无障碍意图被覆盖 | 用户开「减弱动态效果」= 明确要求少动效，本项目逆行 |
+
+### 8.2 新增能力
+
+- **速率加速引擎**（`SpeedMode`，默认关）：改 `CAAnimation.speed` / `CALayer.speed`
+  而非 duration。相比压时长有两个结构性优势 ——
+  ① 不存在下限碰撞；② 时长与关键帧时间轴原样保留，
+  弹簧物理积分步长与关键帧插值不失真，不会抽搐/跳变。
+  安全边界：App 显式设 `speed != 1.0`（视频/音频同步）一律透传，只接管默认值 1.0；
+  与时长模式**互斥**（同时生效会得到倍率平方，且双重下限钳制失真）。
+- **辅助功能让位**（默认开）：`dlsym` 惰性解析
+  `UIAccessibilityIsReduceMotionEnabled`，不增加链接依赖。
+- **PA 链式续播 / UIWindow 换根页面** 补齐。
+
+### 8.3 校验工具
+
+新增 `tools/check_v210.py`，做 `static_check.py` 不覆盖的**语义级**核查：
+原IMP 声明/赋值配对、inline 定义先于使用（含前向声明识别）、
+TLS key 创建与判空、配置变量在 `SIO_reload` 两个分支均赋值、
+已删除函数无残留引用、括号配平，以及「下限不得反向拉长动画」这条关键不变量。
+已通过故意注入错误验证有效性。
+
+*本报告基于静态分析生成，未经编译或真机验证。v2.1.0 全部变更建议在
+macOS（GitHub Actions）构建后于真机确认；其中问题 1（保活链路）修复后
+需重点验证后台保活是否真正启动。*
