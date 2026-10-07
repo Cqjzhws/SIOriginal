@@ -246,17 +246,6 @@ magic 损坏、条目指向 ASCII 区等），断言退出码与关键输出，�
 - **新功能**：LayoutAccel 开关（默认关）—— `-[UIView layoutIfNeeded]` 包裹，
   加速 SwiftUI/自动布局隐式动画；配置 App 全局开关 + App 专属覆盖均已落地。
 
-## 七、v2.0.8 变更：ProMotion 120Hz 强制
-
-- **新功能 ProMotion120**（默认关，全局，无 App 覆盖）：hook
-  `-[CADisplayLink setPreferredFramesPerSecond:]`（恰好 60 → 设备上限）与
-  `-[CADisplayLink setPreferredFrameRateRange:]`（上限 ≤60 → maximum/preferred
-  拓宽到设备上限，minimum 不动）。这三类安全边界全部落地：
-  刻意低帧（<60，视频同步）不动；60Hz 机型 `maximumFramesPerSecond ≤ 60`
-  → `SIO_pmTarget()` 恒为 0，hook 纯透传、功能零开销；iOS 14 无 range 入口 →
-  swizzle 静默跳过。`CAFrameRateRange` 用 ABI 一致的 3×float 副本
-  （`SIOFrameRateRange`）规避 SDK 的 iOS 15 可用性标注，部署目标保持 iOS 14。
-
 ## 八、v2.1.0 变更：致命 bug 修复 + 无损加速引擎
 
 ### 8.1 逐行审计发现的问题
@@ -301,3 +290,48 @@ TLS key 创建与判空、配置变量在 `SIO_reload` 两个分支均赋值、
 *本报告基于静态分析生成，未经编译或真机验证。v2.1.0 全部变更建议在
 macOS（GitHub Actions）构建后于真机确认；其中问题 1（保活链路）修复后
 需重点验证后台保活是否真正启动。*
+
+
+## 九、v2.3.0 变更：移除 120Hz，新增帧对齐引擎
+
+### 9.1 移除 ProMotion120
+
+**该功能的实际作用**是改写 App 设定的帧率上限
+（`CADisplayLink.setPreferredFramesPerSecond:` 的 60 → 设备上限、
+`setPreferredFrameRateRange:` 的 maximum/preferred 拓宽）。
+
+**移除理由**：
+1. 不解决「感觉不流畅」的主要成因 —— 卡顿根源是帧时间不稳定，
+   而 120Hz 只是把帧周期从 16.67ms 减到 8.33ms；时长不对齐帧栅格时余数依然存在。
+2. 功耗代价明确 —— 全局 120Hz 让 GPU/CPU 多渲染一倍帧数。
+3. 干预面广 —— 拦的是所有App 的渲染循环，属最侵入式 hook。
+
+**清理完整性**：删除 `gPM120` 开关、`SIO_pmMaxFPS`/`SIO_pmTarget`、
+`sio_DL_setFPS`/`sio_DL_setRange`、`o_dl_*` 原 IMP、`SIOFrameRateRange` 类型、
+两处安装点（常规 + 按需补装）、配置 App 的 UI/默认值/写入白名单/保存逻辑，
+以及 README/ANALYSIS/control 中的相关描述。已用grep 验证无残留。
+
+### 9.2 新增帧对齐引擎（`FrameAlign`，默认开）
+
+**问题机理**：CoreAnimation 按时间在 `0, T, 2T, …` 提交帧，设备每 `P` 秒刷新一帧。
+时长 `D` 不是 `P` 整数倍时，最后一帧显示不足 `P` 即被提交，
+随后空等 `P` 才提交下一帧 —— 这一个「不足一帧 + 空等一帧」的周期即视觉顿挫。
+
+**本项目为何尤其容易制造余数**：加速即时长除以倍率。
+`0.3s ÷ 5 = 0.06s`在 60Hz 下是 3.6 帧，倍率越高余数越大（×20/×50 为常用档）。
+
+**修法**：换算后向下取整到帧边界整数倍。`floor(0.06/0.01667)×0.01667 = 0.05s`。
+
+**三条不变量**（由 `tools/test_frame_align.py` 机器验证）：
+1. 结果必为帧周期的整数倍
+2. 只能缩短、绝不能延长
+3. 时长不足一帧时保持原值（否则 0.005s → 0.0167s，慢 3 倍）
+
+**施加位置**：在 `SIO_targetDuration` 末尾（下限钳制**之后**）。
+顺序不可颠倒 —— 若先对齐再钳制，下限会把已对齐的值重新抬高，对齐白做。
+`SIO_targetDurationLayer` 因额外除了一次 LayerBoost，必须**重做**对齐。
+
+**为什么优于 120Hz**：120Hz 让帧数翻倍但不对齐问题依旧（0.06s 在 120Hz 下是 7.2 帧）。
+帧对齐让时间轴与帧栅格严格咬合，在 60Hz 设备上同样有效。
+
+*本报告基于静态分析生成，未经编译或真机验证。*

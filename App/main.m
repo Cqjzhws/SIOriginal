@@ -159,7 +159,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @1.0;
     if (!d[@"Notify"])           d[@"Notify"]           = @YES;
     if (!d[@"LayoutAccel"])      d[@"LayoutAccel"]      = @NO;
-    if (!d[@"ProMotion120"])     d[@"ProMotion120"]     = @NO;
+    if (!d[@"FrameAlign"])         d[@"FrameAlign"]         = @YES;
     if (!d[@"SpeedMode"])         d[@"SpeedMode"]         = @NO;
     if (!d[@"RespectReduceMotion"]) d[@"RespectReduceMotion"] = @YES;
     if (!d[@"Blacklist"])        d[@"Blacklist"]        = @[ @"com.tencent.wework" ];
@@ -180,7 +180,7 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
                           @"Spring", @"Extra", @"ListAccel", @"Blacklist", @"ZoomAccel",
                           @"FastScroll", @"FastTap", @"LongPress", @"LongPressDuration",
                           @"Floor", @"LayerBoost", @"TransitionBoost", @"Notify",
-                          @"LayoutAccel", @"ProMotion120",
+                          @"LayoutAccel", @"FrameAlign",
                           // v2.1.0：新增两键。若忘记加入这个白名单，
                           // dylib 侧永远读不到用户设置 —— 又是「界面有开关但无效」的假功能。
                           @"SpeedMode", @"RespectReduceMotion",
@@ -480,9 +480,9 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UISegmentedControl *_segFloor, *_segLayer, *_segTrans;
     UILabel *_floorHint, *_layerHint, *_transHint;
     // 手感
-    UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout, *_swPM;
+    UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout;
     // v2.1.0：新增两个开关（速率引擎 / 辅助功能让位）
-    UISwitch *_swSpeedMode, *_swRespectRM;
+    UISwitch *_swSpeedMode, *_swRespectRM, *_swFrameAlign;
     UISegmentedControl *_segLongPress;
     UITextView *_blacklist;
     // 系统
@@ -591,7 +591,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.1.0 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.3.0 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -781,9 +781,16 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _swLayout = [[UISwitch alloc] init];
     _swLayout.on = [cfg[@"LayoutAccel"] boolValue];
     [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"布局动画加速（实验，SwiftUI/约束布局）" icon:@"squareshape.split.3x3" iconColor:[UIColor systemIndigoColor] control:_swLayout] isLast:NO];
-    _swPM = [[UISwitch alloc] init];
-    _swPM.on = [cfg[@"ProMotion120"] boolValue];
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"强制 120Hz（ProMotion 机型，60Hz 机型无效）" icon:@"gauge.with.needle" iconColor:[UIColor systemGreenColor] control:_swPM] isLast:NO];
+    // v2.3.0：原 ProMotion120 开关位改为「帧对齐引擎」。
+    // 移除 120Hz 的理由见README：它只放宽 App 的帧率上限，
+    // 而流畅感的真正短板往往是「动画时长不对齐帧边界」——每帧渲染时刻不稳定，
+    // 视觉上就是顿挫。帧对齐从根源解决，且在 60Hz 设备上同样有效。
+    _swFrameAlign = [[UISwitch alloc] init];
+    BOOL faDef = cfg[@"FrameAlign"] ? [cfg[@"FrameAlign"] boolValue] : YES;
+    _swFrameAlign.on = faDef;
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"帧对齐引擎（消除时长抖动，60Hz 也生效）" icon:@"rectangle.grid.1x2" iconColor:[UIColor systemTealColor] control:_swFrameAlign] isLast:NO];
+    UILabel *faHint = [self label:@"把加速后的动画时长对齐到设备帧边界（120Hz=8.3ms / 60Hz=16.7ms 的整数倍）。不对齐时每帧渲染时刻会漂移，视觉上表现为顿挫——这是 120Hz 之外真正改善流畅感的手段。" size:12 dim:YES];
+    [c2 addRow:[self hintRow:faHint] isLast:NO];
 
     // v2.1.0[新功能 8]：速率加速引擎。
     // 开关语义与「加速倍率」互斥：开启后不再压缩动画时长，改为提高播放速率。
@@ -1212,7 +1219,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (_segLongPress) { cfg[@"LongPressDuration"] = @(LongPressDurationForIndex((int)_segLongPress.selectedSegmentIndex)); }
     if (_swZoom) { cfg[@"ZoomAccel"] = @(_swZoom.on); }
     if (_swLayout) { cfg[@"LayoutAccel"] = @(_swLayout.on); }
-    if (_swPM) { cfg[@"ProMotion120"] = @(_swPM.on); }
+    if (_swFrameAlign) { cfg[@"FrameAlign"] = @(_swFrameAlign.on); }
     // v2.1.0：新开关落盘
     if (_swSpeedMode) { cfg[@"SpeedMode"] = @(_swSpeedMode.on); }
     if (_swRespectRM) { cfg[@"RespectReduceMotion"] = @(_swRespectRM.on); }
@@ -1354,7 +1361,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.1.0 (build 60)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 2.3.0 (build 76)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"

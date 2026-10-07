@@ -1,9 +1,5 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.1.0
+Version: 2.4.0
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.1.0：修复真后台保活整条链路从未生效的致命 bug（NSNotification 被误注册到 Darwin 通知中心，导致场景伪装/音频断言/保活三个功能从未执行）；修复时长下限反向拉长动画（下限曾把0.005s 微动画抬到 0.02s，凭空造出卡顿）；统一黑名单匹配语义（精确匹配，尾部 * 才前缀）；瞬切模式不再改写 animated 语义。新增速率加速引擎（改播放速率而非时长，无下限碰撞、关键帧与弹簧物理不失真）与辅助功能让位（尊重系统减弱动态效果）；补齐 PA 链式续播与 UIWindow 换根页面。性能：转圈检测去字符串分配 + 16 槽类缓存，原时长改 POD 盒子
-Maintainer: local
-Author: local
-Section: Tweaks
-Depends: firmware (>= 14.0)
+Description: 动画加速 Tweak v2.4.0：补齐转场/控件/隐式动画盲区 —— 新增 15 个 hook：UINavigationController popToRoot、UITabBarController setViewControllers、UITabBar setItems、UIViewController setEditing、UISearchController setActive、UIPopoverPresentationController setPopoverContentSize、UIPageViewController setSpineLocation、UINavigationItem 5 件套按钮切换、UISearchBar setShowsCancelButton、UIStepper setValue、CALayer actionForKey（隐式动画统一兜底，与 CATransaction getter 互补且不双重缩放）。保留 v2.3.0 帧对齐引擎与全部既有功能。

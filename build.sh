@@ -4,7 +4,7 @@
 
 set -e
 
-echo "=== SIOriginal v2.1.0 构建 ==="
+echo "=== SIOriginal v2.3.0 构建 ==="
 
 # 静态核查先行：括号配平 / 原 IMP 判空 / hook 符号配对。
 # 本项目历史上多次因「漏写 SIO_REQUIRE_ORIG」「括号不配平」导致编译失败或
@@ -17,8 +17,12 @@ if command -v python3 &> /dev/null; then
     # 以及「时长下限不得反向拉长动画」这条关键不变量。
     # 这类问题是static_check.py 覆盖不到的（它不做语义分析），
     # 且历史上正是「漏前向声明」「下限钳位写反」导致过编译失败与功能失效。
-    echo ">>> v2.1.0 增量核查 ..."
+    echo ">>> 增量核查 ..."
     python3 tools/check_v210.py Tweak/SIOriginal.m
+    # v2.3.0：帧对齐算法验证。三条不变量（整数帧/只能缩短/不足一帧保持原值）
+    # 无法靠真机肉眼确认，靠真机发现问题时已经晚了 —— 构建期拦住。
+    echo ">>> 帧对齐算法验证 ..."
+    python3 tools/test_frame_align.py
 else
     echo "警告：未找到 python3，跳过静态核查"
 fi
