@@ -452,6 +452,11 @@ static inline double SIO_framePeriod(void) {
 // [安全边界] 对齐只能缩短、不能延长动画 —— 绝不让某个动画因为对齐而变慢。
 // [安全边界] 时长不足一帧（P）时保持原值：此时强制对齐为 1 帧会让动画变慢 10 倍以上。
 // [安全边界] 慢放模式不参与：对齐会缩短时长，与慢放语义直接冲突。
+// v2.3.0：SIO_alignToFrameBoundary 内部要判断是否处于速率模式，
+// 而 SIO_speedModeActive 定义在其后 —— 前向声明必须先于本定义（原源码把
+// 声明放在定义之后，编译报 implicit declaration，此处已修正顺序）。
+static inline BOOL SIO_speedModeActive(void);
+
 static inline double SIO_alignToFrameBoundary(double d) {
     if (!gEnabled || !gFrameAlign) return d;
     if (d <= 0.0) return d;
@@ -467,11 +472,8 @@ static inline double SIO_alignToFrameBoundary(double d) {
     return aligned;
 }
 
-// v2.3.0[新功能] 帧对齐（定义在 SIO_targetDuration 之后，故先前向声明）
-static inline double SIO_alignToFrameBoundary(double d);
-// v2.3.0：SIO_alignToFrameBoundary 内部要判断是否处于速率模式，
-// 而 SIO_speedModeActive 定义在其后 —— 同为 v2.3.0 新增导致的顺序倒置，补前向声明。
-static inline BOOL SIO_speedModeActive(void);
+// v2.3.0：SIO_alignToFrameBoundary 定义先于 SIO_targetDuration，无需前向声明
+// （原源码在此处的两行声明位于各自定义之后，属无效代码，已移到定义之前）。
 
 static inline double SIO_targetDuration(double orig) {
     if (!gEnabled) return orig;
