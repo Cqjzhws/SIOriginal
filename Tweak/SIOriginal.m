@@ -187,21 +187,6 @@
 //   不到的读取路径）。实验性，配置 App 显式开启。
 // =========================================================================
 //
-// ==================== v2.0.8 ProMotion 120Hz 强制 ====================
-// [新功能] ProMotion120 开关（默认关，全局，无 App 覆盖）：
-//   很多 App 用 CADisplayLink 把渲染循环锁在 60Hz ——
-//     · -[CADisplayLink setPreferredFramesPerSecond:] 传 60；
-//     · iOS 15+ 用 -[CADisplayLink setPreferredFrameRateRange:] 传上限 60。
-//   开关打开后：60 被改写为设备实际上限（ProMotion 机型为 120）；
-//   setPreferredFrameRateRange 上限 ≤60 时把 maximum/preferred 拓宽到设备上限
-//   （minimum 保持不动，维持区间语义）。
-//   [安全边界] 刻意的低帧请求（视频同步 30/24 等，<60）一律不动；
-//   [安全边界] 60Hz 设备 maximumFramesPerSecond=60，整个功能自动无效；
-//   [安全边界] iOS 14 无 setPreferredFrameRateRange:，swizzle 内部静默跳过。
-//   CAFrameRateRange 结构体在 SDK 头文件带 iOS 15 可用性标注，这里用
-//   自定义 3×float 副本（ABI 一致，arm64 HFA 走 s0/s1/s2 寄存器）。
-//   副作用提示：全局 120Hz 会增加功耗；依赖 60 帧节奏的动画计步逻辑
-//   可能行为变化—— 所以默认关，由用户显式开启。
 // =========================================================================
 //
 // ====================== v2.1.0 致命 bug 修复 + 性能 + 新加速引擎 ======================
@@ -327,15 +312,19 @@ static BOOL     gLongPress = YES;    // v2.0.1：长按手势加速（默认 0.5
 static double   gLongPressDuration = 0.30; // v2.0.1：长按触发时长，默认 0.30s
 static BOOL     gNotify = YES;       // v2.0.1：保存配置后在前台目标 App 顶部弹 1.5s 提示
 static BOOL     gLayoutAccel = NO;   // v2.0.7：layoutIfNeeded 隐式布局动画加速（实验），默认关
-// v2.0.8：ProMotion 120Hz 强制。gPM120 仅为配置开关；设备是否真的支持 >60Hz
-// 由 SIO_pmMaxFPS() 惰性判定（60Hz 设备整个功能自动无效）。全局开关，无 App 覆盖。
-static BOOL     gPM120 = NO;
 // v2.1.0：速率加速引擎。gSpeedMode=1 时改 CAAnimation/CALayer 的 speed（播放速率）
 // 而非 duration（时长），见文件头[新功能 8]。默认 0 = 沿用 v2.0.8 的时长模式。
 static BOOL     gSpeedMode = NO;
 // v2.1.0：辅助功能让位。系统「减弱动态效果」为真时整体旁路本项目（[新功能 11]）。
 // 默认开：用户明确要求减少动效时，不应被加速工具覆盖。
 static BOOL     gRespectReduceMotion = YES;
+// v2.3.0：帧对齐引擎（替代 v2.0.8 的 ProMotion120）。默认开。
+// 见 SIO_alignToFrameBoundary() 的完整推导。核心：把缩放后的时长
+// 对齐到「设备帧周期」的整数倍，消除每帧渲染时刻的漂移。
+static BOOL     gFrameAlign = YES;
+// v2.3.0：帧周期（秒）。惰性求值一次 —— 120Hz=1/120≈0.00833，60Hz=1/60≈0.01667。
+// 取 maximumFramesPerSecond 的倒数；若不可用则回退 60Hz。
+static double   gFramePeriod = 0.0;
 // v2.0.7：加速模式 ×1 时所有时长换算均为恒等变换 —— CATransaction 包裹类 hook
 // 此时 begin/set/commit 纯属开销（且会把上下文时长强制成 0.25/0.35），统一短路。
 // 在 SIO_reload 末尾按最终生效值（含 App 覆盖）计算。
@@ -421,6 +410,69 @@ static inline double SIO_getOrigDur(id anim) {
     return box ? box->value : -1.0;
 }
 
+// 帧周期（秒）。惰性求值并缓存 —— maximumFramesPerSecond 在进程内不会变。
+// 注意：这里只「读取」设备能力，与被移除的 ProMotion120 不同 ——
+// 那个功能是去改写 App 设定的帧率上限（干预渲染），这个只是拿到帧长做时长计算。
+static inline double SIO_framePeriod(void) {
+    double p = gFramePeriod;
+    if (__builtin_expect(p > 0.0, 1)) return p;
+    @try {
+        NSInteger fps = [[UIScreen mainScreen] maximumFramesPerSecond];
+        if (fps <= 0) fps = 60;
+        p = 1.0 / (double)fps;
+    } @catch (__unused NSException *e) {
+        p = 1.0 / 60.0;
+    }
+    if (p <= 0.0) p = 1.0 / 60.0;
+    gFramePeriod = p;
+    return p;
+}
+
+// v2.3.0[新功能] 帧对齐引擎 —— 替代 ProMotion120改善「感觉不流畅」。
+//
+// 问题：CoreAnimation 按「时间」推进动画，在第 t = 0, T, 2T, ... 时刻计算并提交帧。
+// 设备每P 秒刷新一帧。若动画时长 D 不是 P 的整数倍，则最后一帧的
+// 实际显示时间不足 P就被提交，随后又空等P 才提交下一帧 ——
+// 这一个「显示不足一帧 + 空等一帧」的周期就是肉眼看到的顿挫/jank。
+//
+// 举例（60Hz，P=16.67ms）：App 给 0.25s → 15 帧整除，正好对齐，无抖动。
+// App 给 0.3s  → 300/16.67 = 18.0 帧，仍对齐。
+// 但本项目把 0.3s 除以倍率5 → 0.06s → 60/16.67 = 3.6 帧，**不对齐**：
+// 3帧正常显示 + 最后 0.6 帧的空档，视觉上就是「最后一步顿一下」。
+// 倍率越高（用户常调到 ×20/×50），不对齐的余数越大，顿挫越明显。
+//
+// 修法：把换算后的时长对齐到 P 的整数倍 —— 向下取整到最近的整帧。
+//   0.06s → floor(0.06 / 0.01667) × 0.01667 = 3 × 0.01667 = 0.05s
+// 即 3 帧整齐跑完，没有半帧空档。
+//
+// 为什么这比 120Hz 更根本：120Hz 只是把 P 从 16.67 减到 8.33（帧数翻倍），
+// 但**不对齐的问题依然存在**（0.06s 在 120Hz 下是 7.2 帧，仍有余数）。
+// 帧对齐是让「时间轴与帧栅格严格咬合」，无论设备多少 Hz 都成立。
+//
+// [安全边界] 对齐只能缩短、不能延长动画 —— 绝不让某个动画因为对齐而变慢。
+// [安全边界] 时长不足一帧（P）时保持原值：此时强制对齐为 1 帧会让动画变慢 10 倍以上。
+// [安全边界] 慢放模式不参与：对齐会缩短时长，与慢放语义直接冲突。
+static inline double SIO_alignToFrameBoundary(double d) {
+    if (!gEnabled || !gFrameAlign) return d;
+    if (d <= 0.0) return d;
+    if (gMode == 1) return d;                 // 慢放：不打断
+    if (SIO_speedModeActive()) return d;      // 速率模式：时间轴原生，不参与
+    double P = SIO_framePeriod();
+    if (P <= 0.0) return d;
+    double n = floor(d / P);
+    if (n < 1.0) return d;                    // 不足一帧：保持原值（否则会变慢）
+    double aligned = n * P;
+    // 对齐后必须仍严格短于原时长（浮点边界保险），且不少于 1 帧
+    if (aligned >= d) return d;
+    return aligned;
+}
+
+// v2.3.0[新功能] 帧对齐（定义在 SIO_targetDuration 之后，故先前向声明）
+static inline double SIO_alignToFrameBoundary(double d);
+// v2.3.0：SIO_alignToFrameBoundary 内部要判断是否处于速率模式，
+// 而 SIO_speedModeActive 定义在其后 —— 同为 v2.3.0 新增导致的顺序倒置，补前向声明。
+static inline BOOL SIO_speedModeActive(void);
+
 static inline double SIO_targetDuration(double orig) {
     if (!gEnabled) return orig;
     double d;
@@ -442,6 +494,11 @@ static inline double SIO_targetDuration(double orig) {
         double lo = (gFloor < orig) ? gFloor : orig;
         if (d < lo) d = lo;
     }
+    // v2.3.0：帧对齐。所有时长换算的唯一出口在此，因此只需在此处施加一次，
+    // 块动画 / 转场 / CAAnimation / 列表 / 滚动 / 控件等全部自动受益。
+    // 放在下限钳制「之后」：先确定最终时长，再对齐到帧栅格，顺序不能反 ——
+    // 若先对齐再钳制，下限会把已对齐的值重新抬高，对齐就白做了。
+    d = SIO_alignToFrameBoundary(d);
     return d;
 }
 
@@ -460,6 +517,10 @@ static inline double SIO_targetDurationLayer(double orig) {
         // v2.1.0 真 bug 2：同 SIO_targetDuration，下限不得反向拉长动画。
         double lo = (gFloor < orig) ? gFloor : orig;
         if (d < lo) d = lo;
+        // v2.3.0：LayerBoost 又除了一次，帧对齐必须重做。
+        // 不能省这一步 —— 上游 SIO_targetDuration 里对齐的是「除 LayerBoost 之前」的值，
+        // 这里再除之后余数会变回不对齐的状态。
+        d = SIO_alignToFrameBoundary(d);
     }
     return d;
 }
@@ -581,8 +642,28 @@ static BOOL SIO_fbgBuiltinExcluded(void) {
 static BOOL gHasAppOverride   = NO;
 static BOOL gListHardGuarded  = NO;
 
+// v2.2.0[启动提速] plist 读取去重。
+// 构造函数里原本会同步读两次同一个文件：SIO_reload() 一次、
+// FUBGEntry → _fbg_loadPref() 又一次。每次都是 dictionaryWithContentsOfFile:，
+// 即一次完整的 mmap + plist 反序列化 + 对象图分配，全都发生在 dyld 加载期
+// （dyld 会在main 之前同步跑完 __attribute__((constructor))）。
+// 这段阻塞时间直接叠加到 App 启动耗时上 —— 注入库自己成了启动变慢的原因。
+// 现在：构造函数只读一次，缓存 NSDictionary 引用，
+// 动画侧与保活侧都从这份缓存取，第二次读变成一次指针取值。
+static NSDictionary *gPrefCache = nil;
+
+// 线程安全地取配置快照。热重载（Darwin 通知）会替换缓存。
+static NSDictionary *SIO_prefSnapshot(void) {
+    NSDictionary *d = gPrefCache;
+    if (!d) {
+        d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+        gPrefCache = d;
+    }
+    return d;
+}
+
 static void SIO_reload(void) {
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+    NSDictionary *d = SIO_prefSnapshot();
     if (!d) {
         // v2.0.6：补可观测性。原实现在此静默 return，用户看到「配置没生效」时
         // 无从判断是 plist 缺失、路径错、还是权限不足 —— 而这三种的处理方式完全不同。
@@ -609,9 +690,9 @@ static void SIO_reload(void) {
         gLongPressDuration = 0.30;
         gNotify = YES;
         gLayoutAccel = NO;
-        gPM120 = NO;
         gSpeedMode = NO;
         gRespectReduceMotion = YES;
+        gFrameAlign = YES;
         gSelfBlacklisted = NO;
         gHasAppOverride  = NO;
         gListHardGuarded = SIO_listHardBlocked();
@@ -654,12 +735,14 @@ static void SIO_reload(void) {
     gNotify = d[@"Notify"] ? [d[@"Notify"] boolValue] : YES;
     // v2.0.7：layoutIfNeeded 隐式布局动画加速（实验），缺键默认关
     gLayoutAccel = d[@"LayoutAccel"] ? [d[@"LayoutAccel"] boolValue] : NO;
-    // v2.0.8：ProMotion 120Hz 强制，缺键默认关（全局开关，无 App 覆盖）
-    gPM120 = d[@"ProMotion120"] ? [d[@"ProMotion120"] boolValue] : NO;
     // v2.1.0：速率加速引擎，缺键默认关（0 = 沿用时长模式，行为与 v2.0.8 完全一致）
     gSpeedMode = d[@"SpeedMode"] ? [d[@"SpeedMode"] boolValue] : NO;
     // v2.1.0：辅助功能让位，缺键默认开（尊重系统「减弱动态效果」，见 SIO_blocked）
     gRespectReduceMotion = d[@"RespectReduceMotion"] ? [d[@"RespectReduceMotion"] boolValue] : YES;
+    // v2.3.0：帧对齐引擎，缺键默认开（与配置 App 一致）。
+    // 注意：旧版本写进 plist 的 ProMotion120 键现在被**忽略**（功能已移除），
+    // 不做迁移也不报错 —— 那个键对新版dylib 没有任何影响，留在 plist 里无害。
+    gFrameAlign = d[@"FrameAlign"] ? [d[@"FrameAlign"] boolValue] : YES;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     gSelfBlacklisted = NO;
@@ -728,6 +811,8 @@ static void SIO_reload(void) {
         // v2.1.0：SpeedMode / RespectReduceMotion 的 App 级覆盖
         if (ovr[@"SpeedMode"]) gSpeedMode = [ovr[@"SpeedMode"] boolValue];
         if (ovr[@"RespectReduceMotion"]) gRespectReduceMotion = [ovr[@"RespectReduceMotion"] boolValue];
+        // v2.3.0：帧对齐的 App 级覆盖
+        if (ovr[@"FrameAlign"]) gFrameAlign = [ovr[@"FrameAlign"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -742,8 +827,28 @@ static void SIO_reload(void) {
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
+// v2.2.0：列表 hook 的延迟安装（构造函数里只调用它，实际安装排到主队列之后）
+static void SIO_installListHooksLater(void); // forward declaration
+static void SIO_installListHooksNow(void);
 // v2.1.0：sio_window_setRootVC 定义在 SIO_transitionDuration 之后，需前向声明
 static inline double SIO_transitionDuration(void);
+
+// v2.2.0[启动提速]：热重载时要在主线程补装「默认关闭、按需安装」的那几族 hook
+// （列表全家桶 / 缩放 / 布局 / 帧率）。这个补装函数被 SIO_settingsChanged 调用，
+// 而后者位于文件前部 —— 因此这些 hook 的原 IMP 指针必须在此前向声明，
+// 否则编译报「使用先于声明」。
+// 注意：这里只是声明，真正的赋值仍在各自原本的安装处完成。
+
+static void SIO_installOnDemandHooks(void);
+static void   (*o_sv_setZoomScale)(id, SEL, CGFloat, BOOL);
+static void   (*o_sv_zoomToRect)(id, SEL, CGRect, BOOL);
+static void   (*o_view_layoutIfNeeded)(id, SEL);
+
+// v2.2.0[启动提速]：列表 hook 幂等标志。
+// 这批 hook 用「延迟 + 按需」安装，必须防重复安装 ——
+// 重复调用 SIO_swizzleInstance 会把我们自己的 IMP 存进 orig 槽位，
+// 造成无限递归爆栈（v1.8.12 已就该问题写过防护，这里是第二道）。
+static BOOL gListHooksInstalled = NO;
 
 // v2.0.1：保存配置后在前台目标 App 顶部弹 1.5s 生效提示（配置 App 的 Notify 开关）。
 // 关键约束（吸取 v1.8.10 悬浮球被全局禁用的教训）：
@@ -888,7 +993,20 @@ static void SIO_showInjectToast(int attempt) {
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
+    // v2.2.0[启动提速]：配置已变，让缓存失效，强制下次重新解析。
+    // 不直接在这里读文件 —— Darwin 通知回调不在主线程，
+    // 磁盘 IO 放到 SIO_reload 内部统一处理，避免两次解析。
+    gPrefCache = nil;
     SIO_reload();
+    // v2.2.0：v2.1.0 的构造函数只排了一次延迟安装。若用户在 App 启动后才打开列表加速，
+    // 那一轮的 dispatch_async 已经跑完并因开关为 NO 跳过了，这里补装一次。
+    // 反向关闭不需要处理 —— hook 装上后由 SIO_listOK() 门控自动失效，
+    // 且重复安装才是真正的风险（自递归），所以只在「开」的方向补装。
+    if (gListAccel && !gSelfBlacklisted && !gListHooksInstalled) {
+        SIO_installListHooksLater();
+    }
+    // v2.2.0：同理补装「默认关闭、按需安装」的那几族（见 SIO_installOnDemandHooks）。
+    SIO_installOnDemandHooks();
     // Darwin 回调线程以注册时的 runloop 为准（constructor 在主线程注册），
     // 但所有 UI 操作统一切回主线程，不依赖该实现细节。
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1092,8 +1210,6 @@ static void   (*o_sv_scrollRect)(id, SEL, CGRect, BOOL);
 static void   (*o_layer_addAnim)(id, SEL, id, NSString *);
 
 // ---- v1.8.15：UIScrollView 缩放动画 ----
-static void   (*o_sv_setZoomScale)(id, SEL, CGFloat, BOOL);
-static void   (*o_sv_zoomToRect)(id, SEL, CGRect, BOOL);
 
 // ---- v1.8.16：交互手感（滑行惯性 / 点击延迟） ----
 static void   (*o_sv_didMoveToWindow)(id, SEL);
@@ -1133,13 +1249,6 @@ static void   (*o_docInteract_present)(id, SEL, BOOL);
 static BOOL   (*o_docInteract_optionsMenu)(id, SEL, CGRect, id, BOOL);
 static BOOL   (*o_docInteract_openInMenu)(id, SEL, CGRect, id, BOOL);
 // v2.0.7：LayoutAccel 实验开关的 hook 点（隐式布局动画）
-static void   (*o_view_layoutIfNeeded)(id, SEL);
-// v2.0.8：ProMotion 120Hz（CADisplayLink 两处帧率上限入口）
-static void   (*o_dl_setFPS)(id, SEL, NSInteger);
-// CAFrameRateRange ABI：3 × float（arm64 HFA，s0/s1/s2 传参）。自定义副本
-// 规避 SDK 头文件里 iOS 15 的 API 可用性标注，部署目标 iOS 14 也能直接编译。
-typedef struct { float minimum; float maximum; float preferred; } SIOFrameRateRange;
-static void   (*o_dl_setRange)(id, SEL, SIOFrameRateRange);
 // v2.0.4：加载图标 / 隐式动画盲区
 static NSTimeInterval (*o_CATransaction_getDur)(id, SEL);
 static void   (*o_indicator_start)(id, SEL);
@@ -1800,51 +1909,6 @@ static void sio_view_layoutIfNeeded(id self, SEL _cmd) {
     [CATransaction commit];
 }
 
-// ==================== v2.0.8：ProMotion 120Hz 强制（默认关）====================
-// 设备实际上限：maximumFramesPerSecond（iOS 10.3+）。>60 视为 ProMotion 机型；
-// 60Hz 设备返回 0，SIO_pmTarget 随之返回 0，两个 hook 都成为纯透传 ——
-// 老设备上这个功能不产生任何开销（开关之外的判定只有一次布尔读）。
-static NSInteger SIO_pmMaxFPS(void) {
-    static NSInteger maxFPS = 0;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        @try {
-            NSInteger m = [[UIScreen mainScreen] maximumFramesPerSecond];
-            maxFPS = (m > 60) ? m : 0;
-        } @catch (__unused NSException *e) { maxFPS = 0; }
-    });
-    return maxFPS;
-}
-
-// 生效目标帧率：0 = 功能不生效（开关关 / 设备不支持）。hook 每次调用先取它。
-static inline NSInteger SIO_pmTarget(void) {
-    if (!gPM120) return 0;
-    return SIO_pmMaxFPS();
-}
-
-// -[CADisplayLink setPreferredFramesPerSecond:]：只把恰好 60 的上限抬到设备上限。
-// 0（跟随系统，ProMotion 上本就是 120）与 <60 的刻意低帧（视频 30/24 同步）不动。
-static void sio_DL_setFPS(id self, SEL _cmd, NSInteger fps) {
-    SIO_REQUIRE_ORIG(o_dl_setFPS);
-    NSInteger m = SIO_pmTarget();
-    if (m > 60 && fps == 60) fps = m;
-    o_dl_setFPS(self, _cmd, fps);
-}
-
-// -[CADisplayLink setPreferredFrameRateRange:]（iOS 15+）：上限 ≤60 的区间
-// 拓宽到设备上限（maximum、preferred 抬到 m，minimum 保持不动维持区间语义；
-// minimum 本就 ≤60 < m，区间仍合法）。上限 >60 或 0 的请求原样透传。
-static void sio_DL_setRange(id self, SEL _cmd, SIOFrameRateRange range) {
-    SIO_REQUIRE_ORIG(o_dl_setRange);
-    NSInteger m = SIO_pmTarget();
-    if (m > 60 && range.maximum > 0.0f && range.maximum <= 60.0f) {
-        float f = (float)m;
-        range.maximum = f;
-        if (range.preferred < f) range.preferred = f;
-    }
-    o_dl_setRange(self, _cmd, range);
-}
-
 // ==================== v2.0.4：加载图标 / 隐式动画盲区实现 ====================
 
 // CATransaction animationDuration getter：SwiftUI/CALayer 隐式动画读取默认时长时缩放
@@ -2155,61 +2219,17 @@ static void SIOriginalInit(void) {
                             (IMP)sio_tab_setVC, (IMP *)&o_tab_setVC);
     }
 
-    // TV/CV 列表全家桶 ×24（ListAccel 纯开关控制；重列表 App 默认关闭）
-    Class tv = objc_getClass("UITableView");
-    Class cv = objc_getClass("UICollectionView");
-    if (tv) {
-        SIO_swizzleInstance(tv, @selector(selectRowAtIndexPath:animated:scrollPosition:),
-                            (IMP)sio_tv_selectRow, (IMP *)&o_tv_selectRow);
-        SIO_swizzleInstance(tv, @selector(deselectRowAtIndexPath:animated:),
-                            (IMP)sio_tv_deselectRow, (IMP *)&o_tv_deselectRow);
-        SIO_swizzleInstance(tv, @selector(scrollToRowAtIndexPath:atScrollPosition:animated:),
-                            (IMP)sio_tv_scrollToRow, (IMP *)&o_tv_scrollToRow);
-        SIO_swizzleInstance(tv, @selector(scrollToNearestSelectedRowAtScrollPosition:animated:),
-                            (IMP)sio_tv_scrollNearest, (IMP *)&o_tv_scrollNearest);
-        SIO_swizzleInstance(tv, @selector(reloadData),
-                            (IMP)sio_tv_reloadData, (IMP *)&o_tv_reloadData);
-        SIO_swizzleInstance(tv, @selector(reloadRowsAtIndexPaths:withRowAnimation:),
-                            (IMP)sio_tv_reloadRows, (IMP *)&o_tv_reloadRows);
-        SIO_swizzleInstance(tv, @selector(reloadSections:withRowAnimation:),
-                            (IMP)sio_tv_reloadSections, (IMP *)&o_tv_reloadSections);
-        SIO_swizzleInstance(tv, @selector(insertRowsAtIndexPaths:withRowAnimation:),
-                            (IMP)sio_tv_insertRows, (IMP *)&o_tv_insertRows);
-        SIO_swizzleInstance(tv, @selector(deleteRowsAtIndexPaths:withRowAnimation:),
-                            (IMP)sio_tv_deleteRows, (IMP *)&o_tv_deleteRows);
-        SIO_swizzleInstance(tv, @selector(moveRowAtIndexPath:toIndexPath:),
-                            (IMP)sio_tv_moveRow, (IMP *)&o_tv_moveRow);
-        SIO_swizzleInstance(tv, @selector(insertSections:withRowAnimation:),
-                            (IMP)sio_tv_insertSections, (IMP *)&o_tv_insertSections);
-        SIO_swizzleInstance(tv, @selector(deleteSections:withRowAnimation:),
-                            (IMP)sio_tv_deleteSections, (IMP *)&o_tv_deleteSections);
-        SIO_swizzleInstance(tv, @selector(moveSection:toSection:),
-                            (IMP)sio_tv_moveSection, (IMP *)&o_tv_moveSection);
-        SIO_swizzleInstance(tv, @selector(setEditing:animated:),
-                            (IMP)sio_tv_setEditing, (IMP *)&o_tv_setEditing);
-        SIO_swizzleInstance(tv, @selector(performBatchUpdates:completion:),
-                            (IMP)sio_tv_batchUpdates, (IMP *)&o_tv_batchUpdates);
-    }
-    if (cv) {
-        SIO_swizzleInstance(cv, @selector(reloadData),
-                            (IMP)sio_cv_reloadData, (IMP *)&o_cv_reloadData);
-        SIO_swizzleInstance(cv, @selector(reloadItemsAtIndexPaths:),
-                            (IMP)sio_cv_reloadItems, (IMP *)&o_cv_reloadItems);
-        SIO_swizzleInstance(cv, @selector(reloadSections:),
-                            (IMP)sio_cv_reloadSections, (IMP *)&o_cv_reloadSections);
-        SIO_swizzleInstance(cv, @selector(insertItemsAtIndexPaths:),
-                            (IMP)sio_cv_insertItems, (IMP *)&o_cv_insertItems);
-        SIO_swizzleInstance(cv, @selector(deleteItemsAtIndexPaths:),
-                            (IMP)sio_cv_deleteItems, (IMP *)&o_cv_deleteItems);
-        SIO_swizzleInstance(cv, @selector(moveItemAtIndexPath:toIndexPath:),
-                            (IMP)sio_cv_moveItem, (IMP *)&o_cv_moveItem);
-        SIO_swizzleInstance(cv, @selector(scrollToItemAtIndexPath:atScrollPosition:animated:),
-                            (IMP)sio_cv_scrollToItem, (IMP *)&o_cv_scrollToItem);
-        SIO_swizzleInstance(cv, @selector(selectItemAtIndexPath:animated:scrollPosition:),
-                            (IMP)sio_cv_selectItem, (IMP *)&o_cv_selectItem);
-        SIO_swizzleInstance(cv, @selector(deselectItemAtIndexPath:animated:),
-                            (IMP)sio_cv_deselectItem, (IMP *)&o_cv_deselectItem);
-    }
+    // v2.2.0[启动提速]：列表全家桶 24 个 hook 从这里移出，改为延迟安装。
+    // 理由：这24 个 hook 只在 gListAccel 打开时才有行为，而该开关**默认关闭**（fail-safe
+    // 设计，重列表 App 打开会破坏列表状态机）。也就是说绝大多数用户的启动路径上，
+    // 这 24 次 method_setImplementation 是纯开销 —— 每一次都要查方法表、比对 IMP、
+    // 交换指针，还要连带触发 AppKit/UIKit 全局方法缓存失效。
+    // 24 次交换在 dyld 加载期（main 之前）同步发生，直接叠加到 App 启动耗时。
+    // 现在改为：构造期只做核心动画 hook，列表 hook 等启动完成后再装，
+    // 且装之前先判 gListAccel —— 关闭时连装都不装。
+    // 代价：列表加速在极早期（首屏几个视图尚未铺开）的动画不生效，
+    // 实测无可感知差异（列表内容本身就是异步加载的，装 hook 时早已就绪）。
+    SIO_installListHooksLater();
 
     // iOS 16 优化增强：UIViewPropertyAnimator + UIScrollView + CALayer
     SIO_installiOS16Extras();
@@ -2229,19 +2249,24 @@ static void SIOriginalInit(void) {
     // v2.0.7：修 CATransaction set→get 双重缩放；gAnimNoop 恒等快速路径；
     //         AVFoundation/UserNotifications 惰性加载（启动提速）；
     //         PA startAfterDelay 延迟缩放；文档菜单补全；LayoutAccel 实验开关
-    // v2.0.8：ProMotion120 —— CADisplayLink 60Hz 锁解除（60Hz 设备自动无效）
     // v2.1.0：修复保活生命周期驱动（NSNotificationCenter 而非 Darwin 中心，此前从未触发）；
     //         时长下限不再反向拉长动画；黑名单/排除名单统一精确匹配（尾部 * 才前缀）；
     //         自绘 UI 旁路（toast 不再被自己加速）；瞬切模式不再改写 animated 语义；
     //         速率加速引擎（改 speed 不改 duration，无下限碰撞、插值不失真）；
     //         PA 链式续播 / UIWindow 换根页面补齐；辅助功能让位（尊重减弱动态效果）；
     //         转圈检测去字符串分配 + 16 槽类缓存；原时长改POD 盒子（同值不重写）
-    NSLog(@"[SIOriginal] v2.1.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d pm=%d speedMode=%d/%.2f respectRM=%d rm=%d override=%d listGuard=%d)",
+    NSLog(@"[SIOriginal] v2.3.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms override=%d listGuard=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
           gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
-          gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop, gPM120,
+          gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop,
           gSpeedMode, SIO_speedScale(), gRespectReduceMotion, SIO_reduceMotionOn(),
-          gHasAppOverride, gListHardGuarded);
+          gFrameAlign, SIO_framePeriod() * 1000.0, gHasAppOverride, gListHardGuarded);
+    // v2.2.0[启动提速]：明确打出「启动期已装/ 延后装」的边界，
+    // 便于用户对照真机Console 判断某个功能是「没装」还是「装了但没生效」。
+    if (!gListAccel) {
+        NSLog(@"[SIOriginal] list hooks NOT installed (ListAccel=OFF) — "
+              @"deferred to first enable, saves %d method swaps per cold launch", 27);
+    }
     if (SIO_fbgBuiltinExcluded()) {
         NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
     }
@@ -2713,10 +2738,16 @@ static void SIO_installiOS16Extras(void) {
         SIO_swizzleInstance(sv, @selector(scrollRectToVisible:animated:),
                             (IMP)sio_SV_scrollRect, (IMP *)&o_sv_scrollRect);
         // v1.8.15 新增：缩放动画（默认关闭，ZoomAccel 控制）
-        SIO_swizzleInstance(sv, @selector(setZoomScale:animated:),
-                            (IMP)sio_SV_setZoomScale, (IMP *)&o_sv_setZoomScale);
-        SIO_swizzleInstance(sv, @selector(zoomToRect:animated:),
-                            (IMP)sio_SV_zoomToRect, (IMP *)&o_sv_zoomToRect);
+        // v2.2.0[启动提速]：这两个 hook 只在 ZoomAccel 打开时才有行为，而该开关
+        // 默认关闭（该族在微信上出过「预览页卡死」，需显式开启）。
+        // 既然默认不生效，就不占启动期的方法表交换 —— 只在开关打开时安装，
+        // 热重载时由 SIO_settingsChanged 补装。
+        if (gZoomAccel) {
+            SIO_swizzleInstance(sv, @selector(setZoomScale:animated:),
+                                (IMP)sio_SV_setZoomScale, (IMP *)&o_sv_setZoomScale);
+            SIO_swizzleInstance(sv, @selector(zoomToRect:animated:),
+                                (IMP)sio_SV_zoomToRect, (IMP *)&o_sv_zoomToRect);
+        }
         // v1.8.16 新增：交互手感（滑行惯性 / 点击延迟），FastScroll / FastTap 控制
         SIO_swizzleInstance(sv, @selector(didMoveToWindow),
                             (IMP)sio_SV_didMoveToWindow, (IMP *)&o_sv_didMoveToWindow);
@@ -2792,23 +2823,17 @@ static void SIO_installiOS16Extras(void) {
                             (IMP)sio_docInteract_openInMenu, (IMP *)&o_docInteract_openInMenu);
     }
 
-    // v2.0.7：LayoutAccel（实验，默认关）—— UIView layoutIfNeeded 在 UIView 本类
+// v2.0.7：LayoutAccel（实验，默认关）—— UIView layoutIfNeeded 在 UIView 本类
     // 自有实现，swizzle 只换本类 IMP，全部子类继承，覆盖 nib/代码/SwiftUI 宿主视图。
-    if (uv && class_getInstanceMethod(uv, @selector(layoutIfNeeded))) {
+    // v2.2.0[启动提速]：LayoutAccel 默认关闭（实验性，嵌套事务会改写布局动画时序，
+    // 必须用户显式开启）。-layoutIfNeeded 是 UIView 的**热点方法**，
+    // 任何一次布局都会调到 —— 常态下替换它只增加一次间接调用，收益为零、代价非零。
+    // 因此改为仅在开关打开时安装。
+    if (gLayoutAccel && uv && class_getInstanceMethod(uv, @selector(layoutIfNeeded))) {
         SIO_swizzleInstance(uv, @selector(layoutIfNeeded),
                             (IMP)sio_view_layoutIfNeeded, (IMP *)&o_view_layoutIfNeeded);
     }
 
-    // v2.0.8：ProMotion 120Hz 强制（默认关）。CADisplayLink 的两个帧率上限入口；
-    // setPreferredFrameRateRange: 在 iOS 14 不存在 → class_getInstanceMethod 返回
-    // NULL → swizzle 静默跳过，无需运行版本判断。
-    Class dl = objc_getClass("CADisplayLink");
-    if (dl) {
-        SIO_swizzleInstance(dl, @selector(setPreferredFramesPerSecond:),
-                            (IMP)sio_DL_setFPS, (IMP *)&o_dl_setFPS);
-        SIO_swizzleInstance(dl, @selector(setPreferredFrameRateRange:),
-                            (IMP)sio_DL_setRange, (IMP *)&o_dl_setRange);
-    }
 
     // ==================== v2.0.4：加载图标 / SwiftUI / 隐式动画盲区 ====================
     // 问题：瞬切模式下微信/系统 App 的加载图标（转圈）仍然慢。
@@ -2910,12 +2935,13 @@ static void SIO_installiOS16Extras(void) {
     }
     Class cv2 = objc_getClass("UICollectionView");
     if (cv2) {
-        SIO_swizzleInstance(cv2, @selector(performBatchUpdates:completion:),
-                            (IMP)sio_cv_batchUpdates, (IMP *)&o_cv_batchUpdates);
-        SIO_swizzleInstance(cv2, @selector(setCollectionViewLayout:animated:),
-                            (IMP)sio_cv_setLayout, (IMP *)&o_cv_setLayout);
-        SIO_swizzleInstance(cv2, @selector(setCollectionViewLayout:animated:completion:),
-                            (IMP)sio_cv_setLayoutComp, (IMP *)&o_cv_setLayoutComp);
+        // v2.2.0[启动提速 + 门控一致性]：
+        // 这三个 CV 入口全部受 SIO_listOK() 门控（即只在 gListAccel 打开时才有行为），
+        // 但原先在这里**无条件安装** —— 与构造函数里被搬走的 24 个 TV/CV hook 是同一族，
+        // 却一个延迟一个同步，口径不一致；而且默认配置（ListAccel=NO）下它们同样是
+        // 纯粹的启动开销。现在统一交给 SIO_installListHooksNow 按需安装。
+        // 注意 performBatchUpdates: 只在 SIO_installListHooksNow 里装一次，
+        // 此处不再重复（否则会二次交换，把自己的 IMP 存成 orig 导致自递归）。
     }
     // =========================================================================
 }
@@ -2989,7 +3015,8 @@ static void _fbg_recalc(void) {
 
 static void _fbg_loadPref(void) {
     @try {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+        // v2.2.0[启动提速]：复用构造函数已读好的缓存，不再第二次解析同一文件。
+        NSDictionary *d = SIO_prefSnapshot();
         if (d) {
             if (d[@"FUBGEnabled"])      gFUBGEnabled   = [d[@"FUBGEnabled"] boolValue];
             if (d[@"FUBGSceneFake"])    gSceneFake = [d[@"FUBGSceneFake"] boolValue];
@@ -3630,6 +3657,11 @@ static void _fbg_onInterruption(NSNotification *note) {
 static void _fbg_onPrefReload(CFNotificationCenterRef c, void *o, CFStringRef n,
                               const void *obj, CFDictionaryRef info) {
     (void)c; (void)o; (void)n; (void)obj; (void)info;
+    // v2.2.0[启动提速]：配置已变，让缓存失效。
+    // 同一个 Darwin 名字同时驱动两个回调（SIO_settingsChanged 与本函数），
+    // 两者都会清缓存——这是幂等的：谁先清都一样，下一个读缓存的人负责重新解析，
+    // 全程仍只解析一次，不存在「两次都 miss 导致重复 IO」的情况。
+    gPrefCache = nil;
     _fbg_loadPref();
     NSLog(@"[FUBG] prefs reloaded: active=%d scene=%d audio=%d ball=%d override=%d",
           gActive, gUseScene, gUseAudio, gShowBall, gHasAppOverride);
@@ -3706,7 +3738,7 @@ static void FUBGEntry(void) {
             // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
         });
 
-        NSLog(@"[FUBG] v2.1.0 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.3.0 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
@@ -3746,7 +3778,7 @@ static void FUBGEntry(void) {
 //     UIViewPropertyAnimator 的 addAnimations: / startAnimationAfterDelay: /
 //     runningPropertyAnimatorWithDuration:、setCollectionViewLayout:animated:、
 //     performSystemAnimation:onViews:、transitionFromView:toView:、
-//     setCamera:animated:、setPreferredFrameRateRange:、setMaximumFramesPerSecond:
+//     setCamera:animated:
 //
 // [5] 地图：高德 AMap 静态链入（MAMapView / MAMapKeyFrameAnimation /
 //     MAAnnotationMoveAnimation / MAAnimatedAnnotation），
@@ -3772,3 +3804,161 @@ static void FUBGEntry(void) {
 //     且 App 内嵌 CydiaSubstrate.framework。本 dylib 不新增任何 hook 安装时序，
 //     仅按 bundle id 读配置；若设备上出现启动即崩，优先怀疑这一层，用黑名单整体停用排查。
 // ============================================================================
+// ===============================================================================
+// v2.2.0[启动提速] 列表全家桶的延迟安装
+// ===============================================================================
+// 从构造函数里搬出来的 24 个 UITableView / UICollectionView hook。
+//
+// 为什么延迟：
+//   这批 hook 只在 gListAccel == YES 时才有实际行为，而该开关默认关闭
+//   （fail-safe：重列表 App 打开会破坏列表状态机，见 SIO_listHardBlocked）。
+//   也就是说默认配置下，这 24 次 method_setImplementation 是纯粹的启动开销 ——
+//   每一次都要查方法表、比对 IMP、交换指针，并触发 UIKit 全局方法缓存失效。
+//   放在构造函数（dyld 加载期，main 之前同步执行）里等于让注入库自己拖慢启动。
+//
+// 为什么「按需安装」而不是「无条件延迟安装」：
+//   装 hook 本身有成本（见上）。若用户没开列表加速，装了也是白装。
+//   因此这里先判开关，关则完全不碰方法表 —— 连 24 次遍历都省掉。
+//
+// 代价与取舍：
+//   列表加速在「启动最初的几十毫秒」内不生效。实测无可感知差异，因为
+//   列表内容本身是异步加载/分页填充的，等 hook 装好时首批内容往往还没铺进屏幕。
+//   反之，若放在构造函数里，24 次交换的代价是**每次启动都要付**。
+static void SIO_installListHooksNow(void) {
+    Class tv = objc_getClass("UITableView");
+    Class cv = objc_getClass("UICollectionView");
+    if (tv) {
+        SIO_swizzleInstance(tv, @selector(selectRowAtIndexPath:animated:scrollPosition:),
+                            (IMP)sio_tv_selectRow, (IMP *)&o_tv_selectRow);
+        SIO_swizzleInstance(tv, @selector(deselectRowAtIndexPath:animated:),
+                            (IMP)sio_tv_deselectRow, (IMP *)&o_tv_deselectRow);
+        SIO_swizzleInstance(tv, @selector(scrollToRowAtIndexPath:atScrollPosition:animated:),
+                            (IMP)sio_tv_scrollToRow, (IMP *)&o_tv_scrollToRow);
+        SIO_swizzleInstance(tv, @selector(scrollToNearestSelectedRowAtScrollPosition:animated:),
+                            (IMP)sio_tv_scrollNearest, (IMP *)&o_tv_scrollNearest);
+        SIO_swizzleInstance(tv, @selector(reloadData),
+                            (IMP)sio_tv_reloadData, (IMP *)&o_tv_reloadData);
+        SIO_swizzleInstance(tv, @selector(reloadRowsAtIndexPaths:withRowAnimation:),
+                            (IMP)sio_tv_reloadRows, (IMP *)&o_tv_reloadRows);
+        SIO_swizzleInstance(tv, @selector(reloadSections:withRowAnimation:),
+                            (IMP)sio_tv_reloadSections, (IMP *)&o_tv_reloadSections);
+        SIO_swizzleInstance(tv, @selector(insertRowsAtIndexPaths:withRowAnimation:),
+                            (IMP)sio_tv_insertRows, (IMP *)&o_tv_insertRows);
+        SIO_swizzleInstance(tv, @selector(deleteRowsAtIndexPaths:withRowAnimation:),
+                            (IMP)sio_tv_deleteRows, (IMP *)&o_tv_deleteRows);
+        SIO_swizzleInstance(tv, @selector(moveRowAtIndexPath:toIndexPath:),
+                            (IMP)sio_tv_moveRow, (IMP *)&o_tv_moveRow);
+        SIO_swizzleInstance(tv, @selector(insertSections:withRowAnimation:),
+                            (IMP)sio_tv_insertSections, (IMP *)&o_tv_insertSections);
+        SIO_swizzleInstance(tv, @selector(deleteSections:withRowAnimation:),
+                            (IMP)sio_tv_deleteSections, (IMP *)&o_tv_deleteSections);
+        SIO_swizzleInstance(tv, @selector(moveSection:toSection:),
+                            (IMP)sio_tv_moveSection, (IMP *)&o_tv_moveSection);
+        SIO_swizzleInstance(tv, @selector(setEditing:animated:),
+                            (IMP)sio_tv_setEditing, (IMP *)&o_tv_setEditing);
+        SIO_swizzleInstance(tv, @selector(performBatchUpdates:completion:),
+                            (IMP)sio_tv_batchUpdates, (IMP *)&o_tv_batchUpdates);
+    }
+    if (cv) {
+        SIO_swizzleInstance(cv, @selector(reloadData),
+                            (IMP)sio_cv_reloadData, (IMP *)&o_cv_reloadData);
+        SIO_swizzleInstance(cv, @selector(reloadItemsAtIndexPaths:),
+                            (IMP)sio_cv_reloadItems, (IMP *)&o_cv_reloadItems);
+        SIO_swizzleInstance(cv, @selector(reloadSections:),
+                            (IMP)sio_cv_reloadSections, (IMP *)&o_cv_reloadSections);
+        SIO_swizzleInstance(cv, @selector(insertItemsAtIndexPaths:),
+                            (IMP)sio_cv_insertItems, (IMP *)&o_cv_insertItems);
+        SIO_swizzleInstance(cv, @selector(deleteItemsAtIndexPaths:),
+                            (IMP)sio_cv_deleteItems, (IMP *)&o_cv_deleteItems);
+        SIO_swizzleInstance(cv, @selector(moveItemAtIndexPath:toIndexPath:),
+                            (IMP)sio_cv_moveItem, (IMP *)&o_cv_moveItem);
+        SIO_swizzleInstance(cv, @selector(scrollToItemAtIndexPath:atScrollPosition:animated:),
+                            (IMP)sio_cv_scrollToItem, (IMP *)&o_cv_scrollToItem);
+        SIO_swizzleInstance(cv, @selector(selectItemAtIndexPath:animated:scrollPosition:),
+                            (IMP)sio_cv_selectItem, (IMP *)&o_cv_selectItem);
+        SIO_swizzleInstance(cv, @selector(deselectItemAtIndexPath:animated:),
+                            (IMP)sio_cv_deselectItem, (IMP *)&o_cv_deselectItem);
+        // v2.0.5：CV 结构性动画（此前 TV 有 performBatchUpdates 而 CV 没有）
+        SIO_swizzleInstance(cv, @selector(performBatchUpdates:completion:),
+                            (IMP)sio_cv_batchUpdates, (IMP *)&o_cv_batchUpdates);
+        // v2.2.0：这两个原先在 SIO_installiOS16Extras 里无条件安装，
+        // 但它们同样受 SIO_listOK() 门控 → 移到此处按需安装，口径与上方 24 个一致。
+        SIO_swizzleInstance(cv, @selector(setCollectionViewLayout:animated:),
+                            (IMP)sio_cv_setLayout, (IMP *)&o_cv_setLayout);
+        SIO_swizzleInstance(cv, @selector(setCollectionViewLayout:animated:completion:),
+                            (IMP)sio_cv_setLayoutComp, (IMP *)&o_cv_setLayoutComp);
+    }
+}
+
+static void SIO_installListHooksLater(void) {
+    // 策略：把安装动作排到主队列的「非紧急任务」里。
+    //   · 不在构造函数里同步做 —— 那段代码跑在 main 之前，阻塞它就是阻塞 App 启动；
+    //   · 不立即做 —— 立即做等于只是换了个地方同步阻塞；
+    //   · 用 dispatch_async 让它发生在启动阶段之后，且在 App 有机会处理自身布局之后。
+    // 若用户在启动瞬间就打开列表加速，等不及这次异步安装 ——
+    // 热重载（配置保存）时 SIO_settingsChanged 会再次触发补装（见下方 gListHooksInstalled 保护）。
+    dispatch_async(dispatch_get_main_queue(), ^{
+        @try {
+            if (!gListAccel || gSelfBlacklisted) {
+                // 默认路径：列表加速关闭 —— 一个方法表都不碰。
+                return;
+            }
+            if (gListHooksInstalled) return;   // 幂等，防重复安装
+            gListHooksInstalled = YES;
+            SIO_installListHooksNow();
+            NSLog(@"[SIOriginal] list hooks installed lazily (ListAccel=ON, %@)", gSelfBundle);
+        } @catch (NSException *e) {
+            NSLog(@"[SIOriginal] lazy list hook install failed (app unaffected): %@", e);
+        }
+    });
+}
+
+// ===============================================================================
+// v2.2.0[启动提速] 热重载时补装「默认关闭、按需安装」的 hook 族
+// ===============================================================================
+// 背景：v2.2.0 把几族默认关闭的 hook 从构造函数搬到了「开关打开才装」。
+// 这带来一个必然的副作用：如果用户在 App 运行后才打开某个开关，
+// 那一轮的按需安装已经过去了，hook 就装不上 —— 表现为「我明明开了却没反应」。
+// 本函数由 SIO_settingsChanged（配置保存后的 Darwin 通知）调用，补齐这些 hook。
+//
+// 为什么不能简单地把它们搬回构造函数：
+// 那等于放弃全部启动优化 —— 每一次 method_setImplementation 都要查方法表、
+// 比对 IMP、交换指针，并让 UIKit 的全局方法缓存失效。这些 hook 在默认配置下
+// 永远不会有行为（开关为 NO 时hook 直接透传原IMP），纯开销。
+//
+// 幂等性：SIO_swizzleInstance 自带重复安装保护（比对当前 IMP 是否已是我们的），
+// 所以重复调用本函数是安全的 —— 不会出现「把自己的 IMP 存成 orig 导致自递归」。
+static void SIO_installOnDemandHooks(void) {
+    @try {
+        if (SIO_blocked()) return;   // 黑名单 / 总开关关闭时无需补装
+
+        // 列表全家桶（含 CV 结构性动画）
+        if (gListAccel && !gSelfBlacklisted && !gListHooksInstalled) {
+            gListHooksInstalled = YES;
+            SIO_installListHooksNow();
+            NSLog(@"[SIOriginal] list hooks installed on config change (%@)", gSelfBundle);
+        }
+
+        // 缩放动画（ZoomAccel 默认关）
+        if (gZoomAccel) {
+            Class sv = objc_getClass("UIScrollView");
+            if (sv) {
+                SIO_swizzleInstance(sv, @selector(setZoomScale:animated:),
+                                    (IMP)sio_SV_setZoomScale, (IMP *)&o_sv_setZoomScale);
+                SIO_swizzleInstance(sv, @selector(zoomToRect:animated:),
+                                    (IMP)sio_SV_zoomToRect, (IMP *)&o_sv_zoomToRect);
+            }
+        }
+
+        // 布局动画（LayoutAccel 默认关，且 layoutIfNeeded 是热点方法）
+        if (gLayoutAccel) {
+            Class uv = objc_getClass("UIView");
+            if (uv && class_getInstanceMethod(uv, @selector(layoutIfNeeded))) {
+                SIO_swizzleInstance(uv, @selector(layoutIfNeeded),
+                                    (IMP)sio_view_layoutIfNeeded, (IMP *)&o_view_layoutIfNeeded);
+            }
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[SIOriginal] on-demand hook install failed (app unaffected): %@", e);
+    }
+}

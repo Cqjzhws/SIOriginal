@@ -1,5 +1,5 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.2.0
+Version: 2.3.0
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.2.0：启动提速 —— plist 解析去重（2次→1次）、列表全家桶 27 个 hook 与缩放/布局/120Hz 三族改为「延迟+按需」安装，默认配置下冷启动期 method_setImplementation 从 53 次降到 26 次（-51%），热重载时自动补装；保留 v2.1.0 全部修复（保活链路修复、时长下限不再反向拉长、黑名单统一精确匹配）与速率加速引擎
+Description: 动画加速 Tweak v2.3.0：**移除 ProMotion120 帧率强制**（该功能只放宽App 的帧率上限，对「感觉不流畅」帮助有限，且会显著增加功耗）；新增**帧对齐引擎**（默认开）—— 把加速后的动画时长对齐到设备帧边界的整数倍（120Hz=8.33ms / 60Hz=16.67ms），消除时长不整除帧周期导致的每帧渲染时刻漂移与「最后一步顿一下」。这是 120Hz 之外真正改善流畅感的手段，在 60Hz 设备上同样有效。附tools/test_frame_align.py 验证三条不变量
