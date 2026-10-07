@@ -591,7 +591,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.3.0 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.4.0 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -781,15 +781,14 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _swLayout = [[UISwitch alloc] init];
     _swLayout.on = [cfg[@"LayoutAccel"] boolValue];
     [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"布局动画加速（实验，SwiftUI/约束布局）" icon:@"squareshape.split.3x3" iconColor:[UIColor systemIndigoColor] control:_swLayout] isLast:NO];
-    // v2.3.0：原 ProMotion120 开关位改为「帧对齐引擎」。
-    // 移除 120Hz 的理由见README：它只放宽 App 的帧率上限，
-    // 而流畅感的真正短板往往是「动画时长不对齐帧边界」——每帧渲染时刻不稳定，
+    // 开关位为「帧对齐引擎」（与任何帧率强制功能无关）。
+    // 流畅感的真正短板往往是「动画时长不对齐帧边界」——每帧渲染时刻不稳定，
     // 视觉上就是顿挫。帧对齐从根源解决，且在 60Hz 设备上同样有效。
     _swFrameAlign = [[UISwitch alloc] init];
     BOOL faDef = cfg[@"FrameAlign"] ? [cfg[@"FrameAlign"] boolValue] : YES;
     _swFrameAlign.on = faDef;
     [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"帧对齐引擎（消除时长抖动，60Hz 也生效）" icon:@"rectangle.grid.1x2" iconColor:[UIColor systemTealColor] control:_swFrameAlign] isLast:NO];
-    UILabel *faHint = [self label:@"把加速后的动画时长对齐到设备帧边界（120Hz=8.3ms / 60Hz=16.7ms 的整数倍）。不对齐时每帧渲染时刻会漂移，视觉上表现为顿挫——这是 120Hz 之外真正改善流畅感的手段。" size:12 dim:YES];
+    UILabel *faHint = [self label:@"把加速后的动画时长对齐到屏幕每一帧的边界（60Hz 屏为 16.7ms 的整数倍，高刷屏同理按其帧长对齐）。时长不整除帧周期时每帧渲染时刻会漂移，视觉上表现为顿挫。本功能只读取设备刷新率用于时长计算，不会修改或强制任何帧率。" size:12 dim:YES];
     [c2 addRow:[self hintRow:faHint] isLast:NO];
 
     // v2.1.0[新功能 8]：速率加速引擎。

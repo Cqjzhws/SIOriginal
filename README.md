@@ -66,9 +66,10 @@ v2.0.8 的「强制 120Hz」做的是**改写 App 设定的帧率上限**
   也就是说默认配置下这 27 次方法表交换是**纯开销**。
   现在构造期不碰，改为启动后异步安装，且**开关关闭时连装都不装**。
 - **[性能·启动] 其余默认关闭的 hook 同样按需安装**：
-  缩放动画（`ZoomAccel`）、布局动画（`LayoutAccel`）、
-  120Hz 帧率（`ProMotion120`）。其中 `layoutIfNeeded` 尤其值得按需 ——
+  缩放动画（`ZoomAccel`）、布局动画（`LayoutAccel`）。
+  其中 `layoutIfNeeded` 尤其值得按需 ——
   它是 `UIView` 的热点方法，任何一次布局都会调到，常态下替换只增加间接调用。
+  （v2.2.0 时同批按需安装的帧率强制功能已在 v2.3.0 彻底移除，不再存在任何帧率改写。）
 - **[功能补全] 热重载补装**：按需安装的必然副作用是「运行后才打开开关」时 hook 装不上
   （表现为"我明明开了却没反应"）。新增 `SIO_installOnDemandHooks()`，
   由配置保存后的 Darwin 通知触发补装，全部幂等。
@@ -286,7 +287,7 @@ TLS key 创建与判空、配置变量在 `SIO_reload` 两个分支均赋值、�
 <key>TransitionBoost</key><real>1.0</real>
 <key>Notify</key><true/>
 <key>LayoutAccel</key><false/>
-<key>ProMotion120</key><false/>
+<key>FrameAlign</key><true/>
 <key>Blacklist</key><array><string>com.tencent.wework</string></array>
 <key>FUBGEnabled</key><true/>
 <key>FUBGSceneFake</key><true/>

@@ -12,6 +12,13 @@ on:
 permissions:
   contents: write
 
+# v2.4.0：同一 tag 上的多次构建只保留最后一次。
+# 教训：移动 tag 触发新构建时，若上一次构建还在跑，两次都会向同名 Release
+# 上传同名资产，后结束的会覆盖先结束的 —— 曾导致旧源码的 IPA 覆盖新源码 IPA。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: macos-15
