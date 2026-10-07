@@ -392,29 +392,33 @@ static inline void SIO_markAnimScaled(id anim) {
                              OBJC_ASSOCIATION_ASSIGN);
 }
 
-// v2.1.0[性能 7]：原时长改存「非指针 POD 盒子」。
+// v2.1.0[性能 7]：原时长改存「极小 ObjC POD 盒子」。
 // 原实现 SIO_saveOrigDur 用 @(d) 装箱 —— 每次显式动画的每次 setDuration: 都有一次
 // NSNumber 堆分配 + 一次关联对象写入，是显式动画高频路径上稳定的分配来源。
-// 现在改为：把 double 的位模式塞进一个 malloc 的 8 字节盒子，用关联对象持有。
-// 相比 NSNumber：分配量相同但对象更小（16B vs 16B，实际差别在于省掉了
-// NSNumber 的 tag/额外 isa 字段与 objc_number 类的生命周期管理），
-// 真正的收益在于「同值不重写」：同一动画反复设同一时长时不再产生新对象。
+// 现在改为：用只含一个 double ivar 的极小盒子，关联对象 RETAIN 持有；
+// 同一动画反复设同一时长时只写 ivar（零新分配）。
+// 注意：ARC 下禁止把 malloc 的 double* 直接当 id 存取（id→double* 转换被拒，
+// 且 RETAIN 策略会对非对象指针发 retain 导致崩溃），故必须用 ObjC 类承载。
+@interface SIODoubleBox : NSObject { @public double value; }
+@end
+@implementation SIODoubleBox
+@end
+
 static inline void SIO_saveOrigDur(id anim, double d) {
     if (!anim) return;
-    double *box = (double *)objc_getAssociatedObject(anim, kSIOOrigDur);
+    SIODoubleBox *box = (SIODoubleBox *)objc_getAssociatedObject(anim, kSIOOrigDur);
     if (box) {
-        *box = d;                 // 盒子已在：原地更新，零分配
+        box->value = d;          // 盒子已在：原地更新，零分配
         return;
     }
-    box = (double *)malloc(sizeof(double));
-    if (!box) return;
-    *box = d;
+    box = [SIODoubleBox new];
+    box->value = d;
     objc_setAssociatedObject(anim, kSIOOrigDur, box,
-                             OBJC_ASSOCIATION_OWN_NONATOMIC);
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 static inline double SIO_getOrigDur(id anim) {
-    double *box = (double *)objc_getAssociatedObject(anim, kSIOOrigDur);
-    return box ? *box : -1.0;
+    SIODoubleBox *box = (SIODoubleBox *)objc_getAssociatedObject(anim, kSIOOrigDur);
+    return box ? box->value : -1.0;
 }
 
 static inline double SIO_targetDuration(double orig) {
@@ -2566,7 +2570,7 @@ static BOOL SIO_delegateIsSpinnerCandidate(Class dc, BOOL *outNeedsStringCheck) 
     return hit;
 }
 
-static BOOL sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
+static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     SIO_REQUIRE_ORIG(o_layer_addAnim);
     // v2.0.7：恒等快速路径。加速 ×1 时下面的转圈检测对所有分支都算不出新时长，
     // 纯属每个显式动画一次的固定开销，直接透传。
