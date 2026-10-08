@@ -338,8 +338,8 @@ static BOOL     gTimeScaleSleep = YES;
 static BOOL gTSForeground = YES;
 // v2.7.0：白名单模式开关（NO=所有 App 生效；YES=仅名单内 App 生效，配置器自身除外）
 static BOOL gTSWLMode = NO;
-// v2.7.0：白名单数组（Bundle ID 列表，copy 语义）
-static NSString *gTSWhitelist = nil;
+// v2.7.0：白名单数组（Bundle ID 列表，copy 语义；NSArray —— 元素按 NSString 校验）
+static NSArray *gTSWhitelist = nil;
 // v2.3.0：帧周期（秒）。惰性求值一次 —— 120Hz=1/120≈0.00833，60Hz=1/60≈0.01667。
 // 取 maximumFramesPerSecond 的倒数；若不可用则回退 60Hz。
 static double   gFramePeriod = 0.0;
