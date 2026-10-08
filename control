@@ -1,5 +1,5 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.4.0
+Version: 2.5.0
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.4.0：补齐转场/控件/隐式动画盲区 —— 新增 15 个 hook：UINavigationController popToRoot、UITabBarController setViewControllers、UITabBar setItems、UIViewController setEditing、UISearchController setActive、UIPopoverPresentationController setPopoverContentSize、UIPageViewController setSpineLocation、UINavigationItem 5 件套按钮切换、UISearchBar setShowsCancelButton、UIStepper setValue、CALayer actionForKey（隐式动画统一兜底，与 CATransaction getter 互补且不双重缩放）。保留 v2.3.0 帧对齐引擎与全部既有功能。
+Description: 动画加速 Tweak v2.5.0：性能审计修复 —— 启动指纹 NSLog 拆分（不再在 pre-main 触发 UIKit 初始化与私有框架 dlopen）、iOS16Extras 约 55 次 hook 交换移至启动完成后并新增 swaps= 运行时计数、转圈检测 O(1) 否定前置筛（图层树遍历减少 98%）、gPrefCache 改 os_unfair_lock 加锁修复并发释放崩溃隐患、配置读写与落盘改后台串行队列。新增 tools/check_v250.py（性能不变量 ×9）与 tools/bench_v250.py（算法基准 ×4）。保留 v2.4.0 全部 hook 与 v2.3.0 帧对齐引擎。

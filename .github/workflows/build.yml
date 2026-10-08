@@ -142,6 +142,11 @@ jobs:
         python3 tools/check_v210.py Tweak/SIOriginal.m
         # v2.3.0：帧对齐算法验证（整数帧 / 只缩短 / 不足一帧保持原值）
         python3 tools/test_frame_align.py
+        # v2.5.0：性能不变量核查（启动惰性化 / 配置缓存加锁 / watchdog 成对启停 /
+        #   关联对象合并 / 主线程零 IO）—— 防止性能改动被后续提交悄悄抵消
+        python3 tools/check_v250.py .
+        # v2.5.0：算法层基准（决策次数），未达标即视为性能回退
+        python3 tools/bench_v250.py
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v4

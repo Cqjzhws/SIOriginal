@@ -23,6 +23,14 @@ if command -v python3 &> /dev/null; then
     # 无法靠真机肉眼确认，靠真机发现问题时已经晚了 —— 构建期拦住。
     echo ">>> 帧对齐算法验证 ..."
     python3 tools/test_frame_align.py
+    # v2.5.0：性能不变量核查 + 算法层基准。
+    # 本轮的优化都是「把昂贵的事挪走 / 少做一次」—— 一旦后续改动把它们挪回来，
+    # 编译不报错、功能也不坏，只是性能悄悄退化，而这类退化在真机上极难归因。
+    # 因此必须变成 CI 里会失败的断言。
+    echo ">>> v2.5.0 性能不变量核查 ..."
+    python3 tools/check_v250.py .
+    echo ">>> v2.5.0 算法层基准 ..."
+    python3 tools/bench_v250.py
 else
     echo "警告：未找到 python3，跳过静态核查"
 fi

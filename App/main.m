@@ -28,6 +28,45 @@ extern int reboot(int);
 static NSString * const PrefPath  = @"/var/Managed Preferences/mobile/com.apple.UIKit.plist";
 static NSString * const NotifyKey = @"com.local.sioriginal.settingschanged";
 
+// =============================================================================
+// v2.5.0[性能·P3] 配置读取缓存 + 串行 IO 队列
+// =============================================================================
+// 原实现里 ReadConfig() 是「每次调用都完整读一次磁盘」：
+//   · 四个 Tab 的 viewDidLoad 各调一次（切一遍 Tab 就是 4 次 mmap + plist 反序列化）
+//   · onSave 开头一次、WriteConfig 内部再一次（同一个文件读两遍）
+//   · onExport / onSelfCheck 各一次
+// 而 plist 只在本 App 自己写入时才会变 —— 缓存是安全的，只要写后失效。
+//
+// 同时把所有文件读写收敛到一条串行队列 gIOQueue：
+//   · 主线程不再做磁盘 IO（原 onSave 最多 5 次读 + 3 次写全在主线程，
+//     在慢存储/存储加压时是肉眼可见的卡顿，保存按钮按下去会"粘"一下）；
+//   · 串行队列保证「快速连点保存」不会并发读写同一个 plist 造成写覆盖。
+// =============================================================================
+static NSDictionary  *gCfgSnapshot = nil;          // 只读快照（缓存）
+static dispatch_queue_t gIOQueue = NULL;
+
+// v2.5.0：缓存失效必须在主线程做。
+// ReadConfig() 全部在主线程调用，而 WriteConfig() 跑在 IO 队列 ——
+// 若直接在 IO 队列里 `gCfgSnapshot = nil`，就与主线程对同一 __strong 静态变量的
+// 读构成 release 竞争（同 dylib 侧 gPrefCache 的问题，见 PERFORMANCE.md 的 P2）。
+// 统一走主队列，所有读写天然串行；已在主线程时直接置空，不多一次调度。
+static void SIOInvalidateCfgCache(void) {
+    if ([NSThread isMainThread]) {
+        gCfgSnapshot = nil;
+        return;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{ gCfgSnapshot = nil; });
+}
+
+static dispatch_queue_t SIOIOQueue(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gIOQueue = dispatch_queue_create("com.local.sioriginal.io",
+                                         DISPATCH_QUEUE_SERIAL);
+    });
+    return gIOQueue;
+}
+
 static UIColor *SIOCyanColor(void) {
     if (@available(iOS 15.0, *)) return [UIColor systemCyanColor];
     return [UIColor colorWithRed:0.0 green:0.75 blue:0.83 alpha:1.0];
@@ -140,7 +179,14 @@ static void Respring(void) {
 }
 
 static NSMutableDictionary *ReadConfig(void) {
-    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
+    // v2.5.0：命中缓存时只做一次 mutableCopy（约 30 个键，微秒级），
+    // 不再走 mmap + plist 反序列化（毫秒级）。写配置后由 WriteConfig 失效缓存。
+    NSDictionary *snap = gCfgSnapshot;
+    if (!snap) {
+        snap = [NSDictionary dictionaryWithContentsOfFile:PrefPath];
+        gCfgSnapshot = snap;
+    }
+    NSMutableDictionary *d = [snap mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     if (!d[@"Enabled"])          d[@"Enabled"]          = @YES;
     if (!d[@"Mode"])             d[@"Mode"]             = @0;
@@ -171,7 +217,14 @@ static NSMutableDictionary *ReadConfig(void) {
     return d;
 }
 
-static BOOL WriteConfig(NSMutableDictionary *cfg) {
+// v2.5.0[性能·P3] dragCoeff 并入本次写入。
+// 原实现里 onSave 先调 WriteConfig 写 PrefPath，再调 WriteUIKitDrag 写 UIKitPath ——
+// 而这两个常量指向**同一个文件** /var/Managed Preferences/mobile/com.apple.UIKit.plist。
+// 于是同一次保存对同一个 plist 做了两轮完整的 read-modify-write：
+// 第二轮还要把第一轮刚写进去的内容重新读出来再写一遍。
+// 合并后每轮保存少一次读盘 + 一次写盘，且消除了两轮之间的顺序依赖。
+// 传 nil 表示「不改这一项」，保持与 WriteUIKitDrag 相同的语义。
+static BOOL WriteConfig(NSMutableDictionary *cfg, NSNumber *dragCoeff) {
     mkdir("/var/Managed Preferences", 0755);
     mkdir("/var/Managed Preferences/mobile", 0755);
     NSMutableDictionary *merged = [[NSDictionary dictionaryWithContentsOfFile:PrefPath] mutableCopy];
@@ -193,13 +246,27 @@ static BOOL WriteConfig(NSMutableDictionary *cfg) {
         // 之类的值判断，否则 @NO 会被当缺失而保留旧值。
         if (cfg[k]) merged[k] = cfg[k];
     }
+    // v2.5.0：UIAnimationDragCoefficient 在同一份合并结果里落盘，不再二次读写。
+    // coeff <= 0 表示移除该项（与 WriteUIKitDrag 原语义一致）。
+    if (dragCoeff) {
+        double coeff = dragCoeff.doubleValue;
+        if (coeff > 0.0) merged[@"UIAnimationDragCoefficient"] = @(coeff);
+        else             [merged removeObjectForKey:@"UIAnimationDragCoefficient"];
+    }
     BOOL ok = [merged writeToFile:PrefPath atomically:YES];
+    // v2.5.0：写成功即让读缓存失效，下一次 ReadConfig 才会真的读盘。
+    // 走 SIOInvalidateCfgCache 而不是裸赋值 —— 本函数跑在 IO 队列，
+    // 缓存的读取方在主线程，必须串行化（见该函数说明）。
+    SIOInvalidateCfgCache();
     if (ok) {
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                              (__bridge CFStringRef)NotifyKey, NULL, NULL, YES);
     }
     return ok;
 }
+
+// 兼容旧调用点（不需要改 drag 时）
+static BOOL WriteConfigOnly(NSMutableDictionary *cfg) { return WriteConfig(cfg, nil); }
 
 static NSString *ModeText(int m) {
     return m == 1 ? @"慢放" : (m == 2 ? @"瞬切" : @"加速");
@@ -224,7 +291,9 @@ static double ReadUIKitDrag(void) {
     NSNumber *v = d[@"UIAnimationDragCoefficient"];
     return v ? v.doubleValue : 0.0;
 }
-static void WriteUIKitDrag(double coeff) {
+// v2.5.0：正式保存路径已把 drag 并入 WriteConfig（同一文件只写一次，见其说明）。
+// 本函数保留供外部/调试直接调用，标注 unused 以避免 -Wunused-function 告警。
+__attribute__((unused)) static void WriteUIKitDrag(double coeff) {
     NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:UIKitPath] mutableCopy];
     if (!d) d = [NSMutableDictionary dictionary];
     if (coeff > 0.0) {
@@ -498,6 +567,8 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UILabel *_ovSpeedLabel, *_ovGuard;
     // 高级 - 自检
     UILabel *_selfCheck;
+    // v2.5.0：UI 更新合并表（见 -coalesce:block:）
+    NSMutableDictionary *_pendingUpdates;
 }
 @end
 
@@ -506,6 +577,38 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
 - (instancetype)initWithTab:(SIOTabType)tab {
     if (self = [super init]) { _tab = tab; }
     return self;
+}
+
+// =============================================================================
+// v2.5.0[性能·P3] UI 更新合并（批量合并 + 防抖）
+// =============================================================================
+// 滑杆拖动时 UIControlEventValueChanged 以屏幕刷新率（最高 120Hz）连发，
+// segmented control 快速切换同理。原实现每次事件都立刻改 UILabel.text，
+// 而改 text 会触发一次 invalidateIntrinsicContentSize + 标记需要布局，
+// 在同一帧内连续多次就是多次冗余的布局标记。
+//
+// 这里的合并策略是「同一 runloop 轮次内同一类更新只保留一次，且延到轮次末尾执行」：
+//   · 块内读取的是**执行时的**控件状态（如 _slider.value），
+//     所以丢弃中间的重复请求不会丢帧、也不会显示中间值 ——
+//     用户在意的只有停下来那一刻的最终值；
+//   · 延到轮次末尾执行，天然与同一轮里的其他 UI 更新合成一次布局。
+//
+// 需要说明的是：本页这些 handler 本身很轻（改一个短字符串），
+// 所以这里的绝对收益不大 —— 它主要是把「每秒 120 次布局标记」降到
+// 「每帧至多 1 次」，在长页面 + 大字号 + 动态类型下才看得出差别。
+// =============================================================================
+- (void)coalesce:(NSString *)key block:(void (^)(void))block {
+    if (!_pendingUpdates) _pendingUpdates = [NSMutableDictionary dictionary];
+    if (_pendingUpdates[key]) return;          // 本轮已排队，丢弃重复请求
+    _pendingUpdates[key] = [block copy];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) me = weakSelf;
+        if (!me) return;
+        void (^pending)(void) = me->_pendingUpdates[key];
+        [me->_pendingUpdates removeObjectForKey:key];
+        if (pending) pending();
+    });
 }
 
 - (void)viewDidLoad {
@@ -591,7 +694,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.4.0 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.5.0 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1069,38 +1172,49 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _sliderSlowLabel.hidden = (m != 1);
 }
 
+// v2.5.0：以下 handler 改为走 coalesce —— 同一 runloop 轮次内只执行最后一次。
 - (void)sliderChanged {
-    _sliderLabel.text = [NSString stringWithFormat:@"×%.1f", _slider.value];
+    [self coalesce:@"speed" block:^{
+        _sliderLabel.text = [NSString stringWithFormat:@"×%.1f", _slider.value];
+    }];
 }
 
 - (void)slowSliderChanged {
-    _sliderSlowLabel.text = [NSString stringWithFormat:@"×%.1f", _sliderSlow.value];
+    [self coalesce:@"slow" block:^{
+        _sliderSlowLabel.text = [NSString stringWithFormat:@"×%.1f", _sliderSlow.value];
+    }];
 }
 
 - (void)floorChanged { [self updateFloorHint]; }
 - (void)updateFloorHint {
+    [self coalesce:@"floor" block:^{
     double v = FloorForIndex((int)_segFloor.selectedSegmentIndex);
     _floorHint.text = [NSString stringWithFormat:@"所有动画的时长下限：%.3gs。追求极致选 0.005s（风险自担）；遇到卡顿/回调异常请调回 0.01s 或更高。瞬切模式也使用该下限。", v];
+    }];
 }
 
 - (void)layerChanged { [self updateLayerHint]; }
 - (void)updateLayerHint {
+    [self coalesce:@"layer" block:^{
     int idx = (int)_segLayer.selectedSegmentIndex;
     if (idx == 0) {
         _layerHint.text = @"×1：不额外加速，显式动画按全局倍率缩放";
     } else {
         _layerHint.text = [NSString stringWithFormat:@"转圆/进度/旋转/地图相机等显式动画在全局倍率上再 ×%g。不影响 UIView 块动画与转场；慢放不叠加；受下限保护。", LayerBoostForIndex(idx)];
     }
+    }];
 }
 
 - (void)transChanged { [self updateTransHint]; }
 - (void)updateTransHint {
+    [self coalesce:@"trans" block:^{
     int idx = (int)_segTrans.selectedSegmentIndex;
     if (idx == 0) {
         _transHint.text = @"×1 = 不额外加速。push/pop/模态弹窗按全局倍率缩放。";
     } else {
         _transHint.text = [NSString stringWithFormat:@"转场在全局倍率基础上再 ×%g。仅影响导航 push/pop、模态 present/dismiss 等转场动画。", TransitionBoostForIndex(idx)];
     }
+    }];
 }
 
 - (void)dragChanged { [self updateDragHint]; }
@@ -1273,29 +1387,50 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         }
     }
 
-    BOOL ok = WriteConfig(cfg);
-    if (_swRM) WriteAx(@"ReduceMotionEnabled", _swRM.on);
-    if (_swCF) WriteAx(@"PreferCrossFadeTransitions", _swCF.on);
-    if (_swRT) WriteAx(@"ReduceTransparencyEnabled", _swRT.on);
-    if (_segDrag) WriteUIKitDrag(DragCoeffForIndex((int)_segDrag.selectedSegmentIndex));
+    // =========================================================================
+    // v2.5.0[性能·P3] 保存路径整体改为「主线程收集 → 后台串行落盘 → 主线程反馈」。
+    // 原实现在主线程同步做：1 次 ReadConfig 读 + WriteConfig 里 1 次读 1 次写 +
+    // 最多 3 次 WriteAx（每次都是读一遍 Accessibility.plist 再写一遍）+
+    // 1 次 WriteUIKitDrag（又一遍读写同一个 plist）。
+    // 合计最坏 5 次读 + 5 次写，全在主线程、全同步 —— 保存到弹窗之间的这段
+    // 时间主线程是硬卡住的，存储慢或后台有 IO 竞争时按钮会明显"粘"一下。
+    // 现在：UI 状态在主线程快照下来（下面这几个局部量），
+    // 所有文件操作排到串行 IO 队列，结果回到主线程做触感与弹窗。
+    // 串行队列同时保证快速连点保存不会并发写同一个文件。
+    // =========================================================================
+    NSNumber *rmVal   = _swRM   ? @(_swRM.on)   : nil;
+    NSNumber *cfVal   = _swCF   ? @(_swCF.on)   : nil;
+    NSNumber *rtVal   = _swRT   ? @(_swRT.on)   : nil;
+    NSNumber *dragVal = _segDrag ? @(DragCoeffForIndex((int)_segDrag.selectedSegmentIndex)) : nil;
 
-    UINotificationFeedbackGenerator *fg = [[UINotificationFeedbackGenerator alloc] init];
-    [fg prepare];
-    if (ok) {
-        [fg notificationOccurred:UINotificationFeedbackTypeSuccess];
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存成功"
-                            message:@"配置已写入并发送 Darwin 通知，目标 App 重启或注销后生效。"
-                            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-    } else {
-        [fg notificationOccurred:UINotificationFeedbackTypeError];
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存失败"
-                            message:@"无法写入配置文件，请检查权限或路径。"
-                            preferredStyle:UIAlertControllerStyleAlert];
-        [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-        [self presentViewController:a animated:YES completion:nil];
-    }
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(SIOIOQueue(), ^{
+        BOOL ok = WriteConfig(cfg, dragVal);
+        if (rmVal) WriteAx(@"ReduceMotionEnabled", rmVal.boolValue);
+        if (cfVal) WriteAx(@"PreferCrossFadeTransitions", cfVal.boolValue);
+        if (rtVal) WriteAx(@"ReduceTransparencyEnabled", rtVal.boolValue);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) me = weakSelf;
+            if (!me) return;
+            UINotificationFeedbackGenerator *fg = [[UINotificationFeedbackGenerator alloc] init];
+            [fg prepare];
+            if (ok) {
+                [fg notificationOccurred:UINotificationFeedbackTypeSuccess];
+                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存成功"
+                                    message:@"配置已写入并发送 Darwin 通知，目标 App 重启或注销后生效。"
+                                    preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [me presentViewController:a animated:YES completion:nil];
+            } else {
+                [fg notificationOccurred:UINotificationFeedbackTypeError];
+                UIAlertController *a = [UIAlertController alertControllerWithTitle:@"保存失败"
+                                    message:@"无法写入配置文件，请检查权限或路径。"
+                                    preferredStyle:UIAlertControllerStyleAlert];
+                [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+                [me presentViewController:a animated:YES completion:nil];
+            }
+        });
+    });
 }
 
 - (void)onExport {
@@ -1332,7 +1467,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         return;
     }
     NSMutableDictionary *cfg = [(NSDictionary *)obj mutableCopy];
-    BOOL ok = WriteConfig(cfg);
+    BOOL ok = WriteConfigOnly(cfg);
     UIAlertController *a = [UIAlertController alertControllerWithTitle:(ok ? @"导入成功" : @"导入失败")
                         message:(ok ? @"配置已写入，重启目标 App 生效。" : @"写入配置文件失败。")
                         preferredStyle:UIAlertControllerStyleAlert];
@@ -1406,6 +1541,15 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
 @implementation SIOAppDelegate
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)opts {
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+
+    // v2.5.0[性能·P3] 预热配置缓存。
+    // 四个 Tab 的 viewDidLoad 各会调一次 ReadConfig()。UIViewController 的 view
+    // 是懒加载的，所以首个 Tab 在建 window 时就会读一次盘，另外三个在用户切换时
+    // 各读一次 —— 切一遍 Tab 就是四次 mmap + plist 反序列化，且都发生在主线程、
+    // 正好卡在页面出现的那一帧上。
+    // 这里在启动期读一次填进缓存，四个 Tab 与保存/导出/自检全部命中缓存。
+    // 注意：必须在任何 SIOVC 的 view 被访问之前调用，否则首个 Tab 仍会走磁盘。
+    (void)ReadConfig();
 
     SIOVC *engine = [[SIOVC alloc] initWithTab:SIOTabEngine];
     SIOVC *feel   = [[SIOVC alloc] initWithTab:SIOTabFeel];

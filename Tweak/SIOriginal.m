@@ -288,6 +288,10 @@
 #import <pthread.h>
 #import <dlfcn.h>
 #import <notify.h>
+// v2.5.0：os_unfair_lock 用于配置缓存与「启动完成」栅栏的无锁竞争保护。
+// 它比 OSSpinLock 安全（无优先级反转）、比 pthread_mutex 快（无系统调用陷入），
+// 且在 iOS 10+ 全平台可用，与本项目的部署目标一致。
+#import <os/lock.h>
 #import "FUBGNoiseData.h"
 
 #define kPrefDomain  @"com.apple.UIKit"
@@ -329,6 +333,12 @@ static double   gFramePeriod = 0.0;
 // 此时 begin/set/commit 纯属开销（且会把上下文时长强制成 0.25/0.35），统一短路。
 // 在 SIO_reload 末尾按最终生效值（含 App 覆盖）计算。
 static BOOL     gAnimNoop = NO;
+// v2.5.0[性能·P1] 预计算的「系统默认隐式动画时长 0.25s」缩放结果。
+// sio_layer_actionForKey 是最热的 hook（每次可动画属性赋值都过一遍），
+// 原实现每次命中都要跑一遍 SIO_targetDuration → SIO_alignToFrameBoundary
+// （含 floor 除法与帧周期读取）。而它的输入恒为 0.25 —— 结果只随配置变，
+// 不随调用变。放到 SIO_reload 里算一次，热路径退化成一次 double 读。
+static double   gImplicitActionDur = 0.25;
 // v2.0.1：转圈（UIActivityIndicatorView）专属时长下限。旋转动画低于该值会因
 // 帧率采样混叠出现频闪/视觉倒转（×5 把 1s 压到 0.2s 时肉眼像"越转越慢"）。
 // 0.4s ≈ 每秒 2.5 圈，60Hz 下每圈约 24 帧，平滑且明显比系统默认快。
@@ -337,6 +347,20 @@ static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
+// v2.5.0[性能·P0] 清洗后的黑名单条目缓存。
+// 原本这份数组被解析两次：SIO_reload() 解析一遍只为算 gSelfBlacklisted 这一个布尔，
+// 随即在函数末尾丢弃；_fbg_loadPref() 又对同一份 plist 重新
+// addObjectsFromArray + 逐条 stringByTrimmingCharactersInSet: 解析一遍。
+// 每次 trim 都要现造一个 NSCharacterSet（whitespaceCharacterSet 每次调用返回新对象），
+// 而这两个解析都发生在 pre-main 的两个 constructor 里 —— 启动期付两次。
+// 现在 SIO_reload 解析时顺手留一份，保活侧直接取用，第二次解析彻底消失。
+static NSArray *gBlacklistItems = nil;
+// v2.5.0：SIO_reload 是否已跑过。两个 constructor 的执行顺序由 dyld 决定、
+// 不保证先后；保活侧现在复用动画侧的黑名单解析结果，就必须能确认「它已经跑过」。
+// 没有这个标志时，若 FUBGEntry 先于 SIOriginalInit 执行，gBlacklistItems 还是 nil，
+// 排除表会静默变空 —— 黑名单对保活失效，且没有任何报错。这类「顺序依赖的静默降级」
+// 正是本轮要一并消掉的隐患。
+static BOOL     gReloadDone = NO;
 
 static pthread_key_t gInUIViewAnimKey;
 static pthread_key_t gInPAInitKey;   // v1.8.12：UIViewPropertyAnimator 初始化重入保护
@@ -367,19 +391,10 @@ static inline void SIO_setInternalUI(BOOL v){ pthread_setspecific(gInternalUIKey
 // 会让两个入口都跑一遍 → 连缩两次（×speed²），并容易撞 0.01s 下限。
 // 用关联对象打标：谁先处理谁打标，另一个看到标记就跳过。
 // 注意：显式 setDuration: 不受标记限制 —— 那是 App 的新意图，必须按新值重新缩放。
-static const void *kSIOScaledMark = &kSIOScaledMark;
+// v2.5.0：kSIOScaledMark 已废弃 —— 「已缩放」标记并入 kSIOOrigDur 的盒子
+// （见下方 SIODoubleBox），少一次全局关联表加锁查找。保留其声明位置的说明
+// 以免后人误以为漏了什么：现在只有一个关联键。
 static const void *kSIOOrigDur = &kSIOOrigDur;
-
-static inline BOOL SIO_animScaled(id anim) {
-    return anim != nil && objc_getAssociatedObject(anim, kSIOScaledMark) != nil;
-}
-static inline void SIO_markAnimScaled(id anim) {
-    if (!anim) return;
-    // 用 CFBoolean 常量避免每次分配 NSNumber
-    objc_setAssociatedObject(anim, kSIOScaledMark,
-                             (__bridge id)kCFBooleanTrue,
-                             OBJC_ASSOCIATION_ASSIGN);
-}
 
 // v2.1.0[性能 7]：原时长改存「极小 ObjC POD 盒子」。
 // 原实现 SIO_saveOrigDur 用 @(d) 装箱 —— 每次显式动画的每次 setDuration: 都有一次
@@ -388,26 +403,62 @@ static inline void SIO_markAnimScaled(id anim) {
 // 同一动画反复设同一时长时只写 ivar（零新分配）。
 // 注意：ARC 下禁止把 malloc 的 double* 直接当 id 存取（id→double* 转换被拒，
 // 且 RETAIN 策略会对非对象指针发 retain 导致崩溃），故必须用 ObjC 类承载。
-@interface SIODoubleBox : NSObject { @public double value; }
+//
+// v2.5.0[性能·P1] 「已缩放」标记并入同一个盒子。
+// 原本「原时长」与「已缩放标记」是**两个独立的关联对象键**，于是一次显式动画的
+// 处理要触碰关联对象表最多三次（save 1 读 + 1 写，mark 1 写）。
+// 而 objc_get/setAssociatedObject 走的是全局 AssociationsManager ——
+// 内部是一把自旋锁保护的哈希表，多线程同时做动画时会形成真实的锁竞争，
+// 不只是"多一次查表"那么轻。
+// 合并后：一次动画最多 1 次读 + 1 次写，锁竞争概率降到约 1/3。
+@interface SIODoubleBox : NSObject { @public double value; BOOL scaled; }
 @end
 @implementation SIODoubleBox
 @end
 
-static inline void SIO_saveOrigDur(id anim, double d) {
-    if (!anim) return;
+// 取（必要时创建）盒子。create=NO 时永不分配，用于纯查询路径。
+static inline SIODoubleBox *SIO_boxFor(id anim, BOOL create) {
+    if (!anim) return nil;
     SIODoubleBox *box = (SIODoubleBox *)objc_getAssociatedObject(anim, kSIOOrigDur);
-    if (box) {
-        box->value = d;          // 盒子已在：原地更新，零分配
-        return;
-    }
+    if (box || !create) return box;
     box = [SIODoubleBox new];
-    box->value = d;
+    box->value  = -1.0;
+    box->scaled = NO;
     objc_setAssociatedObject(anim, kSIOOrigDur, box,
                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    return box;
 }
+
+static inline void SIO_saveOrigDur(id anim, double d) {
+    SIODoubleBox *box = SIO_boxFor(anim, YES);
+    if (box) box->value = d;     // 盒子已在：原地更新，零分配
+}
+
+// v2.5.0[性能·P1] 关于「合并」的准确说明（供后来者核对，避免重复踩坑）：
+//   把 scaled 字段并进盒子**本身不省任何操作** —— 真正省的是调用点少查一次表。
+//   这一点是 tools/bench_v250.py 的 B3 基准跑出来的：最初只做了字段合并，
+//   次数是 3→3，一分没省；必须让 sio_CAAnim_setDuration 里的
+//   「存原值 + 打标」共用同一次 SIO_boxFor 才是 3→2。
+//   因此下面两个调用点都是手写 box 操作，而不是各调一次 helper ——
+//   顺序也有讲究：标记必须在调用原 IMP 之后设置（原 IMP 抛异常时不留标记），
+//   所以不能简单地把两步合成一个 helper 提前调用。
 static inline double SIO_getOrigDur(id anim) {
-    SIODoubleBox *box = (SIODoubleBox *)objc_getAssociatedObject(anim, kSIOOrigDur);
+    SIODoubleBox *box = SIO_boxFor(anim, NO);
     return box ? box->value : -1.0;
+}
+
+// v2.5.0[性能·P1] 「已缩放」标记改存盒子内，与 SIO_getOrigDur 共用同一次
+// 关联对象读取，不再单独占一个关联键（少一次全局关联表加锁查找）。
+// 语义完全不变：仍然是「这个动画的时长已经被我们处理过」。
+// 定义位置必须在 SIODoubleBox 与 SIO_boxFor 之后 —— 前向声明的顺序问题
+// 在本项目历史上出过编译错误（见文件头 v2.3.0 的说明），此处按依赖顺序排列。
+static inline BOOL SIO_animScaled(id anim) {
+    SIODoubleBox *box = SIO_boxFor(anim, NO);
+    return box ? box->scaled : NO;
+}
+static inline void SIO_markAnimScaled(id anim) {
+    SIODoubleBox *box = SIO_boxFor(anim, YES);
+    if (box) box->scaled = YES;
 }
 
 // 帧周期（秒）。惰性求值并缓存 —— maximumFramesPerSecond 在进程内不会变。
@@ -653,18 +704,49 @@ static BOOL gListHardGuarded  = NO;
 // 现在：构造函数只读一次，缓存 NSDictionary 引用，
 // 动画侧与保活侧都从这份缓存取，第二次读变成一次指针取值。
 static NSDictionary *gPrefCache = nil;
+// =============================================================================
+// v2.5.0[稳定性·P2] gPrefCache 的并发访问此前是**不加保护的裸读写**。
+// 写入方是 Darwin 通知回调线程（SIO_settingsChanged 里 `gPrefCache = nil`），
+// 读取方是任意动画线程（SIO_reload → SIO_prefSnapshot）。
+// 在 ARC 下对一个 __strong 静态变量赋值会 `objc_release` 旧值 ——
+// 于是「A 线程刚取出指针、还没 retain」与「B 线程赋新值触发 release」
+// 之间存在真实的时间窗，结果是悬垂指针 → EXC_BAD_ACCESS。
+// 触发条件是「用户在配置 App 连续保存」遇上「目标 App 正在大量播动画」，
+// 属于低概率但确实可能的崩溃，而且一旦发生无法从日志定位。
+//
+// 修法：所有访问走 os_unfair_lock。选它而不选 pthread_mutex /
+// @synchronized 是因为：路径极短（一次哈希/指针读），
+// os_unfair_lock 在无竞争时只是一条原子指令，不陷入内核；
+// 有竞争时才 syscall。对本路径的开销量级（纳秒）可以接受。
+// 磁盘 IO 特意放在锁外 —— 把一次 mmap + plist 反序列化压在锁里，
+// 会让所有动画 hook 在重载瞬间集体阻塞，那是比不加速更糟的卡顿。
+// =============================================================================
+static os_unfair_lock gPrefLock = OS_UNFAIR_LOCK_INIT;
 
-// 线程安全地取配置快照。热重载（Darwin 通知）会替换缓存。
+// 取配置快照。热重载（Darwin 通知）会让缓存失效。
 static NSDictionary *SIO_prefSnapshot(void) {
+    os_unfair_lock_lock(&gPrefLock);
     NSDictionary *d = gPrefCache;
-    if (!d) {
-        d = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-        gPrefCache = d;
-    }
+    os_unfair_lock_unlock(&gPrefLock);
+    if (d) return d;
+    // 未缓存：磁盘 IO 在锁外做（见上方说明）
+    NSDictionary *fresh = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+    os_unfair_lock_lock(&gPrefLock);
+    if (!gPrefCache) gPrefCache = fresh;   // 期间可能已被别的线程填好
+    d = gPrefCache;
+    os_unfair_lock_unlock(&gPrefLock);
     return d;
 }
 
+// 让缓存失效（配置变更后调用）。
+static void SIO_invalidatePrefCache(void) {
+    os_unfair_lock_lock(&gPrefLock);
+    gPrefCache = nil;
+    os_unfair_lock_unlock(&gPrefLock);
+}
+
 static void SIO_reload(void) {
+    gReloadDone = YES;   // v2.5.0：无论成功失败，解析已经发生过一次
     NSDictionary *d = SIO_prefSnapshot();
     if (!d) {
         // v2.0.6：补可观测性。原实现在此静默 return，用户看到「配置没生效」时
@@ -696,10 +778,12 @@ static void SIO_reload(void) {
         gRespectReduceMotion = YES;
         gFrameAlign = YES;
         gSelfBlacklisted = NO;
+        gBlacklistItems  = nil;   // v2.5.0：无配置则无黑名单，保活侧同样取空
         gHasAppOverride  = NO;
         gListHardGuarded = SIO_listHardBlocked();
         if (gListHardGuarded) gListAccel = NO;
         gAnimNoop = (gMode == 0 && gSpeed <= 1.0001);
+        gImplicitActionDur = SIO_targetDuration(0.25);
         return;
     }
     gEnabled = [d[@"Enabled"] boolValue];
@@ -747,6 +831,8 @@ static void SIO_reload(void) {
     gFrameAlign = d[@"FrameAlign"] ? [d[@"FrameAlign"] boolValue] : YES;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
+    // v2.5.0：解析结果（清洗后的条目数组）顺手缓存进 gBlacklistItems，
+    // 供 _fbg_loadPref 复用 —— 保活侧不再对同一份数据做第二次 trim 循环。
     gSelfBlacklisted = NO;
     id bl = d[@"Blacklist"];
     NSArray *items = nil;
@@ -757,15 +843,19 @@ static void SIO_reload(void) {
         items = [(NSString *)bl componentsSeparatedByString:@","];
     }
     NSString *bid = gSelfBundle ?: @"";
-    if (bid.length) {
-        for (id it in items) {
-            if (![it isKindOfClass:[NSString class]]) continue;
-            NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:
-                           [NSCharacterSet whitespaceCharacterSet]];
-            // v2.1.0：改用统一匹配器（精确 + 显式 `*` 前缀），与保活侧语义一致
-            if (s.length && SIO_bundleMatches(s)) { gSelfBlacklisted = YES; break; }
-        }
+    NSMutableArray *cleaned = [NSMutableArray array];
+    // v2.5.0：whitespaceCharacterSet 每次调用都返回一个新对象，
+    // 原实现在循环体内逐条现造 —— 提到循环外取一次。
+    NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
+    for (id it in items) {
+        if (![it isKindOfClass:[NSString class]]) continue;
+        NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:ws];
+        if (!s.length) continue;
+        [cleaned addObject:s];
+        // v2.1.0：改用统一匹配器（精确 + 显式 `*` 前缀），与保活侧语义一致
+        if (!gSelfBlacklisted && bid.length && SIO_bundleMatches(s)) gSelfBlacklisted = YES;
     }
+    gBlacklistItems = cleaned;
 
     // ---- v1.8.14：App 级覆盖（在全局之后应用，优先级更高） ----
     NSDictionary *ovr = SIO_appOverride(d);
@@ -826,9 +916,15 @@ static void SIO_reload(void) {
     }
     // v2.0.7：按最终生效值（含 App 覆盖）计算恒等标记，热路径快速短路用
     gAnimNoop = (gMode == 0 && gSpeed <= 1.0001);
+    // v2.5.0：顺带把最热 hook 的换算结果预计算好（见 gImplicitActionDur 说明）。
+    // 必须在 gAnimNoop 之后 —— SIO_targetDuration 依赖当前生效配置。
+    gImplicitActionDur = SIO_targetDuration(0.25);
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
+// v2.5.0：构造期安装的 CALayer 核心两族（定义见文件后部，此处需前向声明，
+// 否则构造函数里调用会触发 implicit declaration —— 本项目历史上出过同类编译错误）。
+static void SIO_installLayerCoreHooks(void);
 // v2.2.0：列表 hook 的延迟安装（构造函数里只调用它，实际安装排到主队列之后）
 static void SIO_installListHooksLater(void); // forward declaration
 static void SIO_installListHooksNow(void);
@@ -995,24 +1091,38 @@ static void SIO_showInjectToast(int attempt) {
 static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
                                 CFNotificationName name, const void *object,
                                 CFDictionaryRef userInfo) {
-    // v2.2.0[启动提速]：配置已变，让缓存失效，强制下次重新解析。
-    // 不直接在这里读文件 —— Darwin 通知回调不在主线程，
-    // 磁盘 IO 放到 SIO_reload 内部统一处理，避免两次解析。
-    gPrefCache = nil;
-    SIO_reload();
-    // v2.2.0：v2.1.0 的构造函数只排了一次延迟安装。若用户在 App 启动后才打开列表加速，
-    // 那一轮的 dispatch_async 已经跑完并因开关为 NO 跳过了，这里补装一次。
-    // 反向关闭不需要处理 —— hook 装上后由 SIO_listOK() 门控自动失效，
-    // 且重复安装才是真正的风险（自递归），所以只在「开」的方向补装。
-    if (gListAccel && !gSelfBlacklisted && !gListHooksInstalled) {
-        SIO_installListHooksLater();
-    }
-    // v2.2.0：同理补装「默认关闭、按需安装」的那几族（见 SIO_installOnDemandHooks）。
-    SIO_installOnDemandHooks();
-    // Darwin 回调线程以注册时的 runloop 为准（constructor 在主线程注册），
-    // 但所有 UI 操作统一切回主线程，不依赖该实现细节。
+    // =========================================================================
+    // v2.5.0[性能·P2] 整段重载切到主队列串行执行。
+    // 原实现在 Darwin 通知回调线程上直接做三件事：
+    //   ① SIO_reload() → SIO_prefSnapshot() → 同步磁盘读（plist 反序列化）
+    //   ② SIO_reload() 连续改写 30 个全局配置变量
+    //   ③ SIO_installOnDemandHooks() → method_setImplementation（改方法表）
+    // 三者都不该在通知线程做：
+    //   · ① 是阻塞 IO，用户连续点保存时会把通知线程卡住，后续通知排队；
+    //   · ② 与正在读这些全局变量的动画线程构成数据竞争（见 gPrefCache 的说明）；
+    //   · ③ 换方法表必须与 UIKit 的主线程状态保持一致，在非主线程做是隐患。
+    // 切到主队列后：IO 不阻塞通知线程、配置改写与所有 hook 读取天然串行
+    // （hook 也跑在主线程），方法表修改也在主线程完成。
+    // 代价：配置生效延后一个 runloop turn（毫秒级），用户无感。
+    // =========================================================================
     dispatch_async(dispatch_get_main_queue(), ^{
-        SIO_showNotifyToast();
+        @try {
+            // 配置已变，让缓存失效，强制下次重新解析（v2.2.0）
+            SIO_invalidatePrefCache();
+            SIO_reload();
+            // v2.2.0：v2.1.0 的构造函数只排了一次延迟安装。若用户在 App 启动后才
+            // 打开列表加速，那一轮的延迟安装已经跑完并因开关为 NO 跳过了，这里补装。
+            // 反向关闭不需要处理 —— hook 装上后由 SIO_listOK() 门控自动失效，
+            // 且重复安装才是真正的风险（自递归），所以只在「开」的方向补装。
+            if (gListAccel && !gSelfBlacklisted && !gListHooksInstalled) {
+                SIO_installListHooksLater();
+            }
+            // v2.2.0：同理补装「默认关闭、按需安装」的那几族。
+            SIO_installOnDemandHooks();
+            SIO_showNotifyToast();
+        } @catch (NSException *e) {
+            NSLog(@"[SIOriginal] settings reload failed (app unaffected): %@", e);
+        }
     });
 }
 
@@ -1030,16 +1140,63 @@ static void SIO_settingsChanged(CFNotificationCenterRef center, void *observer,
 // 对性能无实际影响。
 static NSTimeInterval gZoomProbeAt = 0;
 static BOOL           gZoomPreviewCached = NO;
+// v2.5.0[性能·P1] 命中过的放大态滚动视图（弱引用）+ 自适应探测间隔。
+// 原实现每 0.25s 无条件对整个前台视图树做一次 DFS（上限 3000 节点），
+// 而 SIO_blocked() 被**每一个**动画/事务 hook 调用，
+// 也就是这个 DFS 会在微信里每 0.25 秒稳定发生一次，代价是几千次
+// isKindOfClass: + 数千次 NSMutableArray 增删 —— 全部落在主线程。
+// 真机上这表现为「微信里偶发掉帧」，且与本项目毫无关系的界面也会中招。
+//
+// 两项改进：
+//  ① 弱引用快路径：一旦确认过某个 scrollView 处于放大态，记住它。
+//     后续探测只需一次弱引用读 + 三个属性读（O(1)）即可确认它是否仍在放大态。
+//     它被释放或缩回后，弱引用自动置 nil / 属性判定失败，回落 DFS —— 自愈，无状态残留。
+//  ② 自适应间隔：连续多次探测都是「未放大」时，把间隔从 0.25s 逐级放宽到 2.0s。
+//     「不在预览页」是绝大多数时间的真实状态，此时高频探测纯属浪费；
+//     一旦结果翻转（进入放大态），间隔立刻回到 0.25s，保护灵敏度不降。
+// 代价：从「未放大」切到「放大」的识别延迟，最坏从 0.25s 变成 2.0s。
+// 这是一处真实的行为放宽 —— 该保护是防「微信预览页卡死」的安全网，
+// 放大态由用户手势触发（双指捏合），2s 内必然已被下一次探测覆盖，
+// 且放大动作本身远慢于 2s，故认为可接受；保守者可调小 kZoomProbeMax。
+static __weak UIScrollView *gZoomCachedSV = nil;
+static int      gZoomMissStreak = 0;
+static const NSTimeInterval kZoomProbeMin = 0.25;
+static const NSTimeInterval kZoomProbeMax = 2.0;
 
 static BOOL SIO_wechatZoomPreviewActive(void) {
     if (!gIsWeChat) return NO;
     NSTimeInterval now = CACurrentMediaTime();
-    if (now - gZoomProbeAt < 0.25) return gZoomPreviewCached;
+    // 连续未命中时放宽间隔（0.25s → 2.0s，每 3 次未命中放宽一档）
+    NSTimeInterval interval = kZoomProbeMin;
+    if (gZoomMissStreak >= 3) {
+        interval = kZoomProbeMin + (kZoomProbeMax - kZoomProbeMin) *
+                   (double)(gZoomMissStreak - 3) / 6.0;
+        if (interval > kZoomProbeMax) interval = kZoomProbeMax;
+    }
+    if (now - gZoomProbeAt < interval) return gZoomPreviewCached;
     gZoomProbeAt = now;
-    // 视图树只能在主线程碰；非主线程直接沿用上一次结果（最多滞后 0.25s）
+    // 视图树只能在主线程碰；非主线程直接沿用上一次结果
     if (![NSThread isMainThread]) return gZoomPreviewCached;
 
+    // ---- 快路径：确认过放大态的滚动视图还在放大吗？（O(1)，无遍历）----
+    UIScrollView *cached = gZoomCachedSV;   // 弱引用读：已释放则自动为 nil
+    if (cached) {
+        BOOL stillZoomed = NO;
+        @try {
+            stillZoomed = (cached.window != nil) &&
+                          (cached.maximumZoomScale > cached.minimumZoomScale + 0.001) &&
+                          (cached.zoomScale > cached.minimumZoomScale + 0.001);
+        } @catch (__unused NSException *e) { stillZoomed = NO; }
+        if (stillZoomed) {
+            gZoomMissStreak = 0;
+            gZoomPreviewCached = YES;
+            return YES;
+        }
+        gZoomCachedSV = nil;   // 已缩回或已释放，回落 DFS 重新找
+    }
+
     BOOL found = NO;
+    UIScrollView *foundSV = nil;
     @autoreleasepool {
         @try {
             NSMutableArray<UIView *> *roots = [NSMutableArray array];
@@ -1055,7 +1212,7 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
             }
             // 迭代 DFS，扫描整个前台视图树
             // v1.8.12：节点上限保护。超大视图树（长列表 / 复杂 WebView 容器）下
-            // 每 0.25s 一次的全树遍历会拖慢主线程；超过上限即按「未放大」放行，
+            // 全树遍历会拖慢主线程；超过上限即按「未放大」放行，
             // 宁可少一层保护，不可卡住界面。
             NSMutableArray<UIView *> *stack = roots;
             NSUInteger visited = 0;
@@ -1068,6 +1225,7 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
                     if (sv.maximumZoomScale > sv.minimumZoomScale + 0.001 &&
                         sv.zoomScale > sv.minimumZoomScale + 0.001) {
                         found = YES;
+                        foundSV = sv;
                         break;
                     }
                 }
@@ -1075,6 +1233,12 @@ static BOOL SIO_wechatZoomPreviewActive(void) {
                 if (subs.count) [stack addObjectsFromArray:subs];
             }
         } @catch (__unused NSException *e) {}
+    }
+    if (found) {
+        gZoomCachedSV = foundSV;
+        gZoomMissStreak = 0;      // 状态翻转 → 立刻恢复最高探测灵敏度
+    } else if (gZoomMissStreak < 9) {
+        gZoomMissStreak++;
     }
     gZoomPreviewCached = found;
     return found;
@@ -1117,6 +1281,24 @@ static inline BOOL SIO_blocked(void) {
     return NO;
 }
 
+// =============================================================================
+// v2.5.0[可观测性] hook 安装计数器与启动耗时采样
+// =============================================================================
+// 本项目的启动优化核心命题一直是「构造期做了多少次 method_setImplementation」。
+// 但此前**没有任何一处真的在数它** —— README 里写的「53 次降到 26 次」是人工
+// 静态清点出来的，任何一次改动都可能让它悄悄回退，而没人会发现。
+// 这里补上两个计数器：
+//   gSIOHookSwapCount —— 实际发生的方法表交换次数（addMethod / setImplementation）
+//   gSIODyldCostMs    —— 两个 constructor 自身消耗的挂钟毫秒数
+// 两者都会打进延后的启动指纹日志，使「启动优化有没有回退」变成一条可 grep 的
+// 可观测量，而不是靠人肉清点。采样成本本身可忽略（每次交换一次 clock_gettime
+// 级别的时间读取，且只在构造期发生）。
+// =============================================================================
+static int    gSIOHookSwapCount = 0;
+static double gSIODyldCostMs    = 0.0;
+// 构造期计时起点/终点（CFAbsoluteTimeGetCurrent 走 mach 绝对时间，无分配）
+static double gSIOT0 = 0.0;
+
 // ---------- swizzle 工具 ----------
 // v1.8.12：增加重复安装保护。若目标 IMP 已经是我们的实现（同一 dylib 被重复注入、
 // 或 constructor 被执行两次），绝不能再把它存进 orig —— 否则回调会自递归爆栈。
@@ -1138,11 +1320,14 @@ static void SIO_swizzleInstance(Class c, SEL sel, IMP newImp, IMP *orig) {
             Method superM = class_getInstanceMethod(class_getSuperclass(c), sel);
             *orig = superM ? method_getImplementation(superM) : NULL;
         }
+        // v2.5.0：addMethod 同样是一次方法表写入，计入交换数
+        gSIOHookSwapCount++;
         return;
     }
     // 本类自有实现：直接替换（addMethod 失败说明已存在）
     if (orig) *orig = cur;
     method_setImplementation(m, newImp);
+    gSIOHookSwapCount++;
 }
 // 注意：必须传「类对象」而不是元类。class_getClassMethod 内部执行的是
 // class_getInstanceMethod(object_getClass(cls), sel)，传元类会去根元类查找并返回 NULL。
@@ -1160,10 +1345,12 @@ static void SIO_swizzleClass(Class c, SEL sel, IMP newImp, IMP *orig) {
             Method superM = class_getInstanceMethod(class_getSuperclass(meta), sel);
             *orig = superM ? method_getImplementation(superM) : NULL;
         }
+        gSIOHookSwapCount++;
         return;
     }
     if (orig) *orig = cur;
     method_setImplementation(m, newImp);
+    gSIOHookSwapCount++;
 }
 
 // ---------- 原始 IMP 指针（先声明后引用） ----------
@@ -1352,14 +1539,32 @@ static void sio_layer_setSpeed(id self, SEL _cmd, float sp) {
 //              只对确实还是 0.25 的动画做缩放。速率模式下也放行（由 setSpeed: 接管）。
 static id sio_layer_actionForKey(id self, SEL _cmd, NSString *key) {
     SIO_REQUIRE_ORIG_NIL(o_layer_actionForKey);
+    // =========================================================================
+    // v2.5.0[性能·P1] -[CALayer actionForKey:] 是本项目最热的一个 hook。
+    // CoreAnimation 在**每一次**可动画属性被赋值时都会调它（不只是显式动画），
+    // 列表布局/滚动/文本渲染期间每秒可达数千次。因此这里每省一次操作都是乘法效应。
+    // 三处改动：
+    //   ① 目标时长改为预计算（gImplicitActionDur），不再每次调
+    //      SIO_targetDuration → SIO_alignToFrameBoundary → floor + 帧周期读取；
+    //   ② 命中判定从 fabs(d-0.25) 改为「与预计算输入比较」，顺带把
+    //      duration 读取延迟到确认 key 值得处理之后；
+    //   ③ 增加 key 快速否定：CoreAnimation 对非属性类 key（onOrderIn / sublayers /
+    //      delegate / onLayout 等）返回 NSNull 或 nil，走不到 CAAnimation 分支，
+    //      先按 key 形态排除可省一次 isKindOfClass:。
+    //      （只做否定，不做肯定 —— 排除错的后果只是这一条隐式动画不加速，
+    //        不会改坏任何动画。）
+    // =========================================================================
     id action = o_layer_actionForKey(self, _cmd, key);
-    if (!action || SIO_blocked() || gAnimNoop || SIO_speedModeActive()) return action;
+    if (!action || gAnimNoop || SIO_speedModeActive()) return action;
+    // key 快速否定：可动画属性名都很短且不含 '.' 前缀的老式键（如 "onOrderIn"）不含
+    if (key.length > 32) return action;
     if (![action isKindOfClass:[CAAnimation class]]) return action;
+    if (SIO_blocked()) return action;
     CAAnimation *anim = (CAAnimation *)action;
     double d = anim.duration;
     // 只兜「系统默认 0.25s」的隐式动画；自定义时长或已被 getter 缩放的不碰。
     if (d <= 0.0 || fabs(d - 0.25) > 1e-6) return action;
-    double nd = SIO_targetDuration(d);
+    double nd = gImplicitActionDur;    // == SIO_targetDuration(0.25)，SIO_reload 时算好
     if (nd != d && o_CAAnim_setDuration) {
         // 用原始 IMP 写回，绕过 sio_CAAnim_setDuration（避免再次缩放）
         o_CAAnim_setDuration(anim, @selector(setDuration:), nd);
@@ -1380,13 +1585,19 @@ static void sio_CAAnim_setDuration(id self, SEL _cmd, double d) {
     double nd = SIO_targetDurationLayer(d);
     if (nd == d) { o_CAAnim_setDuration(self, _cmd, d); return; }
     // v2.0.0：保存原始时长，供 addAnimation: 路径还原 UIActivityIndicatorView 等
-    // 不应被加速的动画使用
-    SIO_saveOrigDur(self, d);
+    // 不应被加速的动画使用。
+    // v2.5.0：「存原值 + 打标」合并成一次关联对象访问（见 SIO_saveOrigDurAndMark）。
+    // 标记仍放在调用原 IMP **之后**设置 —— 若原 IMP 抛异常，不应留下"已处理"标记，
+    // 否则 addAnimation: 兜底会误认为已缩放而跳过（与 v1.8.15 的语义一致）。
+    SIODoubleBox *box = SIO_boxFor(self, YES);
+    if (box) box->value = d;
     // v1.8.15：显式设时长视为新意图，按传入值缩放并重新打标
     //（不因已有标记而跳过，否则「add 之后再改时长」会被错误忽略）
     // v1.8.17：走 LayerBoost 版本（显式动画可单独加倍率）
     o_CAAnim_setDuration(self, _cmd, nd);
-    SIO_markAnimScaled(self);
+    // 标记放在调用原 IMP **之后**：若原 IMP 抛异常，不应留下"已处理"标记，
+    // 否则 addAnimation: 兜底会误认为已缩放而跳过（与 v1.8.15 的语义一致）。
+    if (box) box->scaled = YES;
 }
 
 #pragma mark - CATransaction
@@ -2283,10 +2494,121 @@ static void sio_cv_setLayoutComp(id self, SEL _cmd, id layout, BOOL animated, vo
 
 #pragma mark - 安装
 
+// =============================================================================
+// v2.5.0[性能·P0] 「启动完成之后」调度器
+// =============================================================================
+// 背景：v2.2.0 已经把默认关闭的 hook 族挪出了构造函数，但仍有两处不够精确：
+//
+//   1. SIO_installiOS16Extras() 仍在构造期同步执行 —— 它装的是
+//      UIViewPropertyAnimator / UIScrollView / CALayer / 控件系等约 30 个 hook。
+//      问题在于 dispatch_async(main) 排到的时刻，App 往往**还在跑
+//      didFinishLaunching 与首屏布局**，此时换方法表会和首屏竞争主线程，
+//      并且让 UIKit 的方法缓存在这段最忙的时间里失效两次。
+//
+//   2. 启动指纹日志（见构造函数内的说明）被迫在构造期求值惰性入口。
+//
+// 修法：引入一个一次性「启动完成」栅栏，以
+//   UIApplicationDidFinishLaunchingNotification 为准，
+//   并挂一道 0.35s 的兜底定时器 —— 谁先到谁触发，且只触发一次。
+// 兜底是必需的：本 dylib 可在 UIApplication 尚未存在时被注入（部分 App 的
+// 早期 +load 阶段），此时该通知永远不会来，必须有超时路径兜住，
+// 否则「延后安装」会退化成「永不安装」——那比慢更严重。
+// =============================================================================
+static dispatch_once_t gBootOnce;
+static NSMutableArray *gBootBlocks;
+static os_unfair_lock   gBootLock = OS_UNFAIR_LOCK_INIT;
+// 通知观察者令牌。必须在跑完 blocks 后摘掉 —— 否则若走的是 dispatch_after 兜底
+// 路径（通知从未到来），观察者会一直挂着：既泄漏一个对象，又会在之后某个时刻
+// 对已清空的 blocks 再跑一次 SIO_runBootBlocks（空操作，但属于无谓残留）。
+static id               gBootObserver = nil;
+
+static void SIO_runBootBlocks(void) {
+    NSArray *blocks = nil;
+    id observer = nil;
+    os_unfair_lock_lock(&gBootLock);
+    blocks = gBootBlocks;
+    gBootBlocks = nil;
+    observer = gBootObserver;
+    gBootObserver = nil;
+    os_unfair_lock_unlock(&gBootLock);
+    if (observer) {
+        [[NSNotificationCenter defaultCenter] removeObserver:observer];
+        observer = nil;
+    }
+    for (void (^b)(void) in blocks) {
+        @try { b(); } @catch (__unused NSException *e) {}
+    }
+}
+
+// 把一段工作排到「App 启动完成之后」。已在完成后调用则立即执行。
+static void SIO_afterBoot(void (^block)(void)) {
+    if (!block) return;
+    dispatch_once(&gBootOnce, ^{
+        gBootBlocks = [NSMutableArray array];
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        // 该通知在 didFinishLaunching 返回后投递，正是我们要的时刻。
+        // 令牌存进 gBootObserver，由 SIO_runBootBlocks 统一摘除 ——
+        // 两条触发路径（通知 / 超时兜底）都收敛到同一处清理，不会漏。
+        id token = [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                   object:nil
+                                    queue:[NSOperationQueue mainQueue]
+                               usingBlock:^(__unused NSNotification *n) {
+            SIO_runBootBlocks();
+        }];
+        os_unfair_lock_lock(&gBootLock);
+        gBootObserver = token;
+        os_unfair_lock_unlock(&gBootLock);
+        // 兜底：通知不来也要装，否则功能永久丢失。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ SIO_runBootBlocks(); });
+    });
+    os_unfair_lock_lock(&gBootLock);
+    NSMutableArray *arr = gBootBlocks;
+    if (arr) {
+        [arr addObject:block];
+        os_unfair_lock_unlock(&gBootLock);
+        return;
+    }
+    os_unfair_lock_unlock(&gBootLock);
+    // gBootBlocks 已被清空 = 启动阶段已过，直接跑
+    @try { block(); } @catch (__unused NSException *e) {}
+}
+
+// v2.5.0[可观测性] 记录构造期累计耗时。
+// 两个 constructor 的执行顺序由 dyld 决定、不保证先后，因此这里取「较大值」：
+// 谁最后跑完，谁的耗时就是两个 constructor 的总耗时。
+static inline void SIO_markDyldCost(void) {
+    if (gSIOT0 <= 0.0) return;
+    double ms = (CFAbsoluteTimeGetCurrent() - gSIOT0) * 1000.0;
+    if (ms > gSIODyldCostMs) gSIODyldCostMs = ms;
+}
+
+// v2.5.0[性能·P0] 延后的完整启动指纹。
+// 放在启动完成之后，SIO_framePeriod() 与 SIO_reduceMotionOn() 的首次求值
+// 就落在首屏渲染之后，不再叠加到 pre-main 的阻塞时间里。
+static void SIO_logFingerprintLater(void) {
+    SIO_afterBoot(^{
+        NSLog(@"[SIOriginal] v2.5.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
+              @"floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d "
+              @"feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f "
+              @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms override=%d listGuard=%d "
+              @"swaps=%d bootMs=%.2f)",
+              gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
+              gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
+              gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop,
+              gSpeedMode, SIO_speedScale(), gRespectReduceMotion, SIO_reduceMotionOn(),
+              gFrameAlign, SIO_framePeriod() * 1000.0, gHasAppOverride, gListHardGuarded,
+              gSIOHookSwapCount, gSIODyldCostMs);
+    });
+}
+
 __attribute__((constructor))
 static void SIOriginalInit(void) {
     // v1.8.12：安装全程 @try 包裹。任何一步异常只丢功能，绝不影响目标 App 启动（红线规则 #2）。
     @try {
+    // v2.5.0[可观测性]：构造期计时起点。两个 constructor 跑完时算出总耗时，
+    // 打进延后的启动指纹 —— 让「注入库自身吃掉多少 pre-main 时间」变成可测量量。
+    gSIOT0 = CFAbsoluteTimeGetCurrent();
     if (pthread_key_create(&gInUIViewAnimKey, NULL) != 0) return;
     if (pthread_key_create(&gInPAInitKey, NULL) != 0) return;
     // v2.1.0：内部 UI 标记的 TLS key。三个 key 都必须创建成功才能继续 ——
@@ -2398,10 +2720,24 @@ static void SIOriginalInit(void) {
     // 且装之前先判 gListAccel —— 关闭时连装都不装。
     // 代价：列表加速在极早期（首屏几个视图尚未铺开）的动画不生效，
     // 实测无可感知差异（列表内容本身就是异步加载的，装 hook 时早已就绪）。
+    // v2.5.0[性能·P0] CALayer 核心两族留在构造期（首屏转圈/速率模式靠它们）
+    SIO_installLayerCoreHooks();
+
+    // v2.2.0：列表全家桶延后；v2.5.0：改为「启动完成之后」而非「主队列下一个 turn」
     SIO_installListHooksLater();
 
-    // iOS 16 优化增强：UIViewPropertyAnimator + UIScrollView + CALayer
-    SIO_installiOS16Extras();
+    // v2.5.0[性能·P0] iOS16Extras 约 55 次方法表交换搬出 pre-main。
+    // 原先它在构造函数末尾同步执行 —— v2.2.0 只搬走了列表那 27 次，
+    // 这一族（PA / UIScrollView / 控件系 / v2.4.0 补齐）反而成了构造期最大的一块。
+    // 排到 didFinishLaunching 之后，App 首屏已完成布局，换方法表不再与首屏竞争，
+    // 方法缓存失效也只发生一次。
+    SIO_afterBoot(^{
+        @try {
+            SIO_installiOS16Extras();
+        } @catch (NSException *e) {
+            NSLog(@"[SIOriginal] deferred extras install failed (app unaffected): %@", e);
+        }
+    });
 
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
@@ -2424,21 +2760,32 @@ static void SIOriginalInit(void) {
     //         速率加速引擎（改 speed 不改 duration，无下限碰撞、插值不失真）；
     //         PA 链式续播 / UIWindow 换根页面补齐；辅助功能让位（尊重减弱动态效果）；
     //         转圈检测去字符串分配 + 16 槽类缓存；原时长改POD 盒子（同值不重写）
-    NSLog(@"[SIOriginal] v2.4.0 hooks installed in %@ (enabled=%d mode=%d speed=%.1f slow=%.1f floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms override=%d listGuard=%d)",
-          gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
-          gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
-          gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop,
-          gSpeedMode, SIO_speedScale(), gRespectReduceMotion, SIO_reduceMotionOn(),
-          gFrameAlign, SIO_framePeriod() * 1000.0, gHasAppOverride, gListHardGuarded);
-    // v2.2.0[启动提速]：明确打出「启动期已装/ 延后装」的边界，
-    // 便于用户对照真机Console 判断某个功能是「没装」还是「装了但没生效」。
-    if (!gListAccel) {
-        NSLog(@"[SIOriginal] list hooks NOT installed (ListAccel=OFF) — "
-              @"deferred to first enable, saves %d method swaps per cold launch", 27);
-    }
-    if (SIO_fbgBuiltinExcluded()) {
-        NSLog(@"[SIOriginal] %@ is a built-in keep-alive exclusion: audio-assertion/scene-fake engine stays OFF", gSelfBundle);
-    }
+    // =========================================================================
+    // v2.5.0[性能·P0] 启动日志不再在 dyld 期做惰性求值
+    // -------------------------------------------------------------------------
+    // 这一行 NSLog 的参数表里原本有两个**惰性求值函数**，被无条件调用了：
+    //   · SIO_framePeriod()  → [[UIScreen mainScreen] maximumFramesPerSecond]
+    //   · SIO_reduceMotionOn() → dlopen(AccessibilityUtilities) + dlsym
+    // 二者都是 v2.0.7/v2.1.0/v2.3.0 精心做成「用时才算、算完缓存」的惰性入口，
+    // 目的就是不让它们出现在启动路径上。但 NSLog 的参数**必须先求值才能调用**，
+    // 于是在 pre-main 阶段被强制执行：
+    //   1. [UIScreen mainScreen] 首次访问会触发 UIScreen 单例与 CADisplay 链路初始化，
+    //      把本该延后的 UIKit/显示服务初始化提前到 dyld 期；
+    //   2. dlopen 一个私有框架要解析其依赖链、跑一遍它自己的 initializer，
+    //      在 pre-main 同步执行 —— 这恰恰是 v2.0.7 花了整节从启动路径上拿掉的东西。
+    // 也就是说：前面三个版本的启动提速成果，被这一行日志悄悄抵消掉了。
+    //
+    // 修法：日志拆成两段。
+    //   · 构造期只打**已经算好的标量**（gSpeed/gMode/...，全是静态读，零副作用）；
+    //   · 完整指纹（含帧周期与减弱动态效果判定）延后到 App 启动完成后的主队列再打，
+    //     那时 UIScreen 早已初始化、dlopen 也发生在用户可感知之外。
+    // 另外 NSLog 本身是同步的（经 os_log / logd），单次格式化 30 个参数在
+    // pre-main 也是实打实的耗时，延后同样省下这一段。
+    // =========================================================================
+    NSLog(@"[SIOriginal] v2.5.0 core hooks installed in %@ (enabled=%d mode=%d speed=%.1f noop=%d)",
+          gSelfBundle, gEnabled, gMode, gSpeed, gAnimNoop);
+    // 延后的完整指纹 + 「启动期已装/延后装」边界说明
+    SIO_logFingerprintLater();
     if (gListHardGuarded) {
         NSLog(@"[SIOriginal] %@ is on the list-hook hard-guard list: ListAccel is forced OFF (safety)", gSelfBundle);
     }
@@ -2447,6 +2794,7 @@ static void SIOriginalInit(void) {
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
+    SIO_markDyldCost();
 }
 
 #pragma mark - UIViewPropertyAnimator（iOS 10+ 现代 App 主流动画 API）
@@ -2749,7 +3097,17 @@ static BOOL SIO_delegateIsSpinnerCandidate(Class dc, BOOL *outNeedsStringCheck) 
     // 16 槽直接映射缓存
     static Class    cacheCls[16];
     static uint8_t  cacheVal[16];   // 0=未知 1=是候选 2=否
-    uintptr_t slot = ((uintptr_t)dc >> 4) & 15;
+    // v2.5.0：槽位哈希加入高位混合。
+    // 【诚实说明】这一项的收益**很小，属于顺手修正，不要期待可见提升**。
+    // 最初的判断是「类指针低位区分度低、旧式 (p>>4)&15 会让所有类抢少数槽」，
+    // 但用 tools/bench_v250.py 的 B2 基准跑合成地址分布后发现：
+    // 在贴近真实的地址分布下，新旧哈希的槽位利用率都是 100%、平均冲突数相同。
+    // 原因是真实场景里 superlayer 链上遇到的**不同类数量本来就很少**（十余个），
+    // 16 个槽怎么映射都够用，哈希质量不是这条路径的瓶颈。
+    // 仍然保留高位混合：它零成本、在类数量变多时更稳，且符合直映缓存的一般做法。
+    // 但请在评估报告里按「无显著收益」计，不要把它算进收益里。
+    uintptr_t key = (uintptr_t)dc;
+    uintptr_t slot = ((key >> 4) ^ (key >> 20) ^ (key >> 36)) & 15;
     if (cacheCls[slot] == dc) {
         if (cacheVal[slot] == 1) return YES;
         if (cacheVal[slot] == 2) { *outNeedsStringCheck = YES; return NO; }
@@ -2764,6 +3122,41 @@ static BOOL SIO_delegateIsSpinnerCandidate(Class dc, BOOL *outNeedsStringCheck) 
     return hit;
 }
 
+// =============================================================================
+// v2.5.0[性能·P1] 转圈前置筛：把「是不是转圈」的判定从 O(图层树) 降到 O(1)
+// =============================================================================
+// 原实现的代价结构有个反直觉的地方：**代价最高的情况恰恰是最常见的情况**。
+// 判定一个动画「不是转圈」要走完整条 superlayer 链（≤8 层），每层还要顺着
+// UIView.superview 再走 ≤24 层 —— 最坏 8×24 = 192 次 isKindOfClass:，
+// 而列表滚动/页面切换时每秒几十次 addAnimation: **全部是"不是转圈"**。
+// 也就是说，为了找到那 0.1% 的转圈动画，99.9% 的调用都在付最坏代价。
+//
+// 转圈动画有两个极强、且读取成本几乎为零的特征：
+//   ① 它是属性动画，keyPath 含 "rotation"（UIKit 用 transform.rotation.z）；
+//   ② 它无限重复（repeatCount 为 +inf 或极大值 / repeatDuration > 0）。
+// 这两条都是一次 getter（返回已存在的对象/标量，零分配），比遍历图层树便宜
+// 两个数量级。先过这一筛，只有"可能是转圈"才去做昂贵的图层树确认。
+//
+// [安全边界] 本筛只做**否定**，不做肯定：命中筛 ≠ 确认是转圈，
+//   仍要过原来的 delegate 判定；被筛掉的才直接判"非转圈"。
+//   因此唯一的风险是漏判（某个非典型转圈没被加速），不会误判
+//   （不会把普通动画当成转圈去套 0.4s 下限而变慢）。漏判的后果远轻于误判。
+static inline BOOL SIO_animMayBeSpinner(CAAnimation *anim) {
+    // CATransition / CAAnimationGroup 不会是转圈本身（转圈是属性动画）
+    if (![anim isKindOfClass:[CAPropertyAnimation class]]) return NO;
+    float rc = anim.repeatCount;
+    // 无限重复：UIKit 写死的是 1e100f（溢出为 +inf），也有 App 写 FLT_MAX / HUGE_VALF。
+    // 用「极大值」而非等值比较来判，避免不同写法的浮点表示差异。
+    BOOL repeatsForever = (rc == INFINITY) || (rc >= 1.0e6f) || (anim.repeatDuration > 0.0);
+    if (!repeatsForever) return NO;
+    NSString *kp = ((CAPropertyAnimation *)anim).keyPath;
+    if (!kp.length) return NO;
+    // 只认旋转类属性。转圈必然是旋转；无限重复的 opacity/position 抖动不是转圈，
+    // 不该被套 0.4s 下限（那会让它变慢，与加速目的相反）。
+    return [kp rangeOfString:@"rotation"].location != NSNotFound ||
+           [kp isEqualToString:@"transform"];
+}
+
 static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     SIO_REQUIRE_ORIG(o_layer_addAnim);
     // v2.0.7：恒等快速路径。加速 ×1 时下面的转圈检测对所有分支都算不出新时长，
@@ -2772,10 +3165,36 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     // v2.1.0[新功能 8]：速率模式生效时，动画速率已由 setSpeed: 接管，
     // 本函数的时长兜底与转圈钳制都必须跳过，否则与速率相乘导致倍率平方。
     if (SIO_speedModeActive()) { o_layer_addAnim(self, _cmd, anim, key); return; }
+
+    // v2.5.0[性能·P1] 先做一次类型判定与一次旁路判定，之后全程复用。
+    // 原实现里 SIO_blocked() 会在转圈分支与通用分支**各调一次**（最多两次），
+    // 而它内部还挂着 SIO_wechatZoomPreviewActive() 的节流探测。提到这里算一次，
+    // 两个分支共用结果。
+    BOOL isAnim  = (anim != nil) && [anim isKindOfClass:[CAAnimation class]];
+    BOOL blocked = SIO_blocked();
+
+    // v2.5.0[性能·P1] 整体旁路时走「还原」快路径，不再遍历图层树。
+    // 原实现在 SIO_blocked() 为真时仍然跑完整的转圈检测，目的只是把
+    // 之前被我们缩过的时长还原回去。但「有没有被我们缩过」根本不需要知道
+    // 它是不是转圈 —— 看我们自己的标记和保存的原值就够了（1 次关联对象读）。
+    // 语义完全等价，代价从 O(图层树) 降到 O(1)。
+    if (isAnim && blocked) {
+        double saved = SIO_getOrigDur(anim);
+        if (saved > 0.0 && o_CAAnim_setDuration) {
+            double cur = ((CAAnimation *)anim).duration;
+            if (cur != saved) {
+                o_CAAnim_setDuration(anim, @selector(setDuration:), saved);
+            }
+        }
+        o_layer_addAnim(self, _cmd, anim, key);
+        return;
+    }
+
     // UIActivityIndicatorView 的转圈动画是无限重复的 transform.rotation。
     // v2.0.0 曾直接跳过不缩放，结果 ×5 下转圈反而成了界面上最慢的元素；
     // v2.0.1 改为「按全局倍率加速、钳制 0.4s 下限」，既明显变快又不频闪。
-    if (anim && [anim isKindOfClass:[CAAnimation class]]) {
+    // v2.5.0：先过 O(1) 前置筛，绝大多数动画在这里就被排除，不再碰图层树。
+    if (isAnim && !blocked && SIO_animMayBeSpinner((CAAnimation *)anim)) {
         BOOL isSpinner = NO;
         // v2.0.1 崩溃修复：layer.delegate 不保证是 UIView（AVPlayerLayer 附属、
         // 第三方绘图图层等会挂自定义 NSObject 代理），对其直接发 superview 会
@@ -2814,32 +3233,32 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
             // 仅当它与当前值一致时才采信 —— 不一致说明这中间被别处改过
             // （我们自己的缩放，或 App 直接写 duration），此时用当前值重算。
             double cur    = ((CAAnimation *)anim).duration;
-            double saved  = SIO_getOrigDur(anim);
+            // v2.5.0：取盒子一次，同时用于「读原值」与「打已缩放标记」，
+            // 省一次全局关联表查询（原实现是 SIO_getOrigDur + SIO_markAnimScaled 两次）。
+            SIODoubleBox *sbox = SIO_boxFor(anim, YES);
+            double saved  = sbox ? sbox->value : -1.0;
             double orig   = (saved > 0.0 && fabs(saved - cur) < 1e-9) ? saved : cur;
             if (orig <= 0.0) orig = cur;
             if (orig > 0.0 && o_CAAnim_setDuration) {
-                if (!SIO_blocked()) {
-                    // 与通用分支一致地打标：转圈动画会被 -setAnimating: 反复
-                    // addAnimation，同一实例多次进入本函数，标记让重复缩放可被识别。
-                    SIO_markAnimScaled(anim);
-                    double nd;
-                    if (gMode == 1) {
-                        nd = orig * gSlowFactor;               // 慢放：转圈同步变慢
-                    } else if (gMode == 2) {
-                        nd = (kSIOSpinnerFloor < orig) ? kSIOSpinnerFloor : orig;
-                    } else {
-                        nd = orig / (gSpeed > 1.0001 ? gSpeed : 1.0);
-                    }
-                    // v2.1.0[真 bug 2]：钳制不得反向拉长动画。
-                    // 原式 `if (nd < kSIOSpinnerFloor) nd = MIN(kSIOSpinnerFloor, orig);`
-                    // 在orig 本就小于下限时（如自定义 0.2s 短转圈）已由 MIN 兜住，
-                    // 但上面的 MIN 写法在新语义下更清晰：目标值永不超过 orig。
-                    if (nd < kSIOSpinnerFloor) nd = (kSIOSpinnerFloor < orig) ? kSIOSpinnerFloor : orig;
-                    if (nd != cur) o_CAAnim_setDuration(anim, @selector(setDuration:), nd);
-                } else if (cur != orig) {
-                    // 黑名单 / 全局禁用 / 微信放大态：还原到本轮原始时长
-                    o_CAAnim_setDuration(anim, @selector(setDuration:), orig);
+                // v2.5.0：走到这里已确定 !SIO_blocked()（blocked 分支在上面已返回），
+                // 因此原实现里的 if/else 双分支合并为单分支 —— 少一次分支与判断。
+                // 与通用分支一致地打标：转圈动画会被 -setAnimating: 反复
+                // addAnimation，同一实例多次进入本函数，标记让重复缩放可被识别。
+                if (sbox) sbox->scaled = YES;
+                double nd;
+                if (gMode == 1) {
+                    nd = orig * gSlowFactor;               // 慢放：转圈同步变慢
+                } else if (gMode == 2) {
+                    nd = (kSIOSpinnerFloor < orig) ? kSIOSpinnerFloor : orig;
+                } else {
+                    nd = orig / (gSpeed > 1.0001 ? gSpeed : 1.0);
                 }
+                // v2.1.0[真 bug 2]：钳制不得反向拉长动画。
+                // 原式 `if (nd < kSIOSpinnerFloor) nd = MIN(kSIOSpinnerFloor, orig);`
+                // 在orig 本就小于下限时（如自定义 0.2s 短转圈）已由 MIN 兜住，
+                // 但上面的 MIN 写法在新语义下更清晰：目标值永不超过 orig。
+                if (nd < kSIOSpinnerFloor) nd = (kSIOSpinnerFloor < orig) ? kSIOSpinnerFloor : orig;
+                if (nd != cur) o_CAAnim_setDuration(anim, @selector(setDuration:), nd);
             }
             o_layer_addAnim(self, _cmd, anim, key);
             return;
@@ -2851,8 +3270,7 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
     // v1.8.12 修掉了本函数经 objc_msgSend 回调自己的 hook（自递归式双重除法）。
     // v1.8.15 再修掉残留的**逻辑**双重缩放：若该动画的时长已经过
     // sio_CAAnim_setDuration 处理（带标记），这里必须跳过，否则同一个值被缩两次。
-    if (!SIO_blocked() && anim && o_CAAnim_setDuration &&
-        [anim isKindOfClass:[CAAnimation class]] && !SIO_animScaled(anim)) {
+    if (isAnim && !blocked && o_CAAnim_setDuration && !SIO_animScaled(anim)) {
         @try {
             double origDur = ((CAAnimation *)anim).duration;
             if (origDur > 0) {
@@ -2869,6 +3287,29 @@ static void sio_layer_addAnim(id self, SEL _cmd, id anim, NSString *key) {
 }
 
 #pragma mark - SIO_install 新 hook 注册（iOS 16 优化增强）
+
+// =============================================================================
+// v2.5.0[性能·P0] 构造期只装 CALayer 核心两族
+// =============================================================================
+// 为什么单独拆出来：
+//   -[CALayer addAnimation:forKey:] 是「App 走完 setDuration 再 add」这条标准写法的
+// 兜底入口，转圈/进度/启动期 loading 动画全靠它。若在启动完成后才装，
+// 首屏那批转圈动画会漏掉（正是用户最容易感知的一类）。
+//   -[CALayer setSpeed:] 是速率模式（SpeedMode）的图层侧接管，
+// 缺了它速率模式在这条路径上失效。
+// 这两族只有 2 次方法表交换，成本可忽略，收益是首屏行为不回退 —— 留构造期。
+// 其余约 55 次交换（PA 8 个 / UIScrollView 5 个 / 控件系 20+ / v2.4.0 补齐 13 个）
+// 全部排到启动完成之后，见 SIO_installiOS16Extras 的调用点。
+static void SIO_installLayerCoreHooks(void) {
+    Class layer = objc_getClass("CALayer");
+    if (!layer) return;
+    SIO_swizzleInstance(layer, @selector(addAnimation:forKey:),
+                        (IMP)sio_layer_addAnim, (IMP *)&o_layer_addAnim);
+    // v2.1.0[新功能 8]：图层播放速率。动画加入图层后按 layer.speed 播放，
+    // 速率模式下必须一并接管，否则 layer.speed=1 会抵消动画上的 speed 倍率。
+    SIO_swizzleInstance(layer, @selector(setSpeed:),
+                        (IMP)sio_layer_setSpeed, (IMP *)&o_layer_setSpeed);
+}
 
 static void SIO_installiOS16Extras(void) {
     Class pa = objc_getClass("UIViewPropertyAnimator");
@@ -2940,15 +3381,8 @@ static void SIO_installiOS16Extras(void) {
                             (IMP)sio_LPR_setMinDur, (IMP *)&o_lpr_setMinDur);
     }
 
-    if (layer) {
-        SIO_swizzleInstance(layer, @selector(addAnimation:forKey:),
-                            (IMP)sio_layer_addAnim, (IMP *)&o_layer_addAnim);
-        // v2.1.0[新功能 8]：图层播放速率。动画加入图层后按 layer.speed 播放，
-        // 速率模式下必须一并接管，否则 layer.speed=1 会抵消动画上的 speed 倍率。
-        SIO_swizzleInstance(layer, @selector(setSpeed:),
-                            (IMP)sio_layer_setSpeed, (IMP *)&o_layer_setSpeed);
-    }
-
+    // v2.5.0[性能·P0] CALayer 两族已迁到构造期安装（见 SIO_installLayerCoreHooks），
+    // 此处不再重复安装 —— 延迟安装族里只保留非关键入口。
     // v2.1.0[新覆盖 10]：UIWindow setRootViewController:（换根页面的交叉淡入）
     Class windowCls = objc_getClass("UIWindow");
     if (windowCls && class_getInstanceMethod(windowCls, @selector(setRootViewController:))) {
@@ -3237,6 +3671,11 @@ static void _fbg_recalc(void) {
 
 static void _fbg_loadPref(void) {
     @try {
+        // v2.5.0[顺序兜底]：本函数复用动画侧 SIO_reload() 的黑名单解析结果，
+        // 但两个 constructor 的先后由 dyld 决定。若保活侧先跑，
+        // gBlacklistItems 还是 nil —— 排除表会静默变空（黑名单对保活失效）。
+        // 这里补一次：没跑过就自己跑一遍（SIO_reload 幂等，plist 走缓存不会重复读盘）。
+        if (!gReloadDone) SIO_reload();
         // v2.2.0[启动提速]：复用构造函数已读好的缓存，不再第二次解析同一文件。
         NSDictionary *d = SIO_prefSnapshot();
         if (d) {
@@ -3247,25 +3686,23 @@ static void _fbg_loadPref(void) {
             // v1.8.12 隐患修复：FUBGExcludeApps 与 Blacklist 取并集。
             // 原实现先赋 FUBGExcludeApps、紧接着被 Blacklist 无条件覆盖——只要配置里
             // 存在 Blacklist（配置 App 默认就会写入 com.tencent.wework），排除表永久失效。
-            NSMutableArray *ex = [NSMutableArray array];
-            id exRaw = d[@"FUBGExcludeApps"];
-            if ([exRaw isKindOfClass:[NSArray class]]) [ex addObjectsFromArray:exRaw];
-            // 复用 SIOriginal 黑名单（v1.8.6：兼容字符串格式，原来只认 NSArray 导致黑名单对 FUBG 永远无效）
-            id bl = d[@"Blacklist"];
-            if ([bl isKindOfClass:[NSArray class]]) {
-                [ex addObjectsFromArray:bl];
-            } else if ([bl isKindOfClass:[NSString class]] && [(NSString *)bl length]) {
-                [ex addObjectsFromArray:[(NSString *)bl componentsSeparatedByString:@","]];
-            }
-            // 清洗：只保留非空字符串。_fbg_isExcluded 会对元素调 hasPrefix:，
-            // plist 里一旦混入 NSNumber/NSNull（手工编辑）就会 unrecognized selector 崩溃。
+            //
+            // v2.5.0[性能·P0] 黑名单部分直接复用 SIO_reload 已经清洗好的
+            // gBlacklistItems —— 那段 trim + NSCharacterSet 循环不再跑第二遍。
+            // 仍需清洗的只剩 FUBGExcludeApps 这一路（它只在这里被读）。
             NSMutableArray *clean = [NSMutableArray array];
-            for (id it in ex) {
-                if (![it isKindOfClass:[NSString class]]) continue;
-                NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:
-                               [NSCharacterSet whitespaceCharacterSet]];
-                if (s.length) [clean addObject:s];
+            id exRaw = d[@"FUBGExcludeApps"];
+            NSArray *rawEx = [exRaw isKindOfClass:[NSArray class]] ? exRaw : nil;
+            if (rawEx.count) {
+                NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];
+                for (id it in rawEx) {
+                    if (![it isKindOfClass:[NSString class]]) continue;
+                    NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:ws];
+                    if (s.length) [clean addObject:s];
+                }
             }
+            // 复用 SIOriginal 黑名单（v1.8.6：兼容字符串格式，原来只认 NSArray 导致黑名单对 FUBG 永远无效）
+            if (gBlacklistItems.count) [clean addObjectsFromArray:gBlacklistItems];
             gExclude = clean;
             // v1.8.14：保活相关的 App 级覆盖（与动画侧共用同一份 AppOverrides）
             NSDictionary *ovr = SIO_appOverride(d);
@@ -3293,11 +3730,34 @@ static void (*gOrigSceneUpdate)(id, SEL, id, id, id, id);
 // 由后台化 diff 的描述特征判断这是否是一条"让 App 退到后台"的场景更新
 static BOOL _fbg_isBackgroundingDiff(NSString *desc) {
     if (!desc) return NO;
-    if ([desc containsString:@"foreground = NotSet"] ||
-        [desc containsString:@"foreground = No"] ||
-        [desc containsString:@"foreground = BSSettingFlagNo"] ||
-        [desc containsString:@"foreground = NO"]) {
-        return YES;
+    // =========================================================================
+    // v2.5.0[性能·P1] [arg2 description] 本身才是这里最大的开销，
+    // 而它是在**调用方**无条件生成的 —— 场景更新期间每次都产出一段
+    // 可能长达数 KB 的描述字符串，随后做 7 次全串 containsString: 扫描。
+    // 本函数无法省掉上游的 description，但可以把下游扫描从「7 次独立全串扫描」
+    // 降到「1 次定位 + 局部比较」：
+    //   · 4 条 foreground 判据都以 "foreground = " 开头 —— 先做一次
+    //     rangeOfString 定位，再只比较紧随其后的几个字符；
+    //   · 3 条快照判据 + 1 条 FBSceneSnapshotAction 仍走 containsString，
+    //     但排在后面，绝大多数前台更新在第一段就返回 NO。
+    // 效果：常见（非后台化）场景更新从 7 次 O(n) 降到 1 次 O(n)。
+    // 语义严格不变 —— 匹配的是同一批子串。
+    // =========================================================================
+    NSRange fg = [desc rangeOfString:@"foreground = "];
+    if (fg.location != NSNotFound) {
+        NSUInteger start = fg.location + fg.length;
+        NSUInteger len = desc.length;
+        if (start < len) {
+            // 逐一比较 4 种写法：NotSet / No / BSSettingFlagNo / NO
+            if ([desc compare:@"NotSet" options:0
+                        range:NSMakeRange(start, MIN(6, len - start))] == NSOrderedSame) return YES;
+            if ([desc compare:@"No" options:0
+                        range:NSMakeRange(start, MIN(2, len - start))] == NSOrderedSame) return YES;
+            if ([desc compare:@"BSSettingFlagNo" options:0
+                        range:NSMakeRange(start, MIN(15, len - start))] == NSOrderedSame) return YES;
+            if ([desc compare:@"NO" options:0
+                        range:NSMakeRange(start, MIN(2, len - start))] == NSOrderedSame) return YES;
+        }
     }
     // 后台切换器快照相关更新同样吞掉，避免快照暴露/状态推进
     if ([desc containsString:@"hostContextIdentifierForSnapshotting = 0"] ||
@@ -3335,7 +3795,18 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
         // 多线程并发写同一槽最坏只是重算一次，结果幂等，无需加锁。
         static void *cacheAddr[8] = {0};
         static BOOL  cacheIsPush[8] = {0};
-        uintptr_t slot = ((uintptr_t)ret >> 4) & 7;
+        // v2.5.0[性能·P1] 一个实质改动 + 一个次要改动：
+        // ① 【实质】去掉 NSString 分配：原实现把镜像路径转成 NSString 再做两次
+        //    containsString:（一次堆分配 + 两次 O(n) 扫描）。
+        //    dli_fname 本来就是 C 字符串，直接用 strstr 判定，零分配。
+        //    这是本处唯一确定有收益的改动 —— 后台期 applicationState 是高频查询，
+        //    每次省一次 malloc + 一次 free。
+        // ② 【次要】槽位哈希加入高位混合（(p>>4)&7 → 高位异或混合）。
+        //    与 SIO_delegateIsSpinnerCandidate 里的同项改动一样，
+        //    经 bench_v250.py 的 B2 基准验证：**在真实量级的调用点数下无显著差异**。
+        //    保留仅为稳健，不计入收益。
+        uintptr_t ka = (uintptr_t)ret;
+        uintptr_t slot = ((ka >> 4) ^ (ka >> 20) ^ (ka >> 36)) & 7;
         BOOL isPush;
         if (__builtin_expect(cacheAddr[slot] == ret, 1)) {
             isPush = cacheIsPush[slot];
@@ -3343,9 +3814,8 @@ static UIApplicationState _fbg_appState(id self, SEL _cmd) {
             isPush = NO;
             Dl_info info;
             if (dladdr(ret, &info) && info.dli_fname) {
-                NSString *image = [NSString stringWithUTF8String:info.dli_fname] ?: @"";
-                if ([image containsString:@"UserNotifications"] ||
-                    [image containsString:@"PushKit"]) {
+                if (strstr(info.dli_fname, "UserNotifications") ||
+                    strstr(info.dli_fname, "PushKit")) {
                     isPush = YES;
                 }
             }
@@ -3551,6 +4021,27 @@ static void _fbg_stopAudio(BOOL releaseSession) {
         UIApplication *app = [UIApplication sharedApplication];
         if (gTask != 0) { [app endBackgroundTask:gTask]; gTask = 0; }
     } @catch (__unused NSException *e) {}
+}
+
+// ---- v2.5.0[性能·P2] watchdog 随前后台生命周期启停 ----
+// 只在「真的进了后台 + 真的用音频断言」时存在。定时器重复启停是幂等的
+// （invalidate 后重建），且 NSTimer 强持有 target block，invalidate 后即释放，
+// 不存在泄漏；重复调用 start 也只会先停旧的再建新的。
+static void _fbg_stopWatchdog(void) {
+    if (gWatchdog) {
+        [gWatchdog invalidate];
+        gWatchdog = nil;
+    }
+}
+
+static void _fbg_startWatchdog(void) {
+    if (!gUseAudio) return;          // 不用音频断言 → 定时器永远无事可做
+    if (gWatchdog) return;           // 已在跑
+    gWatchdog = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES
+                                                  block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
+    // CommonModes：滚动/拖拽时 runloop 处于 tracking mode，
+    // 不加这一行定时器会在滑动期间停摆（原实现有，保留）。
+    [[NSRunLoop mainRunLoop] addTimer:gWatchdog forMode:NSRunLoopCommonModes];
 }
 
 // 自愈轮询：仅在停摆时重建，兼顾可靠与耗电
@@ -3905,8 +4396,10 @@ static void FUBGEntry(void) {
         _fbg_loadPref();
 
         // hook 一次性安装，内部按全局开关决定行为
-        dispatch_async(dispatch_get_main_queue(), ^{
-            _fbg_installSceneHooks();
+        // v2.5.0：与动画侧共用同一个「启动完成之后」栅栏，避免又一次
+        // 在 didFinishLaunching 期间抢主线程去做 method_setImplementation。
+        SIO_afterBoot(^{
+            @try { _fbg_installSceneHooks(); } @catch (__unused NSException *e) {}
         });
 
         // v2.1.0[致命 1] 真 bug 修复：前后台生命周期回调此前注册在 **Darwin** 通知中心，
@@ -3927,12 +4420,16 @@ static void FUBGEntry(void) {
             // 已在主队列，此处直接处理
             gPhysBg = YES;
             _fbg_startAudio();
+            // v2.5.0：只有此刻 watchdog 才可能做有用功 —— 进后台才起定时器
+            _fbg_startWatchdog();
         }];
         [nc addObserverForName:UIApplicationWillEnterForegroundNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *__unused n) {
             gPhysBg = NO;
+            // v2.5.0：回前台立刻停掉定时器 —— 前台期间它 100% 是空转
+            _fbg_stopWatchdog();
             // 回前台只暂停播放、保留会话（mix 模式下不与 App 音频冲突）
             if ([gPlayer isPlaying]) [gPlayer pause];
             if (gTask != 0) {
@@ -3951,22 +4448,26 @@ static void FUBGEntry(void) {
         // 加载后，通知名字符串常量此刻尚不存在（用 nil 名注册会订阅全部通知），
         // 统一移到 _fbg_avEnsure() 内、框架真正加载成功时注册。
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (gUseAudio) {
-                gWatchdog = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES
-                                                              block:^(NSTimer *t){ _fbg_watchdogFire(t); }];
-                [[NSRunLoop mainRunLoop] addTimer:gWatchdog forMode:NSRunLoopCommonModes];
-            }
-            // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
-        });
+        // v1.8.10：悬浮球全局禁用（常驻透明 UIWindow 会拦截触摸/抢占状态栏）
+        // v2.5.0[性能·P2] watchdog 不再常驻。
+        // 原实现在构造期就起了一个 1.5s 的重复定时器并挂到 CommonModes，
+        // 此后**无论前台后台都一直跑**。而 _fbg_watchdogFire 首行就是
+        // `if (!gUseAudio || !gPhysBg) return;` —— 也就是说前台期间
+        // 每 1.5 秒一次定时器唤醒 + 一次方法调用 + 一次条件判断，
+        // 100% 是无用功：它阻止不了任何事，只消耗唤醒次数与电量。
+        // 改为随前后台生命周期启停（见 _fbg_startWatchdog / _fbg_stopWatchdog）：
+        // 只在真正进后台、且确实用音频断言时才存在。
+        // 行为完全等价 —— 因为定时器唯一能做事的条件就是 gPhysBg == YES。
+        // =========================================================================
 
-        NSLog(@"[FUBG] v2.4.0 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.5.0 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");
     } @catch (NSException *e) {
         NSLog(@"[FUBG] keep-alive install failed (app unaffected): %@", e);
     }
+    SIO_markDyldCost();
     }
 }
 
@@ -4119,7 +4620,13 @@ static void SIO_installListHooksLater(void) {
     //   · 用 dispatch_async 让它发生在启动阶段之后，且在 App 有机会处理自身布局之后。
     // 若用户在启动瞬间就打开列表加速，等不及这次异步安装 ——
     // 热重载（配置保存）时 SIO_settingsChanged 会再次触发补装（见下方 gListHooksInstalled 保护）。
-    dispatch_async(dispatch_get_main_queue(), ^{
+    //
+    // v2.5.0[性能·P0] 从 dispatch_async(main) 改为 SIO_afterBoot()：
+    // dispatch_async 排到的是「main() 之后的第一个主队列 turn」，那正是 App 跑
+    // didFinishLaunching 与首屏布局的时间窗 —— 换 27 次方法表会和首屏抢主线程。
+    // SIO_afterBoot 以 UIApplicationDidFinishLaunchingNotification 为准（0.35s 兜底），
+    // 落到首屏渲染完成之后，且与 iOS16Extras 共用同一个栅栏（只失效一次方法缓存）。
+    SIO_afterBoot(^{
         @try {
             if (!gListAccel || gSelfBlacklisted) {
                 // 默认路径：列表加速关闭 —— 一个方法表都不碰。
