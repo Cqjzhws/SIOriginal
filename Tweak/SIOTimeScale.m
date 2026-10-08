@@ -421,7 +421,7 @@ void SIO_TS_install(void) {
 void SIO_TS_apply(BOOL enabled, double factor, BOOL scaleSleep, BOOL foreground) {
     if (!atomic_load_explicit(&gTS_installed, memory_order_relaxed)) return;
     if (factor < 1.0) factor = 1.0;
-    if (factor > 2.0) factor = 2.0;   // 封顶：联网超时 / 反作弊 / 音画同步风险
+    if (factor > 5.0) factor = 5.0;   // v2.7.0：封顶 5.0（由配置 App 白名单模式承担联网 App 的隔离责任）
     double eff = (enabled && foreground) ? factor : 1.0;
 
     os_unfair_lock_lock(&gTSApplyLock);

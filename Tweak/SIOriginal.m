@@ -335,7 +335,11 @@ static BOOL     gTimeScale = NO;
 static double   gTimeScaleFactor = 1.5;
 static BOOL     gTimeScaleSleep = YES;
 // App 前台状态（v2.6.0：后台自动回落 1.0，回前台恢复，见 SIO_afterBoot 注册处）
-static BOOL     gTSForeground = YES;
+static BOOL gTSForeground = YES;
+// v2.7.0：白名单模式开关（NO=所有 App 生效；YES=仅名单内 App 生效，配置器自身除外）
+static BOOL gTSWLMode = NO;
+// v2.7.0：白名单数组（Bundle ID 列表，copy 语义）
+static NSString *gTSWhitelist = nil;
 // v2.3.0：帧周期（秒）。惰性求值一次 —— 120Hz=1/120≈0.00833，60Hz=1/60≈0.01667。
 // 取 maximumFramesPerSecond 的倒数；若不可用则回退 60Hz。
 static double   gFramePeriod = 0.0;
@@ -357,6 +361,20 @@ static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
+
+// v2.7.0：时间源加速总判定 —— 是否允许在本进程内启用时间缩放。
+// 白名单模式关闭 → 所有 App 生效；开启 → 仅名单内 App 生效。
+// 配置器 App 自身（com.local.sioriginal）无论何种模式一律不启用：设置界面
+// 有动画节奏需求，时间被缩放会让开关/滑杆手感变得不可预期。
+static BOOL SIO_tsAllowed(void) {
+    if (gSelfBundle == nil || [gSelfBundle isEqualToString:@"com.local.sioriginal"]) return NO;
+    if (!gTSWLMode) return YES;
+    if (gTSWhitelist.count == 0) return NO;
+    for (NSString *s in gTSWhitelist)
+        if ([s isKindOfClass:[NSString class]] &&
+            [s caseInsensitiveCompare:gSelfBundle] == NSOrderedSame) return YES;
+    return NO;
+}
 // v2.5.0[性能·P0] 清洗后的黑名单条目缓存。
 // 原本这份数组被解析两次：SIO_reload() 解析一遍只为算 gSelfBlacklisted 这一个布尔，
 // 随即在函数末尾丢弃；_fbg_loadPref() 又对同一份 plist 重新
@@ -791,6 +809,9 @@ static void SIO_reload(void) {
         gTimeScale = NO;
         gTimeScaleFactor = 1.5;
         gTimeScaleSleep = YES;
+        // v2.7.0：无配置时白名单模式关（与配置 App 默认一致）
+        gTSWLMode = NO;
+        gTSWhitelist = nil;
         gSelfBlacklisted = NO;
         gBlacklistItems  = nil;   // v2.5.0：无配置则无黑名单，保活侧同样取空
         gHasAppOverride  = NO;
@@ -843,11 +864,16 @@ static void SIO_reload(void) {
     // 注意：旧版本写进 plist 的 ProMotion120 键现在被**忽略**（功能已移除），
     // 不做迁移也不报错 —— 那个键对新版dylib 没有任何影响，留在 plist 里无害。
     gFrameAlign = d[@"FrameAlign"] ? [d[@"FrameAlign"] boolValue] : YES;
-    // v2.6.0：时间源加速，缺键默认关；倍率钳制 1.0–2.0（联网超时/反作弊风险）
+    // v2.6.0：时间源加速，缺键默认关；倍率钳制 1.0–5.0（v2.7.0 上限放开，联网 App 靠白名单隔离）
     gTimeScale = d[@"TimeScale"] ? [d[@"TimeScale"] boolValue] : NO;
     double tsf = d[@"TimeScaleFactor"] ? [d[@"TimeScaleFactor"] doubleValue] : 1.5;
-    gTimeScaleFactor = (tsf >= 1.0 && tsf <= 2.0) ? tsf : 1.5;
+    gTimeScaleFactor = (tsf >= 1.0 && tsf <= 5.0) ? tsf : 1.5;
     gTimeScaleSleep = d[@"TimeScaleSleep"] ? [d[@"TimeScaleSleep"] boolValue] : YES;
+    // v2.7.0：时间源白名单（数组，元素为 Bundle ID）。仅在 whitelist 模式开启时参与判定
+    if (d[@"TimeScaleWhitelist"] && [d[@"TimeScaleWhitelist"] isKindOfClass:[NSArray class]])
+        gTSWhitelist = [d[@"TimeScaleWhitelist"] copy];
+    else
+        gTSWhitelist = nil;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     // v2.5.0：解析结果（清洗后的条目数组）顺手缓存进 gBlacklistItems，
@@ -950,7 +976,7 @@ static void SIO_reload(void) {
     // 后台回落 1.0 由 gTSForeground 承载（见 SIO_afterBoot 注册处）。
     // 未安装时（首次 SIO_reload 先于 SIO_TS_install）内部自动跳过，
     // 构造函数会在 install 后用当前配置补一次 apply。
-    SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
+    SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -2620,18 +2646,19 @@ static inline void SIO_markDyldCost(void) {
 // 就落在首屏渲染之后，不再叠加到 pre-main 的阻塞时间里。
 static void SIO_logFingerprintLater(void) {
     SIO_afterBoot(^{
-        NSLog(@"[SIOriginal] v2.6.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
+        NSLog(@"[SIOriginal] v2.7.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
               @"floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d "
               @"feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f "
               @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms "
-              @"ts=%d/%.2f/%d fg=%d override=%d listGuard=%d "
+              @"ts=%d/%.2f/%d wl=%d/%lu fg=%d override=%d listGuard=%d "
               @"swaps=%d bootMs=%.2f)",
               gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
               gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
               gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop,
               gSpeedMode, SIO_speedScale(), gRespectReduceMotion, SIO_reduceMotionOn(),
               gFrameAlign, SIO_framePeriod() * 1000.0,
-              gTimeScale, gTimeScaleFactor, gTimeScaleSleep, gTSForeground,
+              gTimeScale, gTimeScaleFactor, gTimeScaleSleep, gTSWLMode,
+              (unsigned long)gTSWhitelist.count, gTSForeground,
               gHasAppOverride, gListHardGuarded,
               gSIOHookSwapCount, gSIODyldCostMs);
     });
@@ -2656,7 +2683,7 @@ static void SIOriginalInit(void) {
     // v2.6.0：时间源缩放引擎（OpenSpeedy 思路移植）。安装幂等；
     // 首次 SIO_reload 里的 apply 因引擎未装被跳过，这里装完立即补一次。
     SIO_TS_install();
-    SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
+    SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
     // 前后台门控：进后台回落 1.0（后台任务/网络超时按真实时间走），回前台恢复。
     // UIApplication 此刻尚不存在（pre-main），必须经 SIO_afterBoot 推迟到启动后注册。
     SIO_afterBoot(^{
@@ -2666,13 +2693,13 @@ static void SIOriginalInit(void) {
                        object:nil queue:mainQ
                   usingBlock:^(NSNotification *note) {
                       gTSForeground = YES;
-                      SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, YES);
+                      SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, YES);
                   }];
         [nc addObserverForName:UIApplicationWillResignActiveNotification
                        object:nil queue:mainQ
                   usingBlock:^(NSNotification *note) {
                       gTSForeground = NO;
-                      SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, NO);
+                      SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, NO);
                   }];
     });
 

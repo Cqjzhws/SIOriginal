@@ -1,5 +1,5 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.6.0
+Version: 2.7.0
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.6.0：新增时间源加速引擎（OpenSpeedy 思路移植）—— fishhook 符号重绑定缩放进程读到的单调时钟（mach_absolute_time / mach_continuous_time / clock_gettime 单调族 / CACurrentMediaTime / dispatch_time 相对延时），seqlock 无锁热路径 + 倍率切换锚点重定基（缩放时间单调不减）；P1 节拍缩短（usleep/nanosleep/sleep，≤1ms 不动）与 CADisplayLink timestamp/targetTimestamp/duration、NSTimer 创建 interval 的 ObjC 层缩放。挂钟永不缩放；进后台自动回落 1.0；倍率封顶 2.0。新增配置键 TimeScale / TimeScaleFactor / TimeScaleSleep（支持 App 级覆盖）。保留 v2.5.0 全部功能与性能修复。
+Description: 动画加速 Tweak v2.7.0：时间源加速引擎增强 —— 倍率上限 2.0 放开至 5.0；新增时间源白名单（TimeScaleWhitelist / TimeScaleWhitelistMode 配置键，开启后仅名单内 App 生效，配置器自身永不缩放）；App 高级页新增白名单文本框（每行一个 Bundle ID）与 per-app「加入白名单（速记）」一键开关（立即落盘热重载）；per-app 覆盖新增时间源三键 + 倍率滑杆（独立覆盖 / 无覆盖时镜像全局）；自检版本号改为动态读取 Info.plist（修复硬编码 2.3.0 误导显示）并落地 NSLog 日志。保留 v2.6.0 全部功能。
