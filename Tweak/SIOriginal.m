@@ -298,6 +298,8 @@
 
 #define kPrefDomain  @"com.apple.UIKit"
 #define kPrefPath    @"/var/Managed Preferences/mobile/com.apple.UIKit.plist"
+// v2.7.1：影子配置路径 —— 普通 App 沙盒可读的回退位置（App 侧 WriteConfig 双写）
+#define kShadowPath  @"/var/mobile/Library/Preferences/com.local.sioriginal.plist"
 #define kNotifyName  @"com.local.sioriginal.settingschanged"
 
 // ---------- 配置 ----------
@@ -368,6 +370,10 @@ static NSString *gSelfBundle = nil;
 // 有动画节奏需求，时间被缩放会让开关/滑杆手感变得不可预期。
 static BOOL SIO_tsAllowed(void) {
     if (gSelfBundle == nil || [gSelfBundle isEqualToString:@"com.local.sioriginal"]) return NO;
+    // v2.7.1：微信硬保护。微信内部大量依赖真实单调时间（消息调度/心跳/转场时序），
+    // 时间源缩放会破坏其 UI 时序（v2.7.1 前白名单模式关闭时微信也会被放行）。
+    // 无论用户如何配置（含显式加入白名单）都不对微信生效 —— 与列表加速硬保护同思路。
+    if (gIsWeChat) return NO;
     if (!gTSWLMode) return YES;
     if (gTSWhitelist.count == 0) return NO;
     for (NSString *s in gTSWhitelist)
@@ -759,6 +765,12 @@ static NSDictionary *SIO_prefSnapshot(void) {
     if (d) return d;
     // 未缓存：磁盘 IO 在锁外做（见上方说明）
     NSDictionary *fresh = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
+    // v2.7.1[根因修复]：影子路径回退。本 dylib 注入微信等普通 App 后跑在对方沙盒里，
+    // 读不了平台特权的 /var/Managed Preferences；App 侧 v2.7.1 起会同步写一份
+    // 影子副本到 /var/mobile/Library/Preferences/com.local.sioriginal.plist
+    // （普通 App 沙盒允许读）。主路径拿不到就走影子，杜绝「读不到配置 → 全默认值
+    // （加速×5 + 黑名单失效）」—— 那是微信双标题/聊天框打不开的直接根因。
+    if (!fresh) fresh = [NSDictionary dictionaryWithContentsOfFile:kShadowPath];
     os_unfair_lock_lock(&gPrefLock);
     if (!gPrefCache) gPrefCache = fresh;   // 期间可能已被别的线程填好
     d = gPrefCache;
@@ -1098,6 +1110,13 @@ static BOOL SIO_showToast(NSString *text, BOOL throttle) {
                     [toast removeFromSuperview];
                     SIO_setInternalUI(inner);
                 }];
+                // v2.7.1：兜底移除。宿主 App 动画时序异常时 completion 可能不回调，
+                // toast 会永久残留（v2.7.1 前微信实报「设置已生效」不消失）。
+                // 无论淡出动画是否完成，0.6s 后强制清出视图树。
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (toast.superview) [toast removeFromSuperview];
+                });
             });
         }];
         return YES;
@@ -2648,7 +2667,7 @@ static inline void SIO_markDyldCost(void) {
 // 就落在首屏渲染之后，不再叠加到 pre-main 的阻塞时间里。
 static void SIO_logFingerprintLater(void) {
     SIO_afterBoot(^{
-        NSLog(@"[SIOriginal] v2.7.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
+        NSLog(@"[SIOriginal] v2.7.1 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
               @"floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d "
               @"feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f "
               @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms "
@@ -3751,7 +3770,8 @@ static BOOL _fbg_isExcluded(void) {
 }
 
 static void _fbg_recalc(void) {
-    gActive   = gFUBGEnabled && !gLocalOff && !_fbg_isExcluded();
+    // v2.7.1：微信不参与保活（场景伪造/音频保活对微信的生命周期管理有干扰风险）
+    gActive   = gFUBGEnabled && !gLocalOff && !gIsWeChat && !_fbg_isExcluded();
     gUseScene = gActive && gSceneFake;
     gUseAudio = gActive && gAudioKeep;
 }

@@ -1,5 +1,5 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.7.0
+Version: 2.7.1
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.7.0：时间源加速引擎增强 —— 倍率上限 2.0 放开至 5.0；新增时间源白名单（TimeScaleWhitelist / TimeScaleWhitelistMode 配置键，开启后仅名单内 App 生效，配置器自身永不缩放）；App 高级页新增白名单文本框（每行一个 Bundle ID）与 per-app「加入白名单（速记）」一键开关（立即落盘热重载）；per-app 覆盖新增时间源三键 + 倍率滑杆（独立覆盖 / 无覆盖时镜像全局）；自检版本号改为动态读取 Info.plist（修复硬编码 2.3.0 误导显示）并落地 NSLog 日志。保留 v2.6.0 全部功能。
+Description: 动画加速 Tweak v2.7.1：修复微信注入后双标题/聊天框打不开 —— 根因是普通 App 沙盒读不了平台特权的 /var/Managed Preferences，dylib 回落默认值（加速×5 全开 + 黑名单失效），用户在配置器里的修改目标 App 全部收不到。修复：配置双路径读写（配置器每次保存同步写影子副本到 /var/mobile/Library/Preferences/com.local.sioriginal.plist，dylib 主路径读不到时自动回退影子路径）；微信硬保护（时间源缩放与 FUBG 保活在微信进程内一律禁用，无论配置如何，防误操作弄坏微信）；toast 兜底移除（宿主动画时序异常时 completion 不回调导致的「设置已生效」永久残留）。保留 v2.7.0 全部功能。

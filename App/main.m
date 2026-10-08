@@ -263,6 +263,20 @@ static BOOL WriteConfig(NSMutableDictionary *cfg, NSNumber *dragCoeff) {
         else             [merged removeObjectForKey:@"UIAnimationDragCoefficient"];
     }
     BOOL ok = [merged writeToFile:PrefPath atomically:YES];
+    // ============================================================================
+    // v2.7.1[根因修复]：影子副本。
+    // /var/Managed Preferences 需要平台特权，只有本配置器（TrollStore 授权）能读；
+    // 注入的 dylib 跑在微信等普通 App 里，其沙盒读不了该目录 → SIO_prefSnapshot
+    // 拿到 nil → dylib 回落默认值（gEnabled=YES/加速×5/Extra 开）且黑名单失效，
+    // 用户在配置器里的任何修改目标 App 都收不到（v2.7.1 微信双标题/聊天框打不开的根因）。
+    // 同步写一份到 /var/mobile/Library/Preferences（普通 App 沙盒允许读），
+    // dylib 主路径读不到时回退读这里。UIAnimationDragCoefficient 是 UIKit 域专属项，
+    // 不进影子文件。
+    // ============================================================================
+    static NSString *ShadowPath = @"/var/mobile/Library/Preferences/com.local.sioriginal.plist";
+    NSMutableDictionary *shadow = [merged mutableCopy];
+    [shadow removeObjectForKey:@"UIAnimationDragCoefficient"];
+    [shadow writeToFile:ShadowPath atomically:YES];
     // v2.5.0：写成功即让读缓存失效，下一次 ReadConfig 才会真的读盘。
     // 走 SIOInvalidateCfgCache 而不是裸赋值 —— 本函数跑在 IO 队列，
     // 缓存的读取方在主线程，必须串行化（见该函数说明）。
@@ -709,7 +723,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.7.0 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.7.1 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
