@@ -277,6 +277,54 @@
 //   也没接 SIO_animNoop，与全项目「危险功能 fail-safe、恒等配置零干预」的口径不一致。
 //   修法：纳入统一门控，恒等时直接透传。
 // =========================================================================
+//
+// ==================== v2.6.0 TimeMode（折中路线）：进程内虚拟时钟 ====================
+// 来源：OpenSpeedy（https://github.com/game1024/OpenSpeedy）的加速原理。
+// 完整推导见 OPENSPEEDY_ANALYSIS.md，本文件只写「落地部分」。
+//
+// [0] 先说清楚它**不能**干什么 —— 免得后人误用
+//     本轮只重绑定 C 符号 CACurrentMediaTime，且只改**主二进制自己**的间接符号表。
+//     UIKit / QuartzCore 内部驱动动画走的是 mach_absolute_time()，那部分在 dyld
+//     共享缓存里，符号重绑定管不到，也不在本轮范围内（要覆盖必须上内联 hook +
+//     arm64e PAC 处理，那是完整方案，另议）。
+//     因此 TimeMode 的收益面是「App 自己写的、以 CACurrentMediaTime 为时基的逻辑」：
+//     自绘动画驱动、CADisplayLink 手算进度、轮询/超时/节流/倒计时、游戏主循环、
+//     以及各类「到点才算完成」的 UI 状态机。
+//     它对系统动画（导航转场、键盘弹出、模态升降）**没有**加速作用 ——
+//     那部分仍然是本文件现有的 100+ 个 ObjC hook 在管。二者是互补不是替代。
+//
+// [1] 原理：不是「改时长」，是给进程一把走得更快/更慢的尺子
+//       virtual(t) = baseVirtual + f × (t − baseReal)
+//     倍率变化时重设锚点 (baseReal, baseVirtual)。若直接算 t × f，每次改倍率都会
+//     让虚拟时钟整体跳变甚至倒退，App 里所有 `now − last` 会算出负数或巨大值 ——
+//     表现为动画抽搐、倒计时乱跳、超时逻辑失效。重锚定后时钟连续且单调，只是斜率变了。
+//     该算法已由 tools/test_time_dilation.py 验证四条不变量：
+//     恒等性 / 单调性 / 连续性 / 速率正确性（0.5×–50× 全档实测，最大跳变 0.9990 ≤ 1）。
+//
+// [2] 门控：默认关 + 白名单（双闸）
+//       TimeMode     全局总开关，缺键默认 NO
+//       TimeModeApps Bundle ID 白名单，缺键或空数组 = **无人启用**
+//     两者同时成立才可能生效；运行时还要再过一遍现有的 SIO_blocked()
+//     （总开关 / 黑名单 / 系统减弱动态效果 / 微信预览放大态 / 本项目自绘 UI）。
+//     理由：时间膨胀比「改动画时长」侵入性强得多 —— 它改的是进程对时间本身的认知，
+//     会影响超时、节流、重试、限速等一切基于时刻的判断。必须 fail-safe。
+//
+// [3] 红线：绝不缩放墙钟时间
+//     只碰 CACurrentMediaTime（媒体/动画时基，单调，不动墙钟）。
+//     绝不碰 gettimeofday / NSDate / CFAbsoluteTimeGetCurrent / mach_absolute_time /
+//     clock_gettime —— 那会连带搞坏 TLS 证书有效期校验、JWT/OAuth 过期、
+//     HTTP 缓存与 ETag、FairPlay DRM 租期、自动锁屏计时。
+//     OpenSpeedy 敢 hook GetSystemTimeAsFileTime 是因为它面向单机游戏；iOS App 不行。
+//
+// [4] 重入保护（必须，否则微信必崩 —— 真实栈溢出，不是理论风险）
+//     sio_CACurrentMediaTime 的门控走 SIO_blocked() → SIO_wechatZoomPreviewActive()，
+//     而后者自己就用 CACurrentMediaTime() 做探测节流。不设线程局部重入标记就是
+//     本函数 → 门控 → 探测 → 本函数 → …… 无限递归。
+//
+// [5] 已知特性（不是 bug，勿「修」）
+//     倍率变化到下一次取时间之间的那段真实时间，会按**新**倍率折算 ——
+//     取时间越稀疏偏差越大。test_time_dilation.py 的 R2 用例专门量这一项。
+// =========================================================================
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
@@ -292,14 +340,16 @@
 // 它比 OSSpinLock 安全（无优先级反转）、比 pthread_mutex 快（无系统调用陷入），
 // 且在 iOS 10+ 全平台可用，与本项目的部署目标一致。
 #import <os/lock.h>
+// v2.6.0 TimeMode：进程内符号重绑定需要遍历 Mach-O 的符号表与间接符号表。
+// 这三项都是 Darwin 公开头文件，不引入任何私有 API，也不需要额外链接库。
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
+#import <string.h>
 #import "FUBGNoiseData.h"
-// v2.6.0：时间源缩放引擎（OpenSpeedy 思路移植，P0+P1 见 SIOTimeScale.m）
-#import "SIOTimeScale.h"
 
 #define kPrefDomain  @"com.apple.UIKit"
 #define kPrefPath    @"/var/Managed Preferences/mobile/com.apple.UIKit.plist"
-// v2.7.1：影子配置路径 —— 普通 App 沙盒可读的回退位置（App 侧 WriteConfig 双写）
-#define kShadowPath  @"/var/mobile/Library/Preferences/com.local.sioriginal.plist"
 #define kNotifyName  @"com.local.sioriginal.settingschanged"
 
 // ---------- 配置 ----------
@@ -330,18 +380,6 @@ static BOOL     gRespectReduceMotion = YES;
 // 见 SIO_alignToFrameBoundary() 的完整推导。核心：把缩放后的时长
 // 对齐到「设备帧周期」的整数倍，消除每帧渲染时刻的漂移。
 static BOOL     gFrameAlign = YES;
-// v2.6.0：时间源加速（OpenSpeedy 思路移植）。默认关 —— 它改变的是进程对
-// 单调时间流的感知，游戏引擎（Unity/Cocos/自绘循环）受益最大；
-// 纯 UI App 已有上层动画 hook 覆盖，无谓开启反而徒增音画/网络超时风险。
-static BOOL     gTimeScale = NO;
-static double   gTimeScaleFactor = 1.5;
-static BOOL     gTimeScaleSleep = YES;
-// App 前台状态（v2.6.0：后台自动回落 1.0，回前台恢复，见 SIO_afterBoot 注册处）
-static BOOL gTSForeground = YES;
-// v2.7.0：白名单模式开关（NO=所有 App 生效；YES=仅名单内 App 生效，配置器自身除外）
-static BOOL gTSWLMode = NO;
-// v2.7.0：白名单数组（Bundle ID 列表，copy 语义；NSArray —— 元素按 NSString 校验）
-static NSArray *gTSWhitelist = nil;
 // v2.3.0：帧周期（秒）。惰性求值一次 —— 120Hz=1/120≈0.00833，60Hz=1/60≈0.01667。
 // 取 maximumFramesPerSecond 的倒数；若不可用则回退 60Hz。
 static double   gFramePeriod = 0.0;
@@ -355,6 +393,14 @@ static BOOL     gAnimNoop = NO;
 // （含 floor 除法与帧周期读取）。而它的输入恒为 0.25 —— 结果只随配置变，
 // 不随调用变。放到 SIO_reload 里算一次，热路径退化成一次 double 读。
 static double   gImplicitActionDur = 0.25;
+// ---------- v2.6.0 TimeMode 配置（完整说明见文件头 v2.6.0 段落）----------
+// 三个默认值一律取「关」：时间膨胀的侵入性远大于改动画时长，必须 fail-safe。
+// 白名单为空即「无人启用」，因此即使有人把 TimeMode 设成 1，
+// 不显式把 Bundle ID 写进 TimeModeApps 也不会有任何进程被加速。
+static BOOL     gTimeModeOn      = NO;    // TimeMode：全局总开关，缺键默认 NO
+static BOOL     gTimeWhitelisted = NO;    // TimeModeApps：白名单命中，缺键默认不命中
+static BOOL     gTimeDeepRebind  = NO;    // TimeModeDeep：连 App 自带 framework 一起重绑定，默认否
+static BOOL     gTimeHooked      = NO;    // 符号重绑定是否已完成（幂等，装一次即可）
 // v2.0.1：转圈（UIActivityIndicatorView）专属时长下限。旋转动画低于该值会因
 // 帧率采样混叠出现频闪/视觉倒转（×5 把 1s 压到 0.2s 时肉眼像"越转越慢"）。
 // 0.4s ≈ 每秒 2.5 圈，60Hz 下每圈约 24 帧，平滑且明显比系统默认快。
@@ -363,24 +409,6 @@ static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
-
-// v2.7.0：时间源加速总判定 —— 是否允许在本进程内启用时间缩放。
-// 白名单模式关闭 → 所有 App 生效；开启 → 仅名单内 App 生效。
-// 配置器 App 自身（com.local.sioriginal）无论何种模式一律不启用：设置界面
-// 有动画节奏需求，时间被缩放会让开关/滑杆手感变得不可预期。
-static BOOL SIO_tsAllowed(void) {
-    if (gSelfBundle == nil || [gSelfBundle isEqualToString:@"com.local.sioriginal"]) return NO;
-    // v2.7.1：微信硬保护。微信内部大量依赖真实单调时间（消息调度/心跳/转场时序），
-    // 时间源缩放会破坏其 UI 时序（v2.7.1 前白名单模式关闭时微信也会被放行）。
-    // 无论用户如何配置（含显式加入白名单）都不对微信生效 —— 与列表加速硬保护同思路。
-    if (gIsWeChat) return NO;
-    if (!gTSWLMode) return YES;
-    if (gTSWhitelist.count == 0) return NO;
-    for (NSString *s in gTSWhitelist)
-        if ([s isKindOfClass:[NSString class]] &&
-            [s caseInsensitiveCompare:gSelfBundle] == NSOrderedSame) return YES;
-    return NO;
-}
 // v2.5.0[性能·P0] 清洗后的黑名单条目缓存。
 // 原本这份数组被解析两次：SIO_reload() 解析一遍只为算 gSelfBlacklisted 这一个布尔，
 // 随即在函数末尾丢弃；_fbg_loadPref() 又对同一份 plist 重新
@@ -765,12 +793,6 @@ static NSDictionary *SIO_prefSnapshot(void) {
     if (d) return d;
     // 未缓存：磁盘 IO 在锁外做（见上方说明）
     NSDictionary *fresh = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    // v2.7.1[根因修复]：影子路径回退。本 dylib 注入微信等普通 App 后跑在对方沙盒里，
-    // 读不了平台特权的 /var/Managed Preferences；App 侧 v2.7.1 起会同步写一份
-    // 影子副本到 /var/mobile/Library/Preferences/com.local.sioriginal.plist
-    // （普通 App 沙盒允许读）。主路径拿不到就走影子，杜绝「读不到配置 → 全默认值
-    // （加速×5 + 黑名单失效）」—— 那是微信双标题/聊天框打不开的直接根因。
-    if (!fresh) fresh = [NSDictionary dictionaryWithContentsOfFile:kShadowPath];
     os_unfair_lock_lock(&gPrefLock);
     if (!gPrefCache) gPrefCache = fresh;   // 期间可能已被别的线程填好
     d = gPrefCache;
@@ -784,6 +806,37 @@ static void SIO_invalidatePrefCache(void) {
     gPrefCache = nil;
     os_unfair_lock_unlock(&gPrefLock);
 }
+
+// v2.6.0：TimeMode 白名单判定。定义位置在 SIO_reload 之前（唯一调用点），
+// 且 SIO_bundleMatches / SIO_bundleID 都已在上方定义，无需前向声明。
+// 语义与黑名单完全一致（精确匹配，条目末尾写 `*` 才按前缀匹配），
+// 避免又冒出第三套匹配规则。
+static BOOL SIO_timeWhitelistedFrom(id apps) {
+    NSArray *items = nil;
+    if ([apps isKindOfClass:[NSArray class]]) {
+        items = (NSArray *)apps;
+    } else if ([apps isKindOfClass:[NSString class]]) {
+        items = [(NSString *)apps componentsSeparatedByString:@","];
+    }
+    // 白名单为空 = 无人启用。这是刻意的 fail-safe：
+    // 「打开总开关就全进程加速」是危险的默认值，必须显式点名才生效。
+    if (!items.count) return NO;
+    NSString *bid = SIO_bundleID();
+    if (!bid.length) return NO;
+    NSCharacterSet *ws = [NSCharacterSet whitespaceCharacterSet];   // 循环外取一次
+    for (id it in items) {
+        if (![it isKindOfClass:[NSString class]]) continue;
+        NSString *s = [(NSString *)it stringByTrimmingCharactersInSet:ws];
+        if (!s.length) continue;
+        if (SIO_bundleMatches(s)) return YES;
+    }
+    return NO;
+}
+
+// v2.6.0：虚拟时钟倍率换算。定义位于文件后部（依赖 SIO_blocked 之后的时钟状态），
+// 而 SIO_reload 在两个分支末尾都要调用它 —— 因此这里必须前向声明，
+// 否则编译报「使用先于声明」（本项目历史上出过同类编译错误）。
+static void SIO_timeModeRefresh(void);
 
 static void SIO_reload(void) {
     gReloadDone = YES;   // v2.5.0：无论成功失败，解析已经发生过一次
@@ -817,13 +870,6 @@ static void SIO_reload(void) {
         gSpeedMode = NO;
         gRespectReduceMotion = YES;
         gFrameAlign = YES;
-        // v2.6.0：时间源加速默认关（与配置 App 一致）
-        gTimeScale = NO;
-        gTimeScaleFactor = 1.5;
-        gTimeScaleSleep = YES;
-        // v2.7.0：无配置时白名单模式关（与配置 App 默认一致）
-        gTSWLMode = NO;
-        gTSWhitelist = nil;
         gSelfBlacklisted = NO;
         gBlacklistItems  = nil;   // v2.5.0：无配置则无黑名单，保活侧同样取空
         gHasAppOverride  = NO;
@@ -831,6 +877,11 @@ static void SIO_reload(void) {
         if (gListHardGuarded) gListAccel = NO;
         gAnimNoop = (gMode == 0 && gSpeed <= 1.0001);
         gImplicitActionDur = SIO_targetDuration(0.25);
+        // v2.6.0：无配置 = TimeMode 全关（三个开关都回落「关」，倍率回落 1.0）
+        gTimeModeOn     = NO;
+        gTimeWhitelisted = NO;
+        gTimeDeepRebind = NO;
+        SIO_timeModeRefresh();
         return;
     }
     gEnabled = [d[@"Enabled"] boolValue];
@@ -876,18 +927,11 @@ static void SIO_reload(void) {
     // 注意：旧版本写进 plist 的 ProMotion120 键现在被**忽略**（功能已移除），
     // 不做迁移也不报错 —— 那个键对新版dylib 没有任何影响，留在 plist 里无害。
     gFrameAlign = d[@"FrameAlign"] ? [d[@"FrameAlign"] boolValue] : YES;
-    // v2.6.0：时间源加速，缺键默认关；倍率钳制 1.0–5.0（v2.7.0 上限放开，联网 App 靠白名单隔离）
-    gTimeScale = d[@"TimeScale"] ? [d[@"TimeScale"] boolValue] : NO;
-    double tsf = d[@"TimeScaleFactor"] ? [d[@"TimeScaleFactor"] doubleValue] : 1.5;
-    gTimeScaleFactor = (tsf >= 1.0 && tsf <= 5.0) ? tsf : 1.5;
-    gTimeScaleSleep = d[@"TimeScaleSleep"] ? [d[@"TimeScaleSleep"] boolValue] : YES;
-    // v2.7.0：白名单模式开关（漏读此键 = App 落盘了但 dylib 永远不生效的假功能）
-    gTSWLMode = d[@"TimeScaleWhitelistMode"] ? [d[@"TimeScaleWhitelistMode"] boolValue] : NO;
-    // v2.7.0：时间源白名单（数组，元素为 Bundle ID）。仅在 whitelist 模式开启时参与判定
-    if (d[@"TimeScaleWhitelist"] && [d[@"TimeScaleWhitelist"] isKindOfClass:[NSArray class]])
-        gTSWhitelist = [d[@"TimeScaleWhitelist"] copy];
-    else
-        gTSWhitelist = nil;
+    // v2.6.0：TimeMode。三个键全部缺键默认「关」—— 白名单为空即无人启用，
+    // 所以即使 TimeMode 被手工写成 1，只要 TimeModeApps 里没点名就不生效。
+    gTimeModeOn     = d[@"TimeMode"]     ? [d[@"TimeMode"] boolValue]     : NO;
+    gTimeDeepRebind = d[@"TimeModeDeep"] ? [d[@"TimeModeDeep"] boolValue] : NO;
+    gTimeWhitelisted = SIO_timeWhitelistedFrom(d[@"TimeModeApps"]);
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     // v2.5.0：解析结果（清洗后的条目数组）顺手缓存进 gBlacklistItems，
@@ -964,13 +1008,11 @@ static void SIO_reload(void) {
         if (ovr[@"RespectReduceMotion"]) gRespectReduceMotion = [ovr[@"RespectReduceMotion"] boolValue];
         // v2.3.0：帧对齐的 App 级覆盖
         if (ovr[@"FrameAlign"]) gFrameAlign = [ovr[@"FrameAlign"] boolValue];
-        // v2.6.0：时间源加速的 App 级覆盖
-        if (ovr[@"TimeScale"]) gTimeScale = [ovr[@"TimeScale"] boolValue];
-        if (ovr[@"TimeScaleFactor"]) {
-            double tf2 = [ovr[@"TimeScaleFactor"] doubleValue];
-            if (tf2 >= 1.0 && tf2 <= 2.0) gTimeScaleFactor = tf2;
-        }
-        if (ovr[@"TimeScaleSleep"]) gTimeScaleSleep = [ovr[@"TimeScaleSleep"] boolValue];
+        // v2.6.0：TimeMode 的 App 级覆盖。注意语义不对称（刻意的）：
+        //   覆盖只能改「总开关」这一个闸 —— 白名单仍然必须命中。
+        //   也就是说 AppOverrides 可以为白名单内的某个 App **单独关掉** TimeMode，
+        //   但不能替白名单之外的 App 打开它。安全项不接受「忘了加白名单」。
+        if (ovr[@"TimeMode"]) gTimeModeOn = [ovr[@"TimeMode"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -985,12 +1027,11 @@ static void SIO_reload(void) {
     // v2.5.0：顺带把最热 hook 的换算结果预计算好（见 gImplicitActionDur 说明）。
     // 必须在 gAnimNoop 之后 —— SIO_targetDuration 依赖当前生效配置。
     gImplicitActionDur = SIO_targetDuration(0.25);
-    // v2.6.0：把时间源加速配置推给引擎。总开关叠加主开关 Enabled —— 用户关掉
-    // 「加速总开关」时预期全部功能一起停，时间源缩放不例外。
-    // 后台回落 1.0 由 gTSForeground 承载（见 SIO_afterBoot 注册处）。
-    // 未安装时（首次 SIO_reload 先于 SIO_TS_install）内部自动跳过，
-    // 构造函数会在 install 后用当前配置补一次 apply。
-    SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
+    // v2.6.0：按最终生效值（含 App 覆盖）算出虚拟时钟倍率。
+    // 放在最后 —— 它依赖 gMode / gSpeed / gSlowFactor / gEnabled 的最终值。
+    // 这里只写倍率，不重锚定：锚定推迟到下一次真正取时间时进行
+    // （那时才有「当前真实时刻」可用，见 SIO_virtualTime）。
+    SIO_timeModeRefresh();
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -1110,13 +1151,6 @@ static BOOL SIO_showToast(NSString *text, BOOL throttle) {
                     [toast removeFromSuperview];
                     SIO_setInternalUI(inner);
                 }];
-                // v2.7.1：兜底移除。宿主 App 动画时序异常时 completion 可能不回调，
-                // toast 会永久残留（v2.7.1 前微信实报「设置已生效」不消失）。
-                // 无论淡出动画是否完成，0.6s 后强制清出视图树。
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (toast.superview) [toast removeFromSuperview];
-                });
             });
         }];
         return YES;
@@ -1358,6 +1392,280 @@ static inline BOOL SIO_blocked(void) {
     // 动画 hook 恢复生效；v1.8.4 放大态探测器首次真正启用作为安全网
     if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路（非微信时立即返回 NO）
     return NO;
+}
+
+// =============================================================================
+// v2.6.0 TimeMode —— 进程内虚拟时钟
+// =============================================================================
+// 设计依据、红线与已知特性见文件头 v2.6.0 段落，此处只写实现要点。
+// 算法验证：tools/test_time_dilation.py（恒等/单调/连续/速率 四条不变量）。
+// =============================================================================
+
+// 虚拟时钟状态。全部成员只在 SIO_virtualTime() 内被读写，且始终持 gTimeLock。
+static os_unfair_lock gTimeLock       = OS_UNFAIR_LOCK_INIT;
+static double         gTimeFactor     = 1.0;   // 当前生效倍率（>1 更快，<1 更慢）
+static double         gTimeLastFactor = 1.0;   // 上次锚定时用的倍率 —— 用于检测倍率变化
+static double         gTimeBaseReal   = -1.0;  // 锚点：真实时刻
+static double         gTimeBaseVirt   = 0.0;   // 锚点：与其对应的虚拟时刻
+static double         gTimeLastVirt   = 0.0;   // 上次返回值（跨线程单调兜底）
+
+// 原实现指针。必须在改写符号槽位**之前**用 dlsym 取好 —— 顺序反了会取到自己。
+// 注意：它虽然叫 o_ 前缀（沿用「原实现」命名，也让 static_check.py 的红线判空
+// 检查能覆盖到它），但**不是** ObjC IMP —— 不经过 SIO_swizzleInstance 赋值，
+// 因此 tools/check_v210.py 会把它报成「未见 swizzle 赋值」。那条是提示不是错误，
+// 属于有意保留：这里保留判空检查的好处大于消除一条提示。
+static CFTimeInterval (*o_CACurrentMediaTime)(void) = NULL;
+
+// 重入保护。用 __thread 而不是 pthread_key，三个理由：
+//  ① 不必在构造函数里再多创建一个 key —— 每多一个 key 就多一条创建失败的 early-return
+//     分支，而任何一个 TLS key 缺失都会让后续判定读到未定义值；
+//  ② 读取是一次 TLS 直接寻址，比 pthread_getspecific 的函数调用更快；
+//  ③ 本文件 v2.0.7 起在 CATransaction 那套逻辑里已经用过 __thread，口径一致。
+static __thread BOOL gInTimeHookTLS = NO;
+
+// 倍率换算。由 SIO_reload() 在两个分支末尾调用 —— 配置一变就重算。
+// 注意这里**不做重锚定**：此刻拿不到「当前真实时刻」，硬取一次 CACurrentMediaTime
+// 等于在配置线程上多一次无谓调用；锚定推迟到下一次真正取时间时发生，
+// 由 gTimeFactor != gTimeLastFactor 这个比较自动触发。
+static void SIO_timeModeRefresh(void) {
+    double f = 1.0;
+    if (gTimeModeOn && gTimeWhitelisted && gEnabled && !gSelfBlacklisted) {
+        if (gMode == 0)      f = gSpeed;              // 加速：虚拟时钟走得更快
+        else if (gMode == 1) f = 1.0 / gSlowFactor;   // 慢放：虚拟时钟走得更慢
+        else                 f = 20.0;                // 瞬切：与 SIO_springScale() 的 20.0 取齐
+    }
+    // !(f > 0.0) 一次拦住 NaN、0、负数三种情况（NaN 的所有比较都为假）。
+    if (!(f > 0.0)) f = 1.0;
+    if (f > 50.0) f = 50.0;      // 上限与配置 App 的 Speed 上限一致
+    if (f < 0.02)  f = 0.02;     // 下限：慢放最多 ×50
+    os_unfair_lock_lock(&gTimeLock);
+    gTimeFactor = f;
+    os_unfair_lock_unlock(&gTimeLock);
+}
+
+// 虚拟时钟核心：virtual(t) = baseVirtual + f × (t − baseReal)
+static inline CFTimeInterval SIO_virtualTime(CFTimeInterval real) {
+    // 恒等快速路径：倍率为 1 时不碰锁、不碰状态，直接返回真实值。
+    // 这是绝大多数进程每一帧都会走的路径（TimeMode 默认关），
+    // 必须保持在「一次 double 读 + 一次比较」的量级。
+    // 这里刻意不加锁读 gTimeFactor：arm64 上对齐 8 字节的 double 不会撕裂，
+    // 最坏后果也只是晚一帧感知到倍率变化 —— 比每次取时间都抢一把锁划算得多。
+    double f = gTimeFactor;
+    if (f > 0.99999 && f < 1.00001) return real;
+
+    os_unfair_lock_lock(&gTimeLock);
+    // 首次调用：还没有锚点，先立一个。
+    if (gTimeBaseReal < 0.0) {
+        gTimeBaseReal = real;
+        gTimeBaseVirt = gTimeLastVirt;
+    }
+    // 倍率变了 → 重新锚定。这是整个算法的关键一步：
+    // 若直接算 real × f，倍率每次变化都会让虚拟时钟整体跳变甚至倒退，
+    // App 里所有 `now − last` 会算出负数或巨大值 —— 动画抽搐、倒计时乱跳、
+    // 超时逻辑失效。重锚定之后时钟连续且单调，只是斜率变了。
+    if (gTimeFactor != gTimeLastFactor) {
+        gTimeBaseReal   = real;
+        gTimeBaseVirt   = gTimeLastVirt;
+        gTimeLastFactor = gTimeFactor;
+        f = gTimeFactor;
+    }
+    double v = gTimeBaseVirt + f * (real - gTimeBaseReal);
+    // 跨线程单调兜底：多线程下后到的线程可能带着更早的 real
+    // （线程 A 读到 t1、被抢占，线程 B 读到 t2 > t1 先算完）。
+    // 钳到已知最大值，让「虚拟时钟永不倒退」这条不变量跨线程也成立。
+    if (v < gTimeLastVirt) v = gTimeLastVirt;
+    gTimeLastVirt = v;
+    os_unfair_lock_unlock(&gTimeLock);
+    return v;
+}
+
+// 运行时门控。装了钩 ≠ 生效：还要过双闸 + 现有 SIO_blocked()。
+static inline BOOL SIO_timeModeActive(void) {
+    if (!gTimeModeOn || !gTimeWhitelisted) return NO;   // 双闸：总开关 + 白名单
+    if (!gTimeHooked) return NO;                        // 没装钩 → 不可能生效
+    return !SIO_blocked();                              // 接现有门控（黑名单/减弱动效/微信放大态/自绘UI）
+}
+
+// 被重绑进去的函数。签名必须与原实现完全一致：CFTimeInterval (void)。
+static CFTimeInterval sio_CACurrentMediaTime(void) {
+    // 原实现指针为空只可能是安装失败却仍被调到。此时不能回退去调
+    // CACurrentMediaTime()（那就是本函数 → 自递归），只能返回 0；
+    // 调用方拿到 0 会当作「计时起点」，不会崩，只是这一处计时不准。
+    if (!o_CACurrentMediaTime) return 0.0;
+    CFTimeInterval real = o_CACurrentMediaTime();
+
+    // -------------------------------------------------------------------------
+    // 重入保护（必须 —— 这不是理论风险，微信里必然栈溢出）
+    // 下面的 SIO_timeModeActive() 内部走 SIO_blocked()，而 SIO_blocked() 里的
+    // SIO_wechatZoomPreviewActive() **自己就用 CACurrentMediaTime()** 做探测节流：
+    //   本函数 → 门控 → 探测 → CACurrentMediaTime() → 本函数 → 门控 → 探测 → ……
+    // 修法：进入即置线程局部标记，重入时直接给真实时间 ——
+    // 探测节流本来就该用真实时间（它量的是「距上次探测过了多少真实毫秒」）。
+    // -------------------------------------------------------------------------
+    if (gInTimeHookTLS) return real;
+    gInTimeHookTLS = YES;
+    CFTimeInterval out = real;
+    @try {
+        if (SIO_timeModeActive()) out = SIO_virtualTime(real);
+    } @catch (__unused NSException *e) {
+        out = real;     // 门控抛异常 = 本次不加速，绝不让宿主的取时间调用崩掉
+    }
+    gInTimeHookTLS = NO;
+    return out;
+}
+
+// ---------- v2.6.0：Mach-O 间接符号表重绑定（fishhook 机制的极简内建实现）----------
+// 为什么不直接引 fishhook：
+//   ① 本 dylib 自 v2.0.7 起的编译约束是「只链接 UIKit + QuartzCore」，
+//      为一个 100 行的符号表遍历再拉一个外部依赖（还要在 Makefile 里加文件）不划算；
+//   ② 我们只需要重绑定一个符号，fishhook 的通用重绑定表在这里是过度设计。
+// 原理与 fishhook 完全一致：App 主二进制里对 CACurrentMediaTime 的调用，编译后是
+// 一条 __DATA,__la_symbol_ptr 槽位的间接跳转，dyld 首次调用时把真实地址填进槽位；
+// 重绑定 = 找到槽位，把 dyld 填好的地址换成我们的函数指针。
+typedef struct {
+    const char *name;          // 符号名（不带 Mach-O 的前导下划线）
+    void       *replacement;   // 要写进去的函数指针
+} SIORebind;
+
+// 在一个镜像内把 name 对应的所有间接符号指针槽位换成 replacement。
+// 返回实际改写的槽位数（0 = 该镜像没有这条调用，或桩位落在了我们不碰的段里）。
+static int SIO_rebindSymbolInImage(const struct mach_header *header, intptr_t slide, SIORebind *rb) {
+    if (!header || !rb || !rb->name || !rb->replacement) return 0;
+    // 本项目 ARCHS = arm64；iOS 11+ 已无 32 位用户态，这里只认 MH_MAGIC_64。
+    if (header->magic != MH_MAGIC_64) return 0;
+
+    const struct mach_header_64 *h64 = (const struct mach_header_64 *)header;
+    uintptr_t cur = (uintptr_t)header + sizeof(struct mach_header_64);
+    struct symtab_command     *symtab  = NULL;
+    struct dysymtab_command   *dysym   = NULL;
+    struct segment_command_64 *linkedit = NULL;
+    // 只收 __DATA，**不收 __DATA_CONST**：iOS 14+ 的 __DATA_CONST 在 dyld 做完
+    // 修正后会被设为只读，直接写会 EXC_BAD_ACCESS（fishhook 自己在 iOS 14 上也踩过）。
+    // 而函数型导入符号的桩位（__la_symbol_ptr）传统上就落在可写的 __DATA 里 ——
+    // 少覆盖一个段换来「不改只读页、不 vm_protect」，对默认关闭的功能来说是对的取舍。
+    struct segment_command_64 *dataSegs[4];
+    int nData = 0;
+
+    for (uint32_t i = 0; i < h64->ncmds; i++) {
+        struct load_command *lc = (struct load_command *)cur;
+        if (lc->cmd == LC_SYMTAB) {
+            symtab = (struct symtab_command *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dysym = (struct dysymtab_command *)lc;
+        } else if (lc->cmd == LC_SEGMENT_64) {
+            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+            if (strncmp(seg->segname, SEG_LINKEDIT, 16) == 0) {
+                linkedit = seg;
+            } else if (strncmp(seg->segname, SEG_DATA, 16) == 0 && nData < 4) {
+                dataSegs[nData++] = seg;
+            }
+        }
+        cur += lc->cmdsize;
+    }
+    if (!symtab || !dysym || !linkedit || nData == 0) return 0;
+
+    // __LINKEDIT 段内的 symoff / stroff / indirectsymoff 都是**相对段首**的文件偏移，
+    // 换算成进程内虚拟地址的公式是：base = slide + vmaddr − fileoff。
+    uintptr_t linkeditBase = (uintptr_t)slide
+                           + (uintptr_t)linkedit->vmaddr
+                           - (uintptr_t)linkedit->fileoff;
+    struct nlist_64 *syms = (struct nlist_64 *)(linkeditBase + symtab->symoff);
+    char            *strs = (char *)(linkeditBase + symtab->stroff);
+    uint32_t    *indirect = (uint32_t *)(linkeditBase + dysym->indirectsymoff);
+    if (!syms || !strs || !indirect) return 0;
+
+    int hits = 0;
+    for (int s = 0; s < nData; s++) {
+        struct segment_command_64 *seg = dataSegs[s];
+        uintptr_t secCur = (uintptr_t)seg + sizeof(struct segment_command_64);
+        for (uint32_t i = 0; i < seg->nsects; i++) {
+            struct section_64 *sec = (struct section_64 *)secCur;
+            secCur += sizeof(struct section_64);
+            uint32_t type = sec->flags & SECTION_TYPE;
+            if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
+
+            uint32_t  start  = sec->reserved1;             // 本 section 在间接符号表中的起始下标
+            uint64_t  count  = sec->size / sizeof(void *);
+            void    **slots  = (void **)((uintptr_t)slide + (uintptr_t)sec->addr);
+            for (uint64_t j = 0; j < count; j++) {
+                if (start + j >= dysym->indirectsymsize) break;   // 越界保护
+                uint32_t symIndex = indirect[start + j];
+                if (symIndex == INDIRECT_SYMBOL_ABS || symIndex == INDIRECT_SYMBOL_LOCAL) continue;
+                if (symIndex >= symtab->nsyms) continue;
+                uint32_t strx = syms[symIndex].n_un.n_strx;
+                if (strx == 0 || strx >= symtab->strsize) continue;
+                const char *nm = strs + strx;
+                if (nm[0] == '_') nm++;                    // Mach-O 的 C 符号带前导下划线
+                if (nm[0] == '\0') continue;
+                if (strcmp(nm, rb->name) != 0) continue;
+                slots[j] = rb->replacement;
+                hits++;
+            }
+        }
+    }
+    return hits;
+}
+
+// 安装 TimeMode。幂等：装一次就够，之后开合全靠运行时门控
+// （关掉时 SIO_timeModeActive() 返回 NO，本函数直接返回真实时间）。
+// 刻意不做「卸载」：把槽位改回去需要在别的线程正在执行该函数指针时动内存，
+// 风险远大于收益 —— 保留钩、关行为，是全项目一致的做法（见 ListAccel 的处理）。
+static void SIO_installTimeMode(void) {
+    if (gTimeHooked) return;
+    @try {
+        // 默认路径（TimeMode=NO 或白名单未命中）：连符号表都不遍历，零开销。
+        if (!gTimeModeOn || !gTimeWhitelisted) return;
+
+        // 先取真实实现，再改槽位。顺序反了 dlsym 会取到我们自己的函数。
+        if (!o_CACurrentMediaTime) {
+            o_CACurrentMediaTime = (CFTimeInterval (*)(void))dlsym(RTLD_DEFAULT, "CACurrentMediaTime");
+        }
+        if (!o_CACurrentMediaTime) {
+            NSLog(@"[SIOriginal] TimeMode: cannot resolve CACurrentMediaTime — aborting (app unaffected)");
+            return;
+        }
+
+        SIORebind rb;
+        rb.name        = "CACurrentMediaTime";
+        rb.replacement = (void *)sio_CACurrentMediaTime;
+
+        int hits = 0;
+        // ① 主二进制 —— App 自己的代码对 CACurrentMediaTime 的调用都走这里。
+        if (_dyld_image_count() > 0) {
+            hits += SIO_rebindSymbolInImage(_dyld_get_image_header(0),
+                                            _dyld_get_image_vmaddr_slide(0), &rb);
+        }
+        // ② 可选：把 App 自带的 framework 也重绑定（TimeModeDeep，默认关）。
+        //    系统镜像一律跳过 —— 它们在 dyld 共享缓存里，改它们等于 patch 系统库：
+        //    既越出「折中路线」的边界，也过不了 AMFI 的代码签名校验。
+        //    本 dylib 自己也跳过：我们内部的探测节流要的是真实时间。
+        if (gTimeDeepRebind) {
+            uint32_t n = _dyld_image_count();
+            for (uint32_t i = 1; i < n; i++) {
+                const char *p = _dyld_get_image_name(i);
+                if (!p) continue;
+                if (strstr(p, "/System/Library/") == p) continue;
+                if (strstr(p, "/usr/lib/") == p) continue;
+                if (strstr(p, "SIOriginal") != NULL) continue;
+                hits += SIO_rebindSymbolInImage(_dyld_get_image_header(i),
+                                                _dyld_get_image_vmaddr_slide(i), &rb);
+            }
+        }
+
+        gTimeHooked = YES;
+        if (hits == 0) {
+            // 必须报出来：静默「装了但没生效」是本文件反复出过的事故类型。
+            NSLog(@"[SIOriginal] TimeMode: 0 slots rebound in %@ — 该 App 对 "
+                  @"CACurrentMediaTime 的调用可能全在其自带 framework 内，或桩位落在只读段"
+                  @"（__DATA_CONST）。TimeMode 在本进程不会生效；可将 TimeModeDeep 设为 1 再试，"
+                  @"仍无效则本路线对该 App 不适用。", SIO_bundleID());
+        } else {
+            NSLog(@"[SIOriginal] TimeMode installed in %@ (%d slot(s), deep=%d)",
+                  SIO_bundleID(), hits, (int)gTimeDeepRebind);
+        }
+    } @catch (NSException *e) {
+        NSLog(@"[SIOriginal] TimeMode install failed (app unaffected): %@", e);
+    }
 }
 
 // =============================================================================
@@ -2667,20 +2975,18 @@ static inline void SIO_markDyldCost(void) {
 // 就落在首屏渲染之后，不再叠加到 pre-main 的阻塞时间里。
 static void SIO_logFingerprintLater(void) {
     SIO_afterBoot(^{
-        NSLog(@"[SIOriginal] v2.7.1 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
+        NSLog(@"[SIOriginal] v2.6.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
               @"floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d "
               @"feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f "
-              @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms "
-              @"ts=%d/%.2f/%d wl=%d/%lu fg=%d override=%d listGuard=%d "
+              @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms override=%d listGuard=%d "
+              @"timeMode=%d/%d/%d/%.2f "
               @"swaps=%d bootMs=%.2f)",
               gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
               gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
               gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop,
               gSpeedMode, SIO_speedScale(), gRespectReduceMotion, SIO_reduceMotionOn(),
-              gFrameAlign, SIO_framePeriod() * 1000.0,
-              gTimeScale, gTimeScaleFactor, gTimeScaleSleep, gTSWLMode,
-              (unsigned long)gTSWhitelist.count, gTSForeground,
-              gHasAppOverride, gListHardGuarded,
+              gFrameAlign, SIO_framePeriod() * 1000.0, gHasAppOverride, gListHardGuarded,
+              gTimeModeOn, gTimeWhitelisted, gTimeHooked, gTimeFactor,
               gSIOHookSwapCount, gSIODyldCostMs);
     });
 }
@@ -2700,29 +3006,6 @@ static void SIOriginalInit(void) {
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     gIsWeChat = [gSelfBundle isEqualToString:@"com.tencent.xin"];
     SIO_reload();
-
-    // v2.6.0：时间源缩放引擎（OpenSpeedy 思路移植）。安装幂等；
-    // 首次 SIO_reload 里的 apply 因引擎未装被跳过，这里装完立即补一次。
-    SIO_TS_install();
-    SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
-    // 前后台门控：进后台回落 1.0（后台任务/网络超时按真实时间走），回前台恢复。
-    // UIApplication 此刻尚不存在（pre-main），必须经 SIO_afterBoot 推迟到启动后注册。
-    SIO_afterBoot(^{
-        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        NSOperationQueue *mainQ = [NSOperationQueue mainQueue];
-        [nc addObserverForName:UIApplicationDidBecomeActiveNotification
-                       object:nil queue:mainQ
-                  usingBlock:^(NSNotification *note) {
-                      gTSForeground = YES;
-                      SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, YES);
-                  }];
-        [nc addObserverForName:UIApplicationWillResignActiveNotification
-                       object:nil queue:mainQ
-                  usingBlock:^(NSNotification *note) {
-                      gTSForeground = NO;
-                      SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, NO);
-                  }];
-    });
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     SIO_settingsChanged,
@@ -2845,6 +3128,18 @@ static void SIOriginalInit(void) {
         }
     });
 
+    // v2.6.0：TimeMode 的符号重绑定同样排到启动完成之后，与 iOS16Extras 共用栅栏。
+    // 它要遍历主二进制的符号表与间接符号表（几千个条目量级的一次线性扫描），
+    // 绝不能放进 pre-main —— 那会把 v2.5.0 刚省下来的启动时间又加回去。
+    // 而且默认配置下这个 block 只做一次布尔判断就返回，零开销。
+    SIO_afterBoot(^{
+        @try {
+            SIO_installTimeMode();
+        } @catch (NSException *e) {
+            NSLog(@"[SIOriginal] TimeMode install failed (app unaffected): %@", e);
+        }
+    });
+
     // v1.8.12：启动指纹日志，便于测试时在 Console 确认注入的版本与生效配置
     // v1.8.14：追加 override（是否命中 App 级覆盖）与 listGuard（是否被列表硬保护）
     // v1.8.18：新增 5 个系统级 hook（UIRefreshControl/UINavigationBar/UIPageViewController/UIDocumentInteractionController）
@@ -2888,7 +3183,7 @@ static void SIOriginalInit(void) {
     // 另外 NSLog 本身是同步的（经 os_log / logd），单次格式化 30 个参数在
     // pre-main 也是实打实的耗时，延后同样省下这一段。
     // =========================================================================
-    NSLog(@"[SIOriginal] v2.5.0 core hooks installed in %@ (enabled=%d mode=%d speed=%.1f noop=%d)",
+    NSLog(@"[SIOriginal] v2.6.0 core hooks installed in %@ (enabled=%d mode=%d speed=%.1f noop=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gAnimNoop);
     // 延后的完整指纹 + 「启动期已装/延后装」边界说明
     SIO_logFingerprintLater();
@@ -3770,8 +4065,7 @@ static BOOL _fbg_isExcluded(void) {
 }
 
 static void _fbg_recalc(void) {
-    // v2.7.1：微信不参与保活（场景伪造/音频保活对微信的生命周期管理有干扰风险）
-    gActive   = gFUBGEnabled && !gLocalOff && !gIsWeChat && !_fbg_isExcluded();
+    gActive   = gFUBGEnabled && !gLocalOff && !_fbg_isExcluded();
     gUseScene = gActive && gSceneFake;
     gUseAudio = gActive && gAudioKeep;
 }
@@ -4140,8 +4434,6 @@ static void _fbg_stopWatchdog(void) {
         gWatchdog = nil;
     }
 }
-
-static void _fbg_watchdogFire(NSTimer *t);  // 前向声明：下方 timer block 先于定义引用
 
 static void _fbg_startWatchdog(void) {
     if (!gUseAudio) return;          // 不用音频断言 → 定时器永远无事可做
@@ -4796,6 +5088,11 @@ static void SIO_installOnDemandHooks(void) {
                                     (IMP)sio_view_layoutIfNeeded, (IMP *)&o_view_layoutIfNeeded);
             }
         }
+
+        // v2.6.0：TimeMode。构造期那次 SIO_afterBoot 安装可能已经跑完
+        // （当时开关还是关的），用户之后打开就得在这里补装。
+        // SIO_installTimeMode 自带幂等保护，重复调用安全。
+        SIO_installTimeMode();
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] on-demand hook install failed (app unaffected): %@", e);
     }

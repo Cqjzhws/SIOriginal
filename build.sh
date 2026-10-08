@@ -27,10 +27,15 @@ if command -v python3 &> /dev/null; then
     # 本轮的优化都是「把昂贵的事挪走 / 少做一次」—— 一旦后续改动把它们挪回来，
     # 编译不报错、功能也不坏，只是性能悄悄退化，而这类退化在真机上极难归因。
     # 因此必须变成 CI 里会失败的断言。
-    echo ">>> v2.5.0 性能不变量核查 ..."
+    echo ">>> v2.5.0 性能 + v2.6.0 TimeMode 不变量核查 ..."
     python3 tools/check_v250.py .
     echo ">>> v2.5.0 算法层基准 ..."
     python3 tools/bench_v250.py
+    # v2.6.0：TimeMode 的虚拟时钟算法验证（恒等/单调/连续/速率 四条不变量）。
+    # 时间膨胀一旦算错，表现是「动画抽搐 / 倒计时乱跳 / 超时逻辑失效」，
+    # 在真机上极难归因 —— 必须在构建期拦住。
+    echo ">>> v2.6.0 时间膨胀算法验证 ..."
+    python3 tools/test_time_dilation.py
 else
     echo "警告：未找到 python3，跳过静态核查"
 fi

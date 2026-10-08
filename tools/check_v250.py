@@ -10,7 +10,7 @@ SIOriginal v2.5.0 性能改动 —— 语义级交叉引用核查
 只是性能悄悄退化 —— 而这类退化在真机上是很难归因的。
 这些不变量必须变成 CI 里会失败的断言。
 
-覆盖的 9 条不变量：
+覆盖的 14 条不变量（1–9 为 v2.5.0 性能轮，10–14 为 v2.6.0 TimeMode 轮）：
 
   V250-1  构造函数内不得直接调用 SIO_framePeriod() / SIO_reduceMotionOn()
           （会触发 UIScreen 初始化与 dlopen 私有框架，见 P0-1）
@@ -22,6 +22,15 @@ SIOriginal v2.5.0 性能改动 —— 语义级交叉引用核查
   V250-7  gImplicitActionDur 必须在 SIO_reload 的两个分支里都赋值
   V250-8  os/lock.h 必须已 import（os_unfair_lock 依赖）
   V250-9  启动日志不得再内联调用惰性求值函数（参数表里不得出现）
+  V250-10 sio_CACurrentMediaTime 必须有线程局部重入保护
+          （门控走 SIO_blocked() → 微信放大态探测 → 又调 CACurrentMediaTime()
+            → 无限递归栈溢出，见文件头 v2.6.0 [4]）
+  V250-11 重绑定目标只允许 CACurrentMediaTime —— 绝不许碰墙钟时间源
+          （mach_absolute_time / gettimeofday / clock_gettime /
+           CFAbsoluteTimeGetCurrent 会搞坏 TLS 证书校验、JWT 过期、DRM 租期）
+  V250-12 TimeMode 三个开关的默认值必须全为 NO（fail-safe）
+  V250-13 白名单为空必须判定为「无人启用」
+  V250-14 SIO_timeModeRefresh() 必须在 SIO_reload 的两个分支里都调用
 
 用法：
     python3 tools/check_v250.py [源码根目录]
@@ -219,6 +228,79 @@ def main() -> int:
     # ---------- V250-8：os/lock.h ----------
     if '#import <os/lock.h>' not in raw:
         problems.append("V250-8  未 import <os/lock.h> —— os_unfair_lock 无法使用")
+
+    # ---------- V250-10：时间钩的重入保护 ----------
+    m = re.search(r'static\s+CFTimeInterval\s+sio_CACurrentMediaTime\s*\(\s*void\s*\)\s*\{', code)
+    if not m:
+        problems.append("V250-10 未找到 sio_CACurrentMediaTime 的定义（TimeMode 的时间钩）")
+    else:
+        i, depth = m.end() - 1, 0
+        while i < len(code):
+            if code[i] == '{':
+                depth += 1
+            elif code[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        body = code[m.end() - 1:i + 1]
+        if 'gInTimeHookTLS' not in body:
+            problems.append(
+                "V250-10 sio_CACurrentMediaTime 内没有 gInTimeHookTLS 重入保护 —— "
+                "门控 SIO_timeModeActive() → SIO_blocked() → SIO_wechatZoomPreviewActive() "
+                "会再次调用 CACurrentMediaTime()，无保护即无限递归、栈溢出（微信里必然触发）。")
+        else:
+            if not re.search(r'if\s*\(\s*gInTimeHookTLS\s*\)', body):
+                problems.append("V250-10 缺少 `if (gInTimeHookTLS) return real;` 重入短路分支")
+            if not re.search(r'gInTimeHookTLS\s*=\s*YES', body):
+                problems.append("V250-10 重入标记从未被置位（gInTimeHookTLS = YES）")
+            if not re.search(r'gInTimeHookTLS\s*=\s*NO', body):
+                problems.append("V250-10 重入标记从未被清除（gInTimeHookTLS = NO）")
+        if not re.search(r'if\s*\(\s*!o_CACurrentMediaTime\s*\)', body):
+            problems.append(
+                "V250-10 时间钩未对 o_CACurrentMediaTime 判空 —— 项目红线 #4；"
+                "且此处不能回退去调 CACurrentMediaTime()（那就是本函数，自递归）。")
+
+    # ---------- V250-11：重绑定目标白名单 ----------
+    rb_names = re.findall(r'rb\.name\s*=\s*@?"([^"]+)"', code)
+    if not rb_names:
+        problems.append("V250-11 未找到 TimeMode 的重绑定目标符号")
+    for nm in rb_names:
+        if nm != "CACurrentMediaTime":
+            problems.append(
+                f"V250-11 TimeMode 重绑定了非预期符号 `{nm}` —— "
+                f"只允许 CACurrentMediaTime。缩放墙钟时间源（mach_absolute_time / "
+                f"gettimeofday / clock_gettime / CFAbsoluteTimeGetCurrent）会搞坏 "
+                f"TLS 证书校验、JWT 过期、HTTP 缓存、FairPlay DRM 与自动锁屏。")
+    rb_repl = re.findall(r'rb\.replacement\s*=\s*\(void\s*\*\)\s*(\w+)', code)
+    for rp in rb_repl:
+        if rp != "sio_CACurrentMediaTime":
+            problems.append(f"V250-11 重绑定的替换函数不是 sio_CACurrentMediaTime：`{rp}`")
+
+    # ---------- V250-12：三个开关默认全关 ----------
+    for var in ("gTimeModeOn", "gTimeWhitelisted", "gTimeDeepRebind"):
+        if not re.search(r'static\s+BOOL\s+%s\s*=\s*NO\s*;' % var, code):
+            problems.append(
+                f"V250-12 {var} 的静态默认值不是 NO —— 时间膨胀是侵入性最强的手段，"
+                f"任何一项默认打开都会让「改了配置却全进程加速」成为默认值。")
+    if not re.search(r'd\[@"TimeMode"\]\s*\?\s*\[d\[@"TimeMode"\]\s*boolValue\]\s*:\s*NO', code):
+        problems.append(
+            'V250-12 TimeMode 缺键时必须回落 NO（当前写法不是 `d[@"TimeMode"] ? ... : NO`）')
+
+    # ---------- V250-13：白名单为空 = 无人启用 ----------
+    if not re.search(r'if\s*\(\s*!items\.count\s*\)\s*return\s+NO\s*;', code):
+        problems.append(
+            "V250-13 SIO_timeWhitelistedFrom 缺少 `if (!items.count) return NO;` —— "
+            "白名单为空必须判定为「无人启用」，否则打开总开关就等于全进程加速。")
+
+    # ---------- V250-14：两个分支都要刷新倍率 ----------
+    # 注意：前向声明是 `SIO_timeModeRefresh(void);`（括号里有 void），不会被这条正则命中。
+    n_refresh = len(re.findall(r'SIO_timeModeRefresh\s*\(\s*\)\s*;', code))
+    if n_refresh < 2:
+        problems.append(
+            f"V250-14 SIO_timeModeRefresh() 只有 {n_refresh} 处调用（应为 2 处："
+            f"SIO_reload 的正常分支与 plist 缺失分支）—— "
+            f"少一处会让该配置路径下虚拟时钟沿用上一个倍率。")
 
     # ---------- App 侧：主线程零 IO ----------
     if app:

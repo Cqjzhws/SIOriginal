@@ -2,6 +2,64 @@
 
 面向 iOS 14–17（含 iOS 16/17）的动画加速方案，共 **100+ 个 Hook**，适配 TrollStore / TrollFools，无需 CydiaSubstrate。
 
+## v2.6.0 TimeMode：进程内虚拟时钟（实验·默认关·白名单）
+
+移植 OpenSpeedy 的加速原理（完整推导见 [OPENSPEEDY_ANALYSIS.md](OPENSPEEDY_ANALYSIS.md)）。
+与前面所有版本**不是同一类手段**：
+
+| | v2.5.0 及以前 | v2.6.0 TimeMode |
+|---|---|---|
+| 做法 | 改动画的 **duration / speed** | 改进程读到的 **时间本身** |
+| 覆盖面 | 逐个枚举的 100+ 个 ObjC 动画入口 | 一处改，所有以 `CACurrentMediaTime` 为时基的 App 逻辑都受影响 |
+| 对系统动画 | 有效（导航转场/键盘/模态…） | **无效** |
+| 对 App 自绘逻辑 | 无效 | 有效（自绘动画、CADisplayLink 手算进度、轮询/超时/节流/倒计时、游戏主循环） |
+
+### 算法
+
+```
+virtual(t) = baseVirtual + f × (t − baseReal)
+```
+
+倍率变化时**重设锚点** `(baseReal, baseVirtual)`。若直接算 `t × f`，每次改倍率都会让
+虚拟时钟整体跳变甚至倒退，App 里所有 `now − last` 会算出负数或巨大值 —— 表现为动画
+抽搐、倒计时乱跳、超时逻辑失效。重锚定后时钟连续且单调，只是斜率变了。
+
+该算法已由 `tools/test_time_dilation.py` 验证四条不变量（全绿）：
+恒等性 / 单调性 / 连续性 / 速率正确性（0.5×–50× 全档，最大跳变 0.9990 ≤ 1）。
+
+### 门控：默认关 + 白名单（双闸）
+
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `TimeMode` | BOOL | `NO` | 全局总开关 |
+| `TimeModeApps` | 数组 | 空 | Bundle ID 白名单，**空数组 = 无人启用** |
+| `TimeModeDeep` | BOOL | `NO` | 连 App 自带 framework 一起重绑定 |
+| `AppOverrides.<bid>.TimeMode` | BOOL | — | 只能关，不能替白名单外的 App 打开 |
+
+三者之上运行时还要再过一遍现有的 `SIO_blocked()`
+（总开关 / 黑名单 / 系统减弱动态效果 / 微信预览放大态 / 本项目自绘 UI）。
+
+### 落地方式：符号重绑定（fishhook 机制的内建实现）
+
+只重绑定 `CACurrentMediaTime`，且只改**主二进制自己**的 `__DATA` 段间接符号表。
+不引入外部依赖（自 v2.0.7 起的编译约束是「只链接 UIKit + QuartzCore」）。
+
+**刻意不碰的东西**（红线，由 `check_v250.py` 的 V250-11 强制）：
+- 不 hook `mach_absolute_time` / `gettimeofday` / `clock_gettime` / `CFAbsoluteTimeGetCurrent`
+  —— 缩放墙钟会搞坏 TLS 证书校验、JWT/OAuth 过期、HTTP 缓存、FairPlay DRM 租期、自动锁屏。
+- 不改 `__DATA_CONST`（iOS 14+ 该段在 dyld 修正后为只读，写入会 `EXC_BAD_ACCESS`）。
+- 不改系统镜像（在 dyld 共享缓存里，等于 patch 系统库，且过不了 AMFI）。
+
+### 这不是完整方案
+
+折中路线的明确边界：**管不到 UIKit / QuartzCore 内部**（它们走 `mach_absolute_time`
+且位于共享缓存）。要全覆盖必须上内联 hook（Dobby / ElleKit / Substrate）+ arm64e PAC
+处理，那是另一个量级的工作。本轮先回答一个前提问题 —— **时间膨胀对 iOS App 到底
+有没有可感知收益**，再决定要不要投入做完整方案。
+
+安装结果会打进日志；若主二进制里没有可重绑定的槽位，`hits = 0` 会明确告警
+（"装了但没生效"是本文件反复出过的事故类型，不能静默）。
+
 ## v2.5.0 性能：让已经写好的优化真正生效
 
 对 v2.4.0 做的性能审计。前几轮（v2.0.7 / v2.1.0 / v2.2.0）的优化方向都对、
