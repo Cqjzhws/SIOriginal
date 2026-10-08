@@ -127,7 +127,9 @@ static inline int ts_clk_domain(clock_id_t c) {
         case CLOCK_UPTIME_RAW_APPROX:
 #endif
             return TS_DOMAIN_ABS;
+#ifdef CLOCK_CONTINUOUS             // Apple SDK 无此常量（FreeBSD 系才有）
         case CLOCK_CONTINUOUS:
+#endif
 #ifdef CLOCK_MONOTONIC_SAFE
         case CLOCK_MONOTONIC_SAFE:      // 语义含休眠时长 → 连续域
 #endif
@@ -259,9 +261,9 @@ static id ts_tm_initFireDateTRSUR(id self, SEL _cmd, NSDate *d, NSTimeInterval t
     if (gTS_tmDepth > 0)
         return ((TS_initFDateTRSUR_IMP)o_tm_initFireDateTRSUR)(self, _cmd, d, ti, target, sel, ui, rep);
     gTS_tmDepth++;
-    id r = ((TS_initFDateTRSUR_IMP)o_tm_initFireDateTRSUR)(self, _cmd, d, ts_scaled_interval(ti), target, sel, ui, rep);
+    id res = ((TS_initFDateTRSUR_IMP)o_tm_initFireDateTRSUR)(self, _cmd, d, ts_scaled_interval(ti), target, sel, ui, rep);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 
 typedef id (*TS_initFDateRBlock_IMP)(id, SEL, NSDate *, NSTimeInterval, BOOL, dispatch_block_t);
@@ -270,9 +272,9 @@ static id ts_tm_initFireDateRBlock(id self, SEL _cmd, NSDate *d, NSTimeInterval 
     if (gTS_tmDepth > 0)
         return ((TS_initFDateRBlock_IMP)o_tm_initFireDateRBlock)(self, _cmd, d, ti, rep, blk);
     gTS_tmDepth++;
-    id r = ((TS_initFDateRBlock_IMP)o_tm_initFireDateRBlock)(self, _cmd, d, ts_scaled_interval(ti), rep, blk);
+    id res = ((TS_initFDateRBlock_IMP)o_tm_initFireDateRBlock)(self, _cmd, d, ts_scaled_interval(ti), rep, blk);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 
 typedef id (*TS_cTimerRBlock_IMP)(Class, SEL, NSTimeInterval, BOOL, dispatch_block_t);
@@ -280,17 +282,17 @@ static id ts_tm_cTimerRBlock(Class c, SEL _cmd, NSTimeInterval ti, BOOL rep, dis
     if (gTS_tmDepth > 0)
         return ((TS_cTimerRBlock_IMP)o_tm_cTimerRBlock)(c, _cmd, ti, rep, blk);
     gTS_tmDepth++;
-    id r = ((TS_cTimerRBlock_IMP)o_tm_cTimerRBlock)(c, _cmd, ts_scaled_interval(ti), rep, blk);
+    id res = ((TS_cTimerRBlock_IMP)o_tm_cTimerRBlock)(c, _cmd, ts_scaled_interval(ti), rep, blk);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 static id ts_tm_cSchedRBlock(Class c, SEL _cmd, NSTimeInterval ti, BOOL rep, dispatch_block_t blk) {
     if (gTS_tmDepth > 0)
         return ((TS_cTimerRBlock_IMP)o_tm_cSchedRBlock)(c, _cmd, ti, rep, blk);
     gTS_tmDepth++;
-    id r = ((TS_cTimerRBlock_IMP)o_tm_cSchedRBlock)(c, _cmd, ts_scaled_interval(ti), rep, blk);
+    id res = ((TS_cTimerRBlock_IMP)o_tm_cSchedRBlock)(c, _cmd, ts_scaled_interval(ti), rep, blk);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 
 typedef id (*TS_cTimerTSUR_IMP)(Class, SEL, NSTimeInterval, id, SEL, id, BOOL);
@@ -298,17 +300,17 @@ static id ts_tm_cTimerTSUR(Class c, SEL _cmd, NSTimeInterval ti, id t, SEL s, id
     if (gTS_tmDepth > 0)
         return ((TS_cTimerTSUR_IMP)o_tm_cTimerTSUR)(c, _cmd, ti, t, s, u, r);
     gTS_tmDepth++;
-    id r = ((TS_cTimerTSUR_IMP)o_tm_cTimerTSUR)(c, _cmd, ts_scaled_interval(ti), t, s, u, r);
+    id res = ((TS_cTimerTSUR_IMP)o_tm_cTimerTSUR)(c, _cmd, ts_scaled_interval(ti), t, s, u, r);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 static id ts_tm_cSchedTSUR(Class c, SEL _cmd, NSTimeInterval ti, id t, SEL s, id u, BOOL r) {
     if (gTS_tmDepth > 0)
         return ((TS_cTimerTSUR_IMP)o_tm_cSchedTSUR)(c, _cmd, ti, t, s, u, r);
     gTS_tmDepth++;
-    id r = ((TS_cTimerTSUR_IMP)o_tm_cSchedTSUR)(c, _cmd, ts_scaled_interval(ti), t, s, u, r);
+    id res = ((TS_cTimerTSUR_IMP)o_tm_cSchedTSUR)(c, _cmd, ts_scaled_interval(ti), t, s, u, r);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 
 typedef id (*TS_cTimerInv_IMP)(Class, SEL, NSTimeInterval, NSInvocation *, BOOL);
@@ -316,17 +318,17 @@ static id ts_tm_cTimerInv(Class c, SEL _cmd, NSTimeInterval ti, NSInvocation *in
     if (gTS_tmDepth > 0)
         return ((TS_cTimerInv_IMP)o_tm_cTimerInv)(c, _cmd, ti, inv, r);
     gTS_tmDepth++;
-    id r = ((TS_cTimerInv_IMP)o_tm_cTimerInv)(c, _cmd, ts_scaled_interval(ti), inv, r);
+    id res = ((TS_cTimerInv_IMP)o_tm_cTimerInv)(c, _cmd, ts_scaled_interval(ti), inv, r);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 static id ts_tm_cSchedInv(Class c, SEL _cmd, NSTimeInterval ti, NSInvocation *inv, BOOL r) {
     if (gTS_tmDepth > 0)
         return ((TS_cTimerInv_IMP)o_tm_cSchedInv)(c, _cmd, ti, inv, r);
     gTS_tmDepth++;
-    id r = ((TS_cTimerInv_IMP)o_tm_cSchedInv)(c, _cmd, ts_scaled_interval(ti), inv, r);
+    id res = ((TS_cTimerInv_IMP)o_tm_cSchedInv)(c, _cmd, ts_scaled_interval(ti), inv, r);
     gTS_tmDepth--;
-    return r;
+    return res;
 }
 
 // 本文件的极简 swizzle（与主文件 SIO_swizzleInstance 同规则：幂等、缺方法静默跳过）
