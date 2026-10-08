@@ -361,6 +361,11 @@ static NSArray *gBlacklistItems = nil;
 // 排除表会静默变空 —— 黑名单对保活失效，且没有任何报错。这类「顺序依赖的静默降级」
 // 正是本轮要一并消掉的隐患。
 static BOOL     gReloadDone = NO;
+// v2.5.0：编辑模式安全护栏（来源 FakeCl0ckUp）。桌面图标/Switcher 编辑期间
+// 所有动画加速旁路 —— 用户在拖拽/ rearranging 图标时需要正常动画速度才能
+// 准确定位。SBIconController setIsEditing: 与 SBAppSwitcherController
+// _beginEditing/_stopEditing 在 SpringBoard 进程中被 hook。
+static BOOL     gEditing = NO;
 
 static pthread_key_t gInUIViewAnimKey;
 static pthread_key_t gInPAInitKey;   // v1.8.12：UIViewPropertyAnimator 初始化重入保护
@@ -1278,6 +1283,9 @@ static inline BOOL SIO_blocked(void) {
     // v1.8.9：微信动画加速恢复（实验）——预览 bug 真凶已确认为悬浮球（v1.8.7 永久禁用），
     // 动画 hook 恢复生效；v1.8.4 放大态探测器首次真正启用作为安全网
     if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路（非微信时立即返回 NO）
+    // v2.5.0：编辑模式护栏（来源 FakeCl0ckUp）。桌面图标/Switcher 编辑期间
+    // 所有动画旁路 —— 拖拽重排时加速会导致用户无法准确定位图标。
+    if (gEditing) return YES;
     return NO;
 }
 
@@ -1365,6 +1373,18 @@ static void   (*o_UV_transFrom)(id, SEL, UIView *, UIView *, double, UIViewAnima
 static void   (*o_CASpring_mass)(id, SEL, double);
 static void   (*o_CASpring_stiff)(id, SEL, double);
 static void   (*o_CASpring_damp)(id, SEL, double);
+// v2.5.0：CASpringAnimation setVelocity:（来源 FakeCl0ckUp）。
+// 弹簧物理一致性要求：时间缩放 m 倍时，初速度需同步 ×m 才能在同距离下
+// 保持物理轨迹视觉一致。与 mass/stiff/damp 同族 hook。
+static void   (*o_CASpring_velocity)(id, SEL, double);
+
+// v2.5.0：编辑模式护栏的原始 IMP（来源 FakeCl0ckUp）。
+// SBIconController setIsEditing: 存在于所有 iOS 版本的 SpringBoard；
+// SBAppSwitcherController _beginEditing/_stopEditing 在较新版本存在。
+// 非 SpringBoard 进程这些类不存在，指针永远不被使用。
+static void   (*o_SBIconCtrl_setEditing)(id, SEL, BOOL);
+static void   (*o_SBSwitcher_beginEditing)(id, SEL);
+static void   (*o_SBSwitcher_stopEditing)(id, SEL);
 static void   (*o_nav_push)(id, SEL, UIViewController *, BOOL);
 static void   (*o_nav_pop)(id, SEL, BOOL);
 static void   (*o_nav_popTo)(id, SEL, UIViewController *, BOOL);
@@ -1771,6 +1791,38 @@ static void sio_CASpring_damp(id self, SEL _cmd, double v) {
     SIO_REQUIRE_ORIG(o_CASpring_damp);
     if (SIO_blocked() || !gSpring) { o_CASpring_damp(self, _cmd, v); return; }
     o_CASpring_damp(self, _cmd, v * SIO_springScale());
+}
+
+// v2.5.0：CASpringAnimation setVelocity:（来源 FakeCl0ckUp）。
+// 弹簧时间缩放 m 倍 → 初速度 ×m，保持同距离同物理轨迹的视觉一致性。
+// 加速 ×5 时 velocity 也 ×5，弹簧才能在同压缩距离下「快速弹到位」而非
+// 「以原速跑但路程被缩短」——后者会导致弹簧过冲/欠冲视觉不自然。
+static void sio_CASpring_velocity(id self, SEL _cmd, double v) {
+    SIO_REQUIRE_ORIG(o_CASpring_velocity);
+    if (SIO_blocked() || !gSpring) { o_CASpring_velocity(self, _cmd, v); return; }
+    o_CASpring_velocity(self, _cmd, v * SIO_springScale());
+}
+
+#pragma mark - 编辑模式护栏（来源 FakeCl0ckUp：桌面图标/Switcher 编辑期间旁路加速）
+
+// SBIconController setIsEditing: —— 桌面图标进入/退出编辑态（长按拖拽重排）
+static void sio_SBIconCtrl_setEditing(id self, SEL _cmd, BOOL editing) {
+    SIO_REQUIRE_ORIG(o_SBIconCtrl_setEditing);
+    gEditing = editing;
+    o_SBIconCtrl_setEditing(self, _cmd, editing);
+}
+
+// SBAppSwitcherController _beginEditing / _stopEditing —— Switcher 编辑态
+static void sio_SBSwitcher_beginEditing(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_SBSwitcher_beginEditing);
+    gEditing = YES;
+    o_SBSwitcher_beginEditing(self, _cmd);
+}
+
+static void sio_SBSwitcher_stopEditing(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_SBSwitcher_stopEditing);
+    gEditing = NO;
+    o_SBSwitcher_stopEditing(self, _cmd);
 }
 
 #pragma mark - 导航 / 模态（进阶：事务时长包裹，转场动画交给事务时长统一控制）
@@ -2668,7 +2720,7 @@ static void SIOriginalInit(void) {
     SIO_swizzleClass(uv, @selector(setAnimationDelay:),
                      (IMP)sio_UV_setAnimDelay, (IMP *)&o_UV_setAnimDelay);
 
-    // 弹簧参数 ×3
+    // 弹簧参数 ×4（v2.5.0：补 velocity，来源 FakeCl0ckUp，与 mass/stiff/damp 同族）
     if (spring) {
         SIO_swizzleInstance(spring, @selector(setMass:),
                             (IMP)sio_CASpring_mass, (IMP *)&o_CASpring_mass);
@@ -2676,6 +2728,8 @@ static void SIOriginalInit(void) {
                             (IMP)sio_CASpring_stiff, (IMP *)&o_CASpring_stiff);
         SIO_swizzleInstance(spring, @selector(setDamping:),
                             (IMP)sio_CASpring_damp, (IMP *)&o_CASpring_damp);
+        SIO_swizzleInstance(spring, @selector(setVelocity:),
+                            (IMP)sio_CASpring_velocity, (IMP *)&o_CASpring_velocity);
     }
 
     // 进阶转场 ×7
@@ -2791,6 +2845,29 @@ static void SIOriginalInit(void) {
     }
     // v2.0.5：启动注入确认 toast 已移除（用户反馈：每次打开 App 都弹太烦）
     // 保存配置后的 toast（SIO_showNotifyToast）保留，用于确认设置生效
+
+    // v2.5.0：编辑模式安全护栏（来源 FakeCl0ckUp）。
+    // hook SpringBoard 的 SBIconController setIsEditing: 与
+    // SBAppSwitcherController _beginEditing/_stopEditing ——
+    // 桌面图标/Switcher 进入编辑态时 gEditing=YES，所有动画加速旁路，
+    // 退出编辑态时恢复。这两个类只在 SpringBoard 进程存在，
+    // objc_getClass 在非 SB 进程返回 nil，自动跳过。
+    Class sbIconCtrl = objc_getClass("SBIconController");
+    if (sbIconCtrl) {
+        SIO_swizzleInstance(sbIconCtrl, @selector(setIsEditing:),
+                            (IMP)sio_SBIconCtrl_setEditing, (IMP *)&o_SBIconCtrl_setEditing);
+    }
+    Class sbSwitcher = objc_getClass("SBAppSwitcherController");
+    if (sbSwitcher) {
+        if (class_getInstanceMethod(sbSwitcher, @selector(_beginEditing))) {
+            SIO_swizzleInstance(sbSwitcher, @selector(_beginEditing),
+                                (IMP)sio_SBSwitcher_beginEditing, (IMP *)&o_SBSwitcher_beginEditing);
+        }
+        if (class_getInstanceMethod(sbSwitcher, @selector(_stopEditing))) {
+            SIO_swizzleInstance(sbSwitcher, @selector(_stopEditing),
+                                (IMP)sio_SBSwitcher_stopEditing, (IMP *)&o_SBSwitcher_stopEditing);
+        }
+    }
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
