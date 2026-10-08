@@ -869,6 +869,8 @@ static void SIO_reload(void) {
     double tsf = d[@"TimeScaleFactor"] ? [d[@"TimeScaleFactor"] doubleValue] : 1.5;
     gTimeScaleFactor = (tsf >= 1.0 && tsf <= 5.0) ? tsf : 1.5;
     gTimeScaleSleep = d[@"TimeScaleSleep"] ? [d[@"TimeScaleSleep"] boolValue] : YES;
+    // v2.7.0：白名单模式开关（漏读此键 = App 落盘了但 dylib 永远不生效的假功能）
+    gTSWLMode = d[@"TimeScaleWhitelistMode"] ? [d[@"TimeScaleWhitelistMode"] boolValue] : NO;
     // v2.7.0：时间源白名单（数组，元素为 Bundle ID）。仅在 whitelist 模式开启时参与判定
     if (d[@"TimeScaleWhitelist"] && [d[@"TimeScaleWhitelist"] isKindOfClass:[NSArray class]])
         gTSWhitelist = [d[@"TimeScaleWhitelist"] copy];
