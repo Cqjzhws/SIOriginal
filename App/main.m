@@ -1494,8 +1494,10 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
                         [cfg[@"LongPress"] boolValue] ? @"开" : @"关"];
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
+    NSString *sioVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    NSString *sioBuild = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?";
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.3.0 (build 76)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 %@ (build %@)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"
@@ -1504,6 +1506,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         @"保活：%@\n\n"
         @"【注入方式提醒】\n"
         @"本 App 只负责写配置并发 Darwin 热重载通知；动画引擎 SIOriginal.dylib 需用 TrollFools 注入目标 App。保存配置后，前台目标 App 顶部会出现 1.5 秒生效提示（可在「手感」页关闭）。",
+        sioVer, sioBuild,
         prefsOK ? @"✅" : @"❌",
         uikitOK ? @"✅" : @"❌",
         axOK ? @"✅" : @"❌",
