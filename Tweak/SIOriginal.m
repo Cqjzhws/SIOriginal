@@ -293,13 +293,9 @@
 // 且在 iOS 10+ 全平台可用，与本项目的部署目标一致。
 #import <os/lock.h>
 #import "FUBGNoiseData.h"
-// v2.6.0：时间源缩放引擎（OpenSpeedy 思路移植，P0+P1 见 SIOTimeScale.m）
-#import "SIOTimeScale.h"
 
 #define kPrefDomain  @"com.apple.UIKit"
 #define kPrefPath    @"/var/Managed Preferences/mobile/com.apple.UIKit.plist"
-// v2.7.1：影子配置路径 —— 普通 App 沙盒可读的回退位置（App 侧 WriteConfig 双写）
-#define kShadowPath  @"/var/mobile/Library/Preferences/com.local.sioriginal.plist"
 #define kNotifyName  @"com.local.sioriginal.settingschanged"
 
 // ---------- 配置 ----------
@@ -330,18 +326,6 @@ static BOOL     gRespectReduceMotion = YES;
 // 见 SIO_alignToFrameBoundary() 的完整推导。核心：把缩放后的时长
 // 对齐到「设备帧周期」的整数倍，消除每帧渲染时刻的漂移。
 static BOOL     gFrameAlign = YES;
-// v2.6.0：时间源加速（OpenSpeedy 思路移植）。默认关 —— 它改变的是进程对
-// 单调时间流的感知，游戏引擎（Unity/Cocos/自绘循环）受益最大；
-// 纯 UI App 已有上层动画 hook 覆盖，无谓开启反而徒增音画/网络超时风险。
-static BOOL     gTimeScale = NO;
-static double   gTimeScaleFactor = 1.5;
-static BOOL     gTimeScaleSleep = YES;
-// App 前台状态（v2.6.0：后台自动回落 1.0，回前台恢复，见 SIO_afterBoot 注册处）
-static BOOL gTSForeground = YES;
-// v2.7.0：白名单模式开关（NO=所有 App 生效；YES=仅名单内 App 生效，配置器自身除外）
-static BOOL gTSWLMode = NO;
-// v2.7.0：白名单数组（Bundle ID 列表，copy 语义；NSArray —— 元素按 NSString 校验）
-static NSArray *gTSWhitelist = nil;
 // v2.3.0：帧周期（秒）。惰性求值一次 —— 120Hz=1/120≈0.00833，60Hz=1/60≈0.01667。
 // 取 maximumFramesPerSecond 的倒数；若不可用则回退 60Hz。
 static double   gFramePeriod = 0.0;
@@ -363,24 +347,6 @@ static BOOL     gIsWeChat  = NO;     // 微信缩放预览守卫用（L104）
 // v1.8.12：黑名单在重载时一次性解析成本进程布尔值，热路径零分配（见 SIO_reload）
 static BOOL     gSelfBlacklisted = NO;
 static NSString *gSelfBundle = nil;
-
-// v2.7.0：时间源加速总判定 —— 是否允许在本进程内启用时间缩放。
-// 白名单模式关闭 → 所有 App 生效；开启 → 仅名单内 App 生效。
-// 配置器 App 自身（com.local.sioriginal）无论何种模式一律不启用：设置界面
-// 有动画节奏需求，时间被缩放会让开关/滑杆手感变得不可预期。
-static BOOL SIO_tsAllowed(void) {
-    if (gSelfBundle == nil || [gSelfBundle isEqualToString:@"com.local.sioriginal"]) return NO;
-    // v2.7.1：微信硬保护。微信内部大量依赖真实单调时间（消息调度/心跳/转场时序），
-    // 时间源缩放会破坏其 UI 时序（v2.7.1 前白名单模式关闭时微信也会被放行）。
-    // 无论用户如何配置（含显式加入白名单）都不对微信生效 —— 与列表加速硬保护同思路。
-    if (gIsWeChat) return NO;
-    if (!gTSWLMode) return YES;
-    if (gTSWhitelist.count == 0) return NO;
-    for (NSString *s in gTSWhitelist)
-        if ([s isKindOfClass:[NSString class]] &&
-            [s caseInsensitiveCompare:gSelfBundle] == NSOrderedSame) return YES;
-    return NO;
-}
 // v2.5.0[性能·P0] 清洗后的黑名单条目缓存。
 // 原本这份数组被解析两次：SIO_reload() 解析一遍只为算 gSelfBlacklisted 这一个布尔，
 // 随即在函数末尾丢弃；_fbg_loadPref() 又对同一份 plist 重新
@@ -395,6 +361,11 @@ static NSArray *gBlacklistItems = nil;
 // 排除表会静默变空 —— 黑名单对保活失效，且没有任何报错。这类「顺序依赖的静默降级」
 // 正是本轮要一并消掉的隐患。
 static BOOL     gReloadDone = NO;
+// v2.5.0：编辑模式安全护栏（来源 FakeCl0ckUp）。桌面图标/Switcher 编辑期间
+// 所有动画加速旁路 —— 用户在拖拽/ rearranging 图标时需要正常动画速度才能
+// 准确定位。SBIconController setIsEditing: 与 SBAppSwitcherController
+// _beginEditing/_stopEditing 在 SpringBoard 进程中被 hook。
+static BOOL     gEditing = NO;
 
 static pthread_key_t gInUIViewAnimKey;
 static pthread_key_t gInPAInitKey;   // v1.8.12：UIViewPropertyAnimator 初始化重入保护
@@ -765,12 +736,6 @@ static NSDictionary *SIO_prefSnapshot(void) {
     if (d) return d;
     // 未缓存：磁盘 IO 在锁外做（见上方说明）
     NSDictionary *fresh = [NSDictionary dictionaryWithContentsOfFile:kPrefPath];
-    // v2.7.1[根因修复]：影子路径回退。本 dylib 注入微信等普通 App 后跑在对方沙盒里，
-    // 读不了平台特权的 /var/Managed Preferences；App 侧 v2.7.1 起会同步写一份
-    // 影子副本到 /var/mobile/Library/Preferences/com.local.sioriginal.plist
-    // （普通 App 沙盒允许读）。主路径拿不到就走影子，杜绝「读不到配置 → 全默认值
-    // （加速×5 + 黑名单失效）」—— 那是微信双标题/聊天框打不开的直接根因。
-    if (!fresh) fresh = [NSDictionary dictionaryWithContentsOfFile:kShadowPath];
     os_unfair_lock_lock(&gPrefLock);
     if (!gPrefCache) gPrefCache = fresh;   // 期间可能已被别的线程填好
     d = gPrefCache;
@@ -817,13 +782,6 @@ static void SIO_reload(void) {
         gSpeedMode = NO;
         gRespectReduceMotion = YES;
         gFrameAlign = YES;
-        // v2.6.0：时间源加速默认关（与配置 App 一致）
-        gTimeScale = NO;
-        gTimeScaleFactor = 1.5;
-        gTimeScaleSleep = YES;
-        // v2.7.0：无配置时白名单模式关（与配置 App 默认一致）
-        gTSWLMode = NO;
-        gTSWhitelist = nil;
         gSelfBlacklisted = NO;
         gBlacklistItems  = nil;   // v2.5.0：无配置则无黑名单，保活侧同样取空
         gHasAppOverride  = NO;
@@ -876,18 +834,6 @@ static void SIO_reload(void) {
     // 注意：旧版本写进 plist 的 ProMotion120 键现在被**忽略**（功能已移除），
     // 不做迁移也不报错 —— 那个键对新版dylib 没有任何影响，留在 plist 里无害。
     gFrameAlign = d[@"FrameAlign"] ? [d[@"FrameAlign"] boolValue] : YES;
-    // v2.6.0：时间源加速，缺键默认关；倍率钳制 1.0–5.0（v2.7.0 上限放开，联网 App 靠白名单隔离）
-    gTimeScale = d[@"TimeScale"] ? [d[@"TimeScale"] boolValue] : NO;
-    double tsf = d[@"TimeScaleFactor"] ? [d[@"TimeScaleFactor"] doubleValue] : 1.5;
-    gTimeScaleFactor = (tsf >= 1.0 && tsf <= 5.0) ? tsf : 1.5;
-    gTimeScaleSleep = d[@"TimeScaleSleep"] ? [d[@"TimeScaleSleep"] boolValue] : YES;
-    // v2.7.0：白名单模式开关（漏读此键 = App 落盘了但 dylib 永远不生效的假功能）
-    gTSWLMode = d[@"TimeScaleWhitelistMode"] ? [d[@"TimeScaleWhitelistMode"] boolValue] : NO;
-    // v2.7.0：时间源白名单（数组，元素为 Bundle ID）。仅在 whitelist 模式开启时参与判定
-    if (d[@"TimeScaleWhitelist"] && [d[@"TimeScaleWhitelist"] isKindOfClass:[NSArray class]])
-        gTSWhitelist = [d[@"TimeScaleWhitelist"] copy];
-    else
-        gTSWhitelist = nil;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     // v2.5.0：解析结果（清洗后的条目数组）顺手缓存进 gBlacklistItems，
@@ -964,13 +910,6 @@ static void SIO_reload(void) {
         if (ovr[@"RespectReduceMotion"]) gRespectReduceMotion = [ovr[@"RespectReduceMotion"] boolValue];
         // v2.3.0：帧对齐的 App 级覆盖
         if (ovr[@"FrameAlign"]) gFrameAlign = [ovr[@"FrameAlign"] boolValue];
-        // v2.6.0：时间源加速的 App 级覆盖
-        if (ovr[@"TimeScale"]) gTimeScale = [ovr[@"TimeScale"] boolValue];
-        if (ovr[@"TimeScaleFactor"]) {
-            double tf2 = [ovr[@"TimeScaleFactor"] doubleValue];
-            if (tf2 >= 1.0 && tf2 <= 2.0) gTimeScaleFactor = tf2;
-        }
-        if (ovr[@"TimeScaleSleep"]) gTimeScaleSleep = [ovr[@"TimeScaleSleep"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -985,12 +924,6 @@ static void SIO_reload(void) {
     // v2.5.0：顺带把最热 hook 的换算结果预计算好（见 gImplicitActionDur 说明）。
     // 必须在 gAnimNoop 之后 —— SIO_targetDuration 依赖当前生效配置。
     gImplicitActionDur = SIO_targetDuration(0.25);
-    // v2.6.0：把时间源加速配置推给引擎。总开关叠加主开关 Enabled —— 用户关掉
-    // 「加速总开关」时预期全部功能一起停，时间源缩放不例外。
-    // 后台回落 1.0 由 gTSForeground 承载（见 SIO_afterBoot 注册处）。
-    // 未安装时（首次 SIO_reload 先于 SIO_TS_install）内部自动跳过，
-    // 构造函数会在 install 后用当前配置补一次 apply。
-    SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -1110,13 +1043,6 @@ static BOOL SIO_showToast(NSString *text, BOOL throttle) {
                     [toast removeFromSuperview];
                     SIO_setInternalUI(inner);
                 }];
-                // v2.7.1：兜底移除。宿主 App 动画时序异常时 completion 可能不回调，
-                // toast 会永久残留（v2.7.1 前微信实报「设置已生效」不消失）。
-                // 无论淡出动画是否完成，0.6s 后强制清出视图树。
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (toast.superview) [toast removeFromSuperview];
-                });
             });
         }];
         return YES;
@@ -1357,6 +1283,9 @@ static inline BOOL SIO_blocked(void) {
     // v1.8.9：微信动画加速恢复（实验）——预览 bug 真凶已确认为悬浮球（v1.8.7 永久禁用），
     // 动画 hook 恢复生效；v1.8.4 放大态探测器首次真正启用作为安全网
     if (SIO_wechatZoomPreviewActive()) return YES;   // 微信预览放大态旁路（非微信时立即返回 NO）
+    // v2.5.0：编辑模式护栏（来源 FakeCl0ckUp）。桌面图标/Switcher 编辑期间
+    // 所有动画旁路 —— 拖拽重排时加速会导致用户无法准确定位图标。
+    if (gEditing) return YES;
     return NO;
 }
 
@@ -1444,6 +1373,18 @@ static void   (*o_UV_transFrom)(id, SEL, UIView *, UIView *, double, UIViewAnima
 static void   (*o_CASpring_mass)(id, SEL, double);
 static void   (*o_CASpring_stiff)(id, SEL, double);
 static void   (*o_CASpring_damp)(id, SEL, double);
+// v2.5.0：CASpringAnimation setVelocity:（来源 FakeCl0ckUp）。
+// 弹簧物理一致性要求：时间缩放 m 倍时，初速度需同步 ×m 才能在同距离下
+// 保持物理轨迹视觉一致。与 mass/stiff/damp 同族 hook。
+static void   (*o_CASpring_velocity)(id, SEL, double);
+
+// v2.5.0：编辑模式护栏的原始 IMP（来源 FakeCl0ckUp）。
+// SBIconController setIsEditing: 存在于所有 iOS 版本的 SpringBoard；
+// SBAppSwitcherController _beginEditing/_stopEditing 在较新版本存在。
+// 非 SpringBoard 进程这些类不存在，指针永远不被使用。
+static void   (*o_SBIconCtrl_setEditing)(id, SEL, BOOL);
+static void   (*o_SBSwitcher_beginEditing)(id, SEL);
+static void   (*o_SBSwitcher_stopEditing)(id, SEL);
 static void   (*o_nav_push)(id, SEL, UIViewController *, BOOL);
 static void   (*o_nav_pop)(id, SEL, BOOL);
 static void   (*o_nav_popTo)(id, SEL, UIViewController *, BOOL);
@@ -1850,6 +1791,38 @@ static void sio_CASpring_damp(id self, SEL _cmd, double v) {
     SIO_REQUIRE_ORIG(o_CASpring_damp);
     if (SIO_blocked() || !gSpring) { o_CASpring_damp(self, _cmd, v); return; }
     o_CASpring_damp(self, _cmd, v * SIO_springScale());
+}
+
+// v2.5.0：CASpringAnimation setVelocity:（来源 FakeCl0ckUp）。
+// 弹簧时间缩放 m 倍 → 初速度 ×m，保持同距离同物理轨迹的视觉一致性。
+// 加速 ×5 时 velocity 也 ×5，弹簧才能在同压缩距离下「快速弹到位」而非
+// 「以原速跑但路程被缩短」——后者会导致弹簧过冲/欠冲视觉不自然。
+static void sio_CASpring_velocity(id self, SEL _cmd, double v) {
+    SIO_REQUIRE_ORIG(o_CASpring_velocity);
+    if (SIO_blocked() || !gSpring) { o_CASpring_velocity(self, _cmd, v); return; }
+    o_CASpring_velocity(self, _cmd, v * SIO_springScale());
+}
+
+#pragma mark - 编辑模式护栏（来源 FakeCl0ckUp：桌面图标/Switcher 编辑期间旁路加速）
+
+// SBIconController setIsEditing: —— 桌面图标进入/退出编辑态（长按拖拽重排）
+static void sio_SBIconCtrl_setEditing(id self, SEL _cmd, BOOL editing) {
+    SIO_REQUIRE_ORIG(o_SBIconCtrl_setEditing);
+    gEditing = editing;
+    o_SBIconCtrl_setEditing(self, _cmd, editing);
+}
+
+// SBAppSwitcherController _beginEditing / _stopEditing —— Switcher 编辑态
+static void sio_SBSwitcher_beginEditing(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_SBSwitcher_beginEditing);
+    gEditing = YES;
+    o_SBSwitcher_beginEditing(self, _cmd);
+}
+
+static void sio_SBSwitcher_stopEditing(id self, SEL _cmd) {
+    SIO_REQUIRE_ORIG(o_SBSwitcher_stopEditing);
+    gEditing = NO;
+    o_SBSwitcher_stopEditing(self, _cmd);
 }
 
 #pragma mark - 导航 / 模态（进阶：事务时长包裹，转场动画交给事务时长统一控制）
@@ -2667,20 +2640,16 @@ static inline void SIO_markDyldCost(void) {
 // 就落在首屏渲染之后，不再叠加到 pre-main 的阻塞时间里。
 static void SIO_logFingerprintLater(void) {
     SIO_afterBoot(^{
-        NSLog(@"[SIOriginal] v2.7.1 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
+        NSLog(@"[SIOriginal] v2.5.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
               @"floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d "
               @"feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f "
-              @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms "
-              @"ts=%d/%.2f/%d wl=%d/%lu fg=%d override=%d listGuard=%d "
+              @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms override=%d listGuard=%d "
               @"swaps=%d bootMs=%.2f)",
               gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
               gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
               gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop,
               gSpeedMode, SIO_speedScale(), gRespectReduceMotion, SIO_reduceMotionOn(),
-              gFrameAlign, SIO_framePeriod() * 1000.0,
-              gTimeScale, gTimeScaleFactor, gTimeScaleSleep, gTSWLMode,
-              (unsigned long)gTSWhitelist.count, gTSForeground,
-              gHasAppOverride, gListHardGuarded,
+              gFrameAlign, SIO_framePeriod() * 1000.0, gHasAppOverride, gListHardGuarded,
               gSIOHookSwapCount, gSIODyldCostMs);
     });
 }
@@ -2700,29 +2669,6 @@ static void SIOriginalInit(void) {
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     gIsWeChat = [gSelfBundle isEqualToString:@"com.tencent.xin"];
     SIO_reload();
-
-    // v2.6.0：时间源缩放引擎（OpenSpeedy 思路移植）。安装幂等；
-    // 首次 SIO_reload 里的 apply 因引擎未装被跳过，这里装完立即补一次。
-    SIO_TS_install();
-    SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
-    // 前后台门控：进后台回落 1.0（后台任务/网络超时按真实时间走），回前台恢复。
-    // UIApplication 此刻尚不存在（pre-main），必须经 SIO_afterBoot 推迟到启动后注册。
-    SIO_afterBoot(^{
-        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        NSOperationQueue *mainQ = [NSOperationQueue mainQueue];
-        [nc addObserverForName:UIApplicationDidBecomeActiveNotification
-                       object:nil queue:mainQ
-                  usingBlock:^(NSNotification *note) {
-                      gTSForeground = YES;
-                      SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, YES);
-                  }];
-        [nc addObserverForName:UIApplicationWillResignActiveNotification
-                       object:nil queue:mainQ
-                  usingBlock:^(NSNotification *note) {
-                      gTSForeground = NO;
-                      SIO_TS_apply(SIO_tsAllowed(), gTimeScaleFactor, gTimeScaleSleep, NO);
-                  }];
-    });
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     SIO_settingsChanged,
@@ -2774,7 +2720,7 @@ static void SIOriginalInit(void) {
     SIO_swizzleClass(uv, @selector(setAnimationDelay:),
                      (IMP)sio_UV_setAnimDelay, (IMP *)&o_UV_setAnimDelay);
 
-    // 弹簧参数 ×3
+    // 弹簧参数 ×4（v2.5.0：补 velocity，来源 FakeCl0ckUp，与 mass/stiff/damp 同族）
     if (spring) {
         SIO_swizzleInstance(spring, @selector(setMass:),
                             (IMP)sio_CASpring_mass, (IMP *)&o_CASpring_mass);
@@ -2782,6 +2728,8 @@ static void SIOriginalInit(void) {
                             (IMP)sio_CASpring_stiff, (IMP *)&o_CASpring_stiff);
         SIO_swizzleInstance(spring, @selector(setDamping:),
                             (IMP)sio_CASpring_damp, (IMP *)&o_CASpring_damp);
+        SIO_swizzleInstance(spring, @selector(setVelocity:),
+                            (IMP)sio_CASpring_velocity, (IMP *)&o_CASpring_velocity);
     }
 
     // 进阶转场 ×7
@@ -2897,6 +2845,29 @@ static void SIOriginalInit(void) {
     }
     // v2.0.5：启动注入确认 toast 已移除（用户反馈：每次打开 App 都弹太烦）
     // 保存配置后的 toast（SIO_showNotifyToast）保留，用于确认设置生效
+
+    // v2.5.0：编辑模式安全护栏（来源 FakeCl0ckUp）。
+    // hook SpringBoard 的 SBIconController setIsEditing: 与
+    // SBAppSwitcherController _beginEditing/_stopEditing ——
+    // 桌面图标/Switcher 进入编辑态时 gEditing=YES，所有动画加速旁路，
+    // 退出编辑态时恢复。这两个类只在 SpringBoard 进程存在，
+    // objc_getClass 在非 SB 进程返回 nil，自动跳过。
+    Class sbIconCtrl = objc_getClass("SBIconController");
+    if (sbIconCtrl) {
+        SIO_swizzleInstance(sbIconCtrl, @selector(setIsEditing:),
+                            (IMP)sio_SBIconCtrl_setEditing, (IMP *)&o_SBIconCtrl_setEditing);
+    }
+    Class sbSwitcher = objc_getClass("SBAppSwitcherController");
+    if (sbSwitcher) {
+        if (class_getInstanceMethod(sbSwitcher, @selector(_beginEditing))) {
+            SIO_swizzleInstance(sbSwitcher, @selector(_beginEditing),
+                                (IMP)sio_SBSwitcher_beginEditing, (IMP *)&o_SBSwitcher_beginEditing);
+        }
+        if (class_getInstanceMethod(sbSwitcher, @selector(_stopEditing))) {
+            SIO_swizzleInstance(sbSwitcher, @selector(_stopEditing),
+                                (IMP)sio_SBSwitcher_stopEditing, (IMP *)&o_SBSwitcher_stopEditing);
+        }
+    }
     } @catch (NSException *e) {
         NSLog(@"[SIOriginal] hook install failed (feature degraded, app unaffected): %@", e);
     }
@@ -3770,8 +3741,7 @@ static BOOL _fbg_isExcluded(void) {
 }
 
 static void _fbg_recalc(void) {
-    // v2.7.1：微信不参与保活（场景伪造/音频保活对微信的生命周期管理有干扰风险）
-    gActive   = gFUBGEnabled && !gLocalOff && !gIsWeChat && !_fbg_isExcluded();
+    gActive   = gFUBGEnabled && !gLocalOff && !_fbg_isExcluded();
     gUseScene = gActive && gSceneFake;
     gUseAudio = gActive && gAudioKeep;
 }
