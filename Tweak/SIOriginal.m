@@ -4034,6 +4034,8 @@ static void _fbg_stopWatchdog(void) {
     }
 }
 
+static void _fbg_watchdogFire(NSTimer *t);  // 前向声明：下方 timer block 先于定义引用
+
 static void _fbg_startWatchdog(void) {
     if (!gUseAudio) return;          // 不用音频断言 → 定时器永远无事可做
     if (gWatchdog) return;           // 已在跑
