@@ -49,7 +49,7 @@ jobs:
           -Wl,-no_fixup_chains \
           -install_name @rpath/SIOriginal.dylib \
           -o SIOriginal.dylib \
-          Tweak/SIOriginal.m
+          Tweak/SIOriginal.m Tweak/SIOTimeScale.m Tweak/fishhook.c
         # v1.8.19 关键修复：注入用 dylib 必须「不带任何 entitlement」ad-hoc 签名。
         # 旧流程 ldid -Sentitlements.plist 把 platform-application / no-sandbox /
         # persona-mgmt / AppDataContainers 等私有 entitlement 嵌进 dylib；

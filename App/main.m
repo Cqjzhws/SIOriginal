@@ -206,6 +206,9 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"Notify"])           d[@"Notify"]           = @YES;
     if (!d[@"LayoutAccel"])      d[@"LayoutAccel"]      = @NO;
     if (!d[@"FrameAlign"])         d[@"FrameAlign"]         = @YES;
+    if (!d[@"TimeScale"])          d[@"TimeScale"]          = @NO;
+    if (!d[@"TimeScaleFactor"])    d[@"TimeScaleFactor"]    = @1.5;
+    if (!d[@"TimeScaleSleep"])     d[@"TimeScaleSleep"]     = @YES;
     if (!d[@"SpeedMode"])         d[@"SpeedMode"]         = @NO;
     if (!d[@"RespectReduceMotion"]) d[@"RespectReduceMotion"] = @YES;
     if (!d[@"Blacklist"])        d[@"Blacklist"]        = @[ @"com.tencent.wework" ];
@@ -234,6 +237,8 @@ static BOOL WriteConfig(NSMutableDictionary *cfg, NSNumber *dragCoeff) {
                           @"FastScroll", @"FastTap", @"LongPress", @"LongPressDuration",
                           @"Floor", @"LayerBoost", @"TransitionBoost", @"Notify",
                           @"LayoutAccel", @"FrameAlign",
+                          // v2.6.0：时间源加速三键（漏加 = 界面有开关但 dylib 读不到的假功能）
+                          @"TimeScale", @"TimeScaleFactor", @"TimeScaleSleep",
                           // v2.1.0：新增两键。若忘记加入这个白名单，
                           // dylib 侧永远读不到用户设置 —— 又是「界面有开关但无效」的假功能。
                           @"SpeedMode", @"RespectReduceMotion",
@@ -552,6 +557,10 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout;
     // v2.1.0：新增两个开关（速率引擎 / 辅助功能让位）
     UISwitch *_swSpeedMode, *_swRespectRM, *_swFrameAlign;
+    // v2.6.0：时间源加速（游戏引擎专用，OpenSpeedy 思路移植）
+    UISwitch *_swTimeScale, *_swTimeScaleSleep;
+    UISlider *_sliderTS;
+    UILabel  *_sliderTSLabel;
     UISegmentedControl *_segLongPress;
     UITextView *_blacklist;
     // 系统
@@ -694,7 +703,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.5.0 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.6.0 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -893,6 +902,30 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"帧对齐引擎（消除时长抖动，60Hz 也生效）" icon:@"rectangle.grid.1x2" iconColor:[UIColor systemTealColor] control:_swFrameAlign] isLast:NO];
     UILabel *faHint = [self label:@"把加速后的动画时长对齐到屏幕每一帧的边界（60Hz 屏为 16.7ms 的整数倍，高刷屏同理按其帧长对齐）。时长不整除帧周期时每帧渲染时刻会漂移，视觉上表现为顿挫。本功能只读取设备刷新率用于时长计算，不会修改或强制任何帧率。" size:12 dim:YES];
     [c2 addRow:[self hintRow:faHint] isLast:NO];
+
+    // v2.6.0：时间源加速（OpenSpeedy 思路移植，游戏引擎专用）。
+    // 与上层动画 hook 是互补的两层：动画 hook 缩放「传给系统的时长参数」，
+    // 本引擎缩放「进程读到的单调时间」—— 覆盖 Unity/Cocos 等按 dt 积算的
+    // 自绘循环。挂钟恒不缩放（证书校验/服务器对账依赖真实时间）；
+    // 后台自动回落 1.0；倍率封顶 2.0。
+    _swTimeScale = [[UISwitch alloc] init];
+    BOOL tsDef = cfg[@"TimeScale"] ? [cfg[@"TimeScale"] boolValue] : NO;
+    _swTimeScale.on = tsDef;
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"时间源加速（游戏引擎）" icon:@"timer" iconColor:SIOMintColor() control:_swTimeScale] isLast:NO];
+    double tsFactor = cfg[@"TimeScaleFactor"] ? [cfg[@"TimeScaleFactor"] doubleValue] : 1.5;
+    if (tsFactor < 1.0 || tsFactor > 2.0) tsFactor = 1.5;
+    _sliderTSLabel = [self label:[NSString stringWithFormat:@"×%.2f", tsFactor] size:15 dim:YES];
+    _sliderTS = [[UISlider alloc] init];
+    _sliderTS.minimumValue = 1.0; _sliderTS.maximumValue = 2.0;
+    _sliderTS.value = tsFactor;
+    [_sliderTS addTarget:self action:@selector(tsSliderChanged) forControlEvents:UIControlEventValueChanged];
+    [_sliderTS.widthAnchor constraintEqualToConstant:140].active = YES;
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"时间倍率" icon:@"gauge.with.needle" iconColor:SIOMintColor() control:_sliderTS] isLast:NO];
+    _swTimeScaleSleep = [[UISwitch alloc] init];
+    _swTimeScaleSleep.on = cfg[@"TimeScaleSleep"] ? [cfg[@"TimeScaleSleep"] boolValue] : YES;
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"同时缩短引擎休眠（usleep/sleep）" icon:@"zzz" iconColor:SIOMintColor() control:_swTimeScaleSleep] isLast:NO];
+    UILabel *tsHint = [self label:@"缩放游戏引擎读到的单调时钟（mach_absolute_time / clock_gettime 等），逻辑帧 dt 变大 → 游戏逻辑加速，vsync 与系统节拍不变。挂钟永不缩放；进后台自动回落 1.0 倍；联网游戏、音视频 App 慎开（有超时缩短与音画偏移风险）。纯 UI App 无需开启，动画加速已由上方选项覆盖。" size:12 dim:YES];
+    [c2 addRow:[self hintRow:tsHint] isLast:NO];
 
     // v2.1.0[新功能 8]：速率加速引擎。
     // 开关语义与「加速倍率」互斥：开启后不再压缩动画时长，改为提高播放速率。
@@ -1185,6 +1218,13 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     }];
 }
 
+// v2.6.0：时间倍率滑杆（1.00–2.00，两位小数 —— 这个倍率档位需要细颗粒）
+- (void)tsSliderChanged {
+    [self coalesce:@"tsfactor" block:^{
+        _sliderTSLabel.text = [NSString stringWithFormat:@"×%.2f", _sliderTS.value];
+    }];
+}
+
 - (void)floorChanged { [self updateFloorHint]; }
 - (void)updateFloorHint {
     [self coalesce:@"floor" block:^{
@@ -1333,6 +1373,10 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (_swZoom) { cfg[@"ZoomAccel"] = @(_swZoom.on); }
     if (_swLayout) { cfg[@"LayoutAccel"] = @(_swLayout.on); }
     if (_swFrameAlign) { cfg[@"FrameAlign"] = @(_swFrameAlign.on); }
+    // v2.6.0：时间源加速三键落盘
+    if (_swTimeScale) { cfg[@"TimeScale"] = @(_swTimeScale.on); }
+    if (_sliderTS) { cfg[@"TimeScaleFactor"] = @((double)_sliderTS.value); }
+    if (_swTimeScaleSleep) { cfg[@"TimeScaleSleep"] = @(_swTimeScaleSleep.on); }
     // v2.1.0：新开关落盘
     if (_swSpeedMode) { cfg[@"SpeedMode"] = @(_swSpeedMode.on); }
     if (_swRespectRM) { cfg[@"RespectReduceMotion"] = @(_swRespectRM.on); }

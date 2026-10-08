@@ -293,6 +293,8 @@
 // 且在 iOS 10+ 全平台可用，与本项目的部署目标一致。
 #import <os/lock.h>
 #import "FUBGNoiseData.h"
+// v2.6.0：时间源缩放引擎（OpenSpeedy 思路移植，P0+P1 见 SIOTimeScale.m）
+#import "SIOTimeScale.h"
 
 #define kPrefDomain  @"com.apple.UIKit"
 #define kPrefPath    @"/var/Managed Preferences/mobile/com.apple.UIKit.plist"
@@ -326,6 +328,14 @@ static BOOL     gRespectReduceMotion = YES;
 // 见 SIO_alignToFrameBoundary() 的完整推导。核心：把缩放后的时长
 // 对齐到「设备帧周期」的整数倍，消除每帧渲染时刻的漂移。
 static BOOL     gFrameAlign = YES;
+// v2.6.0：时间源加速（OpenSpeedy 思路移植）。默认关 —— 它改变的是进程对
+// 单调时间流的感知，游戏引擎（Unity/Cocos/自绘循环）受益最大；
+// 纯 UI App 已有上层动画 hook 覆盖，无谓开启反而徒增音画/网络超时风险。
+static BOOL     gTimeScale = NO;
+static double   gTimeScaleFactor = 1.5;
+static BOOL     gTimeScaleSleep = YES;
+// App 前台状态（v2.6.0：后台自动回落 1.0，回前台恢复，见 SIO_afterBoot 注册处）
+static BOOL     gTSForeground = YES;
 // v2.3.0：帧周期（秒）。惰性求值一次 —— 120Hz=1/120≈0.00833，60Hz=1/60≈0.01667。
 // 取 maximumFramesPerSecond 的倒数；若不可用则回退 60Hz。
 static double   gFramePeriod = 0.0;
@@ -777,6 +787,10 @@ static void SIO_reload(void) {
         gSpeedMode = NO;
         gRespectReduceMotion = YES;
         gFrameAlign = YES;
+        // v2.6.0：时间源加速默认关（与配置 App 一致）
+        gTimeScale = NO;
+        gTimeScaleFactor = 1.5;
+        gTimeScaleSleep = YES;
         gSelfBlacklisted = NO;
         gBlacklistItems  = nil;   // v2.5.0：无配置则无黑名单，保活侧同样取空
         gHasAppOverride  = NO;
@@ -829,6 +843,11 @@ static void SIO_reload(void) {
     // 注意：旧版本写进 plist 的 ProMotion120 键现在被**忽略**（功能已移除），
     // 不做迁移也不报错 —— 那个键对新版dylib 没有任何影响，留在 plist 里无害。
     gFrameAlign = d[@"FrameAlign"] ? [d[@"FrameAlign"] boolValue] : YES;
+    // v2.6.0：时间源加速，缺键默认关；倍率钳制 1.0–2.0（联网超时/反作弊风险）
+    gTimeScale = d[@"TimeScale"] ? [d[@"TimeScale"] boolValue] : NO;
+    double tsf = d[@"TimeScaleFactor"] ? [d[@"TimeScaleFactor"] doubleValue] : 1.5;
+    gTimeScaleFactor = (tsf >= 1.0 && tsf <= 2.0) ? tsf : 1.5;
+    gTimeScaleSleep = d[@"TimeScaleSleep"] ? [d[@"TimeScaleSleep"] boolValue] : YES;
 
     // v1.8.12：黑名单一次性解析为布尔值（兼容 NSArray / NSString 两种格式）
     // v2.5.0：解析结果（清洗后的条目数组）顺手缓存进 gBlacklistItems，
@@ -905,6 +924,13 @@ static void SIO_reload(void) {
         if (ovr[@"RespectReduceMotion"]) gRespectReduceMotion = [ovr[@"RespectReduceMotion"] boolValue];
         // v2.3.0：帧对齐的 App 级覆盖
         if (ovr[@"FrameAlign"]) gFrameAlign = [ovr[@"FrameAlign"] boolValue];
+        // v2.6.0：时间源加速的 App 级覆盖
+        if (ovr[@"TimeScale"]) gTimeScale = [ovr[@"TimeScale"] boolValue];
+        if (ovr[@"TimeScaleFactor"]) {
+            double tf2 = [ovr[@"TimeScaleFactor"] doubleValue];
+            if (tf2 >= 1.0 && tf2 <= 2.0) gTimeScaleFactor = tf2;
+        }
+        if (ovr[@"TimeScaleSleep"]) gTimeScaleSleep = [ovr[@"TimeScaleSleep"] boolValue];
     }
 
     // ---- v1.8.14：列表 hook 硬保护，必须放在所有覆盖之后，优先级最高 ----
@@ -919,6 +945,12 @@ static void SIO_reload(void) {
     // v2.5.0：顺带把最热 hook 的换算结果预计算好（见 gImplicitActionDur 说明）。
     // 必须在 gAnimNoop 之后 —— SIO_targetDuration 依赖当前生效配置。
     gImplicitActionDur = SIO_targetDuration(0.25);
+    // v2.6.0：把时间源加速配置推给引擎。总开关叠加主开关 Enabled —— 用户关掉
+    // 「加速总开关」时预期全部功能一起停，时间源缩放不例外。
+    // 后台回落 1.0 由 gTSForeground 承载（见 SIO_afterBoot 注册处）。
+    // 未安装时（首次 SIO_reload 先于 SIO_TS_install）内部自动跳过，
+    // 构造函数会在 install 后用当前配置补一次 apply。
+    SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
 }
 
 static void SIO_installiOS16Extras(void); // forward declaration
@@ -2588,16 +2620,19 @@ static inline void SIO_markDyldCost(void) {
 // 就落在首屏渲染之后，不再叠加到 pre-main 的阻塞时间里。
 static void SIO_logFingerprintLater(void) {
     SIO_afterBoot(^{
-        NSLog(@"[SIOriginal] v2.5.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
+        NSLog(@"[SIOriginal] v2.6.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
               @"floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d "
               @"feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f "
-              @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms override=%d listGuard=%d "
+              @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms "
+              @"ts=%d/%.2f/%d fg=%d override=%d listGuard=%d "
               @"swaps=%d bootMs=%.2f)",
               gSelfBundle, gEnabled, gMode, gSpeed, gSlowFactor, gFloor, gLayerBoost, gTransitionBoost,
               gSpring, gExtra, gListAccel, gZoomAccel, gFastScroll, gFastTap,
               gLongPress, gLongPressDuration, gNotify, gLayoutAccel, gAnimNoop,
               gSpeedMode, SIO_speedScale(), gRespectReduceMotion, SIO_reduceMotionOn(),
-              gFrameAlign, SIO_framePeriod() * 1000.0, gHasAppOverride, gListHardGuarded,
+              gFrameAlign, SIO_framePeriod() * 1000.0,
+              gTimeScale, gTimeScaleFactor, gTimeScaleSleep, gTSForeground,
+              gHasAppOverride, gListHardGuarded,
               gSIOHookSwapCount, gSIODyldCostMs);
     });
 }
@@ -2617,6 +2652,29 @@ static void SIOriginalInit(void) {
     gSelfBundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     gIsWeChat = [gSelfBundle isEqualToString:@"com.tencent.xin"];
     SIO_reload();
+
+    // v2.6.0：时间源缩放引擎（OpenSpeedy 思路移植）。安装幂等；
+    // 首次 SIO_reload 里的 apply 因引擎未装被跳过，这里装完立即补一次。
+    SIO_TS_install();
+    SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, gTSForeground);
+    // 前后台门控：进后台回落 1.0（后台任务/网络超时按真实时间走），回前台恢复。
+    // UIApplication 此刻尚不存在（pre-main），必须经 SIO_afterBoot 推迟到启动后注册。
+    SIO_afterBoot(^{
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        NSOperationQueue *mainQ = [NSOperationQueue mainQueue];
+        [nc addObserverForName:UIApplicationDidBecomeActiveNotification
+                       object:nil queue:mainQ
+                  usingBlock:^(NSNotification *note) {
+                      gTSForeground = YES;
+                      SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, YES);
+                  }];
+        [nc addObserverForName:UIApplicationWillResignActiveNotification
+                       object:nil queue:mainQ
+                  usingBlock:^(NSNotification *note) {
+                      gTSForeground = NO;
+                      SIO_TS_apply(gTimeScale && gEnabled, gTimeScaleFactor, gTimeScaleSleep, NO);
+                  }];
+    });
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
                                     SIO_settingsChanged,

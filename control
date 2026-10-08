@@ -1,5 +1,5 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.5.0
+Version: 2.6.0
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.5.0：性能审计修复 —— 启动指纹 NSLog 拆分（不再在 pre-main 触发 UIKit 初始化与私有框架 dlopen）、iOS16Extras 约 55 次 hook 交换移至启动完成后并新增 swaps= 运行时计数、转圈检测 O(1) 否定前置筛（图层树遍历减少 98%）、gPrefCache 改 os_unfair_lock 加锁修复并发释放崩溃隐患、配置读写与落盘改后台串行队列。新增 tools/check_v250.py（性能不变量 ×9）与 tools/bench_v250.py（算法基准 ×4）。保留 v2.4.0 全部 hook 与 v2.3.0 帧对齐引擎。
+Description: 动画加速 Tweak v2.6.0：新增时间源加速引擎（OpenSpeedy 思路移植）—— fishhook 符号重绑定缩放进程读到的单调时钟（mach_absolute_time / mach_continuous_time / clock_gettime 单调族 / CACurrentMediaTime / dispatch_time 相对延时），seqlock 无锁热路径 + 倍率切换锚点重定基（缩放时间单调不减）；P1 节拍缩短（usleep/nanosleep/sleep，≤1ms 不动）与 CADisplayLink timestamp/targetTimestamp/duration、NSTimer 创建 interval 的 ObjC 层缩放。挂钟永不缩放；进后台自动回落 1.0；倍率封顶 2.0。新增配置键 TimeScale / TimeScaleFactor / TimeScaleSleep（支持 App 级覆盖）。保留 v2.5.0 全部功能与性能修复。
