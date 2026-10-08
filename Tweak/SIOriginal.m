@@ -1588,7 +1588,7 @@ static int SIO_rebindSymbolInImage(const struct mach_header *header, intptr_t sl
             uint64_t  count  = sec->size / sizeof(void *);
             void    **slots  = (void **)((uintptr_t)slide + (uintptr_t)sec->addr);
             for (uint64_t j = 0; j < count; j++) {
-                if (start + j >= dysym->indirectsymsize) break;   // 越界保护
+                if (start + j >= dysym->nindirectsyms) break;   // 越界保护（Mach-O dysymtab_command 的字段是 nindirectsyms，无 indirectsymsize）
                 uint32_t symIndex = indirect[start + j];
                 if (symIndex == INDIRECT_SYMBOL_ABS || symIndex == INDIRECT_SYMBOL_LOCAL) continue;
                 if (symIndex >= symtab->nsyms) continue;
@@ -4428,6 +4428,10 @@ static void _fbg_stopAudio(BOOL releaseSession) {
 // 只在「真的进了后台 + 真的用音频断言」时存在。定时器重复启停是幂等的
 // （invalidate 后重建），且 NSTimer 强持有 target block，invalidate 后即释放，
 // 不存在泄漏；重复调用 start 也只会先停旧的再建新的。
+// 前向声明：_fbg_startWatchdog 的 block 会调用 _fbg_watchdogFire，
+// 而 static 定义在其后 —— 不声明会 implicit declaration + static 冲突（v2.5.0 同款教训）
+static void _fbg_watchdogFire(__unused NSTimer *t);
+
 static void _fbg_stopWatchdog(void) {
     if (gWatchdog) {
         [gWatchdog invalidate];
