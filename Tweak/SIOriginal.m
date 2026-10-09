@@ -2588,7 +2588,7 @@ static inline void SIO_markDyldCost(void) {
 // 就落在首屏渲染之后，不再叠加到 pre-main 的阻塞时间里。
 static void SIO_logFingerprintLater(void) {
     SIO_afterBoot(^{
-        NSLog(@"[SIOriginal] v2.5.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
+        NSLog(@"[SIOriginal] v2.6.0 fingerprint: %@ (enabled=%d mode=%d speed=%.1f slow=%.1f "
               @"floor=%.3g layerBoost=%.0f transBoost=%.1f spring=%d extra=%d list=%d zoom=%d "
               @"feel=%d/%d longPress=%d/%.2f notify=%d layout=%d noop=%d speedMode=%d/%.2f "
               @"respectRM=%d rm=%d frameAlign=%d framePeriod=%.2fms override=%d listGuard=%d "
@@ -2782,7 +2782,7 @@ static void SIOriginalInit(void) {
     // 另外 NSLog 本身是同步的（经 os_log / logd），单次格式化 30 个参数在
     // pre-main 也是实打实的耗时，延后同样省下这一段。
     // =========================================================================
-    NSLog(@"[SIOriginal] v2.5.0 core hooks installed in %@ (enabled=%d mode=%d speed=%.1f noop=%d)",
+    NSLog(@"[SIOriginal] v2.6.0 core hooks installed in %@ (enabled=%d mode=%d speed=%.1f noop=%d)",
           gSelfBundle, gEnabled, gMode, gSpeed, gAnimNoop);
     // 延后的完整指纹 + 「启动期已装/延后装」边界说明
     SIO_logFingerprintLater();
@@ -4462,7 +4462,7 @@ static void FUBGEntry(void) {
         // 行为完全等价 —— 因为定时器唯一能做事的条件就是 gPhysBg == YES。
         // =========================================================================
 
-        NSLog(@"[FUBG] v2.5.0 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
+        NSLog(@"[FUBG] v2.6.0 (SIOriginal) loaded in %@: active=%d scene=%d audio=%d ball=%d audioMode=%d%@",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
               gActive, gUseScene, gUseAudio, gShowBall, gHasAudioMode,
               (gHasAudioMode || gUseScene) ? @"" : @" (WARNING: no audio mode & no scene engine)");

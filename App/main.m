@@ -291,20 +291,6 @@ static double ReadUIKitDrag(void) {
     NSNumber *v = d[@"UIAnimationDragCoefficient"];
     return v ? v.doubleValue : 0.0;
 }
-// v2.5.0：正式保存路径已把 drag 并入 WriteConfig（同一文件只写一次，见其说明）。
-// 本函数保留供外部/调试直接调用，标注 unused 以避免 -Wunused-function 告警。
-__attribute__((unused)) static void WriteUIKitDrag(double coeff) {
-    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:UIKitPath] mutableCopy];
-    if (!d) d = [NSMutableDictionary dictionary];
-    if (coeff > 0.0) {
-        d[@"UIAnimationDragCoefficient"] = @(coeff);
-    } else {
-        [d removeObjectForKey:@"UIAnimationDragCoefficient"];
-    }
-    mkdir("/var/Managed Preferences", 0755);
-    mkdir("/var/Managed Preferences/mobile", 0755);
-    [d writeToFile:UIKitPath atomically:YES];
-}
 
 static double DragCoeffForIndex(int i) {
     switch (i) {
@@ -367,12 +353,14 @@ static double TransitionBoostForIndex(int i) {
         case 1:  return 1.5;
         case 2:  return 2.0;
         case 3:  return 3.0;
+        case 4:  return 4.0;
         default: return 1.0;
     }
 }
 static int TransitionBoostIndexForValue(double v) {
     if (v > 1.2 && v < 1.8)  return 1;
     if (v > 1.8 && v < 2.5)  return 2;
+    if (v >= 3.5)            return 4;
     if (v >= 2.5)            return 3;
     return 0;
 }
@@ -694,7 +682,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.5.0 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v2.6.0 Max · 动画加速超强版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -798,7 +786,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     // 转场独立额外倍率
     [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"转场独立额外倍率" subtitle:nil]];
     SIOCardView *c4 = [[SIOCardView alloc] init];
-    _segTrans = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×1.5", @"×2", @"×3" ]];
+    _segTrans = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×1.5", @"×2", @"×3", @"×4" ]];
     _segTrans.selectedSegmentIndex = TransitionBoostIndexForValue([cfg[@"TransitionBoost"] doubleValue]);
     [_segTrans addTarget:self action:@selector(transChanged) forControlEvents:UIControlEventValueChanged];
     [c4 addRow:[[SIOSettingRow alloc] initWithTitle:@"转场倍率" icon:@"rectangle.on.rectangle" iconColor:[UIColor systemIndigoColor] control:_segTrans] isLast:NO];
@@ -1059,7 +1047,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _ovFloor = [[UISegmentedControl alloc] initWithItems:@[ @"0.005", @"0.01", @"0.02", @"0.05" ]];
     [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"时长下限" icon:@"timer" iconColor:[UIColor systemOrangeColor] control:_ovFloor] isLast:NO];
 
-    _ovTrans = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×1.5", @"×2", @"×3" ]];
+    _ovTrans = [[UISegmentedControl alloc] initWithItems:@[ @"×1", @"×1.5", @"×2", @"×3", @"×4" ]];
     [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"转场额外倍率" icon:@"rectangle.on.rectangle" iconColor:[UIColor systemIndigoColor] control:_ovTrans] isLast:NO];
 
     _ovSpring = [[UISwitch alloc] init]; _ovSpring.on = YES;
