@@ -178,6 +178,17 @@ static void Respring(void) {
     SpawnRoot(@"/usr/bin/killall", @[@"-9", @"SpringBoard"]);
 }
 
+// 当前时间 HH:mm:ss（设备本地时区）。自检页每次检测都显示，便于确认点击已生效。
+static NSString *SIONowTime(void) {
+    static NSDateFormatter *fmt;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        fmt = [[NSDateFormatter alloc] init];
+        fmt.dateFormat = @"HH:mm:ss";
+    });
+    return [fmt stringFromDate:[NSDate date]];
+}
+
 static NSMutableDictionary *ReadConfig(void) {
     // v2.5.0：命中缓存时只做一次 mutableCopy（约 30 个键，微秒级），
     // 不再走 mmap + plist 反序列化（毫秒级）。写配置后由 WriteConfig 失效缓存。
@@ -555,6 +566,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UILabel *_ovSpeedLabel, *_ovGuard;
     // 高级 - 自检
     UILabel *_selfCheck;
+    UIButton *_recheckBtn;
     // v2.5.0：UI 更新合并表（见 -coalesce:block:）
     NSMutableDictionary *_pendingUpdates;
 }
@@ -1105,6 +1117,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     // 注入/环境自检
     [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"注入/环境自检" subtitle:nil]];
     UIButton *recheck = [UIButton buttonWithType:UIButtonTypeSystem];
+    _recheckBtn = recheck;
     [recheck setTitle:@"🔍 重新检测" forState:UIControlStateNormal];
     recheck.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
     recheck.backgroundColor = [UIColor systemBlueColor];
@@ -1113,7 +1126,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     recheck.layer.borderWidth = 1;
     recheck.layer.borderColor = [UIColor systemBlueColor].CGColor;
     recheck.translatesAutoresizingMaskIntoConstraints = NO;
-    [recheck addTarget:self action:@selector(onSelfCheck) forControlEvents:UIControlEventTouchUpInside];
+    [recheck addTarget:self action:@selector(onRecheckTapped) forControlEvents:UIControlEventTouchUpInside];
     [recheck.heightAnchor constraintEqualToConstant:50].active = YES;
     [stack addArrangedSubview:recheck];
     SIOCardView *c2 = [[SIOCardView alloc] init];
@@ -1121,7 +1134,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _selfCheck.numberOfLines = 0;
     [c2 addRow:[self hintRow:_selfCheck] isLast:YES];
     [stack addArrangedSubview:c2];
-    [self onSelfCheck];
+    [self runSelfCheck];
 
     // 电源操作
     [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"电源操作（会先自动保存）" subtitle:nil]];
@@ -1463,9 +1476,19 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [self presentViewController:a animated:YES completion:nil];
 }
 
-- (void)onSelfCheck {
+- (void)onRecheckTapped {
+    if (!_recheckBtn.enabled) return;   // 检测进行中，忽略连点
     UIImpactFeedbackGenerator *impact = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [impact impactOccurred];
+    _recheckBtn.enabled = NO;
+    _recheckBtn.alpha = 0.6;
+    _selfCheck.text = @"🔄 正在检测，请稍候…";
+    // 延迟一帧再执行：让“检测中”状态先渲染出来，避免检测瞬间完成看起来像“没反应”
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self runSelfCheck]; });
+}
+
+- (void)runSelfCheck {
     NSMutableDictionary *cfg = ReadConfig();
     BOOL prefsOK = [[NSFileManager defaultManager] isWritableFileAtPath:PrefPath];
     BOOL uikitOK = [[NSFileManager defaultManager] fileExistsAtPath:UIKitPath];
@@ -1483,7 +1506,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
     _selfCheck.text = [NSString stringWithFormat:
-        @"SIOriginal 配置器 2.3.0 (build 76)\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 %@ (build %@)\nBundle ID: %@\n最近检测：%@\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"
@@ -1492,11 +1515,17 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         @"保活：%@\n\n"
         @"【注入方式提醒】\n"
         @"本 App 只负责写配置并发 Darwin 热重载通知；动画引擎 SIOriginal.dylib 需用 TrollFools 注入目标 App。保存配置后，前台目标 App 顶部会出现 1.5 秒生效提示（可在「手感」页关闭）。",
+        [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"2.6.0",
+        [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"60",
+        [NSBundle mainBundle].bundleIdentifier ?: @"com.local.sioriginal",
+        SIONowTime(),
         prefsOK ? @"✅" : @"❌",
         uikitOK ? @"✅" : @"❌",
         axOK ? @"✅" : @"❌",
         engine,
         fubg ? @"开启" : @"关闭"];
+    _recheckBtn.enabled = YES;
+    _recheckBtn.alpha = 1.0;
 }
 
 - (void)onRespring {
