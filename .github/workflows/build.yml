@@ -2,19 +2,19 @@ name: Build IPA & Dylib
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [ '**' ]
+    tags: [ 'v*' ]
   workflow_dispatch:
 
-# v1.8.19：tag 推送时创建 Release 需要 contents: write。
+# tag 推送时创建 Release 需要 contents: write。
 # 默认 GITHUB_TOKEN 只有 Contents: read，softprops/action-gh-release 会 403，
 # 表现为「编译全部成功但工作流最终失败」。
 permissions:
   contents: write
 
-# v2.4.0：同一 tag 上的多次构建只保留最后一次。
-# 教训：移动 tag 触发新构建时，若上一次构建还在跑，两次都会向同名 Release
-# 上传同名资产，后结束的会覆盖先结束的 —— 曾导致旧源码的 IPA 覆盖新源码 IPA。
+# 同一 ref 上的多次构建只保留最后一次。
+# 教训（v2.4.0）：移动 tag 触发新构建时，若上一次还在跑，两次都会向同名 Release
+# 上传同名资产，后结束的覆盖先结束的 —— 曾导致旧源码的 IPA 覆盖新源码 IPA。
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
@@ -27,30 +27,67 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
 
+    # ---------------------------------------------------------------------
+    # 静态核查放在编译之前。
+    # 括号配平 / 原 IMP 判空 / hook 符号配对 / 时长不变量 —— 这些是本项目
+    # 历史上反复出现的错误类别，静态阶段就能拦下，比等 clang 报错更快、
+    # 报错信息也更直白（clang 对宏展开后的错误定位很差）。
+    # ---------------------------------------------------------------------
+    - name: Static source check
+      run: |
+        set -e
+        python3 tools/static_check.py .
+        python3 tools/check_v300.py .
+        python3 tools/check_symbols.py .
+        python3 tools/check_config_keys.py .
+        echo "--- 帧对齐算法验证:"
+        python3 tools/test_frame_align.py
+
     - name: Install ldid
       run: brew install ldid
 
+    # ---------------------------------------------------------------------
+    # 构建 dylib。
+    # 与 v2.x 相比，这里从「编译一个 4772 行的 SIOriginal.m」变成
+    # 「编译 15 个模块 + 一个共享头文件」。顺序无关，clang 一次调用全部编掉。
+    # ---------------------------------------------------------------------
     - name: Build dylib
       run: |
         set -e
-        # v2.0.2：构建 arm64 + arm64e 双架构。
+        SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+
+        # arm64 + arm64e 双架构。
         # A12+ 设备（iPhone XS 及以后）主程序默认加载 arm64e slice；
         # 注入的 dylib 若只有 arm64，TrollFools 注入后 dyld 会拒绝加载，
-        # 表现为「注入成功但功能完全不生效」。必须双架构。
-        # v2.0.7：不再链接 AVFoundation / UserNotifications（启动提速）。
-        # 链接期依赖会让 dyld 在每个注入 App 的冷启动路径上加载整套框架，
-        # 二者已改为运行时惰性解析（dlopen+dlsym / objc_getClass）。
+        # 表现为「注入成功但功能完全不生效」。
         clang -dynamiclib -O2 \
           -arch arm64 -arch arm64e \
-          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -isysroot "$SDK" \
           -target arm64-apple-ios14.0 \
           -framework UIKit -framework QuartzCore -framework CoreGraphics \
           -fobjc-arc \
+          -I Tweak/include -I Tweak \
           -Wl,-no_fixup_chains \
           -install_name @rpath/SIOriginal.dylib \
           -o SIOriginal.dylib \
-          Tweak/SIOriginal.m Tweak/SIOTimeScale.m Tweak/fishhook.c
-        # v1.8.19 关键修复：注入用 dylib 必须「不带任何 entitlement」ad-hoc 签名。
+          Tweak/SIOCore.m \
+          Tweak/SIOPlatform.m \
+          Tweak/SIOConfig.m \
+          Tweak/SIOEngine.m \
+          Tweak/SIOScheduler.m \
+          Tweak/SIOUI.m \
+          Tweak/SIOInstaller.m \
+          Tweak/SIOBackground.m \
+          Tweak/hooks/SIOCoreAnimation.m \
+          Tweak/hooks/SIOUIViewAnim.m \
+          Tweak/hooks/SIOViewControllers.m \
+          Tweak/hooks/SIOControls.m \
+          Tweak/hooks/SIOCollections.m \
+          Tweak/hooks/SIOScrollView.m \
+          Tweak/hooks/SIOHighRefresh.m \
+          Tweak/hooks/SIOSpringBoard.m
+
+        # 注入用 dylib 必须「不带任何 entitlement」ad-hoc 签名。
         # 旧流程 ldid -Sentitlements.plist 把 platform-application / no-sandbox /
         # persona-mgmt / AppDataContainers 等私有 entitlement 嵌进 dylib；
         # TrollFools 注入后宿主是普通第三方 App，dyld/AMFI 加载携带私有
@@ -60,18 +97,17 @@ jobs:
         echo "--- dylib id:"; otool -D SIOriginal.dylib
         echo "--- dylib entitlements (必须为空):"; ldid -e SIOriginal.dylib || true
 
-        # v2.0.7：链接依赖断言 —— dylib 不得再链接 AVFoundation/UserNotifications
+        # 链接依赖断言 —— dylib 不得链接 AVFoundation/UserNotifications。
+        # 这对应红线 #4：不用保活的 App，启动路径上不得出现这两个框架。
         if otool -L SIOriginal.dylib | grep -qE "AVFoundation|UserNotifications"; then
-          echo "::error::dylib 不应链接 AVFoundation/UserNotifications（v2.0.7 起惰性加载）"
+          echo "::error::dylib 不应链接 AVFoundation/UserNotifications（惰性加载）"
           otool -L SIOriginal.dylib
           exit 1
         fi
-        echo "--- 无 AVFoundation/UserNotifications 链接依赖 ✓"
+        echo "--- 无 AVFoundation/UserNotifications 链接依赖 OK"
 
-        # 构建后立即做结构审计：逐条目校验 FAT 架构表 magic / 段覆盖自洽性，
-        # 发现问题直接失败（lipo -info 只读架构名列表，不校验条目是否真能解析）。
-        # 先跑审计脚本自身的回归测试（历史教训：审计脚本 v1 曾把标准 20 字节
-        # fat_arch 误按 24 字节步长解析，把健康产物误报为畸形、误杀 CI）。
+        # FAT 结构审计：逐条目校验架构表 magic / 段覆盖自洽性。
+        # lipo -info 只读架构名列表，不校验条目是否真能解析。
         echo "--- 审计脚本回归测试:"
         python3 tools/test_audit_dylib.py
         echo "--- 结构审计:"
@@ -80,14 +116,14 @@ jobs:
     - name: Build App
       run: |
         set -e
-        # 编译 .app
+        SDK=$(xcrun --sdk iphoneos --show-sdk-path)
         APP_DIR="Payload/SIOriginal.app"
         rm -rf Payload
         mkdir -p "$APP_DIR"
 
         clang -O2 \
           -arch arm64 -arch arm64e \
-          -isysroot $(xcrun --sdk iphoneos --show-sdk-path) \
+          -isysroot "$SDK" \
           -target arm64-apple-ios14.0 \
           -framework UIKit -framework CoreGraphics -framework Foundation \
           -fobjc-arc \
@@ -95,21 +131,24 @@ jobs:
           -o "$APP_DIR/SIOriginal" \
           App/main.m
 
-        # 复制资源
         cp App/Info.plist "$APP_DIR/"
-        for icon in App/AppIcon.png App/Icon-60@2x.png App/Icon-60@3x.png App/Icon-76@2x.png App/Icon-83.5@2x.png; do
+        for icon in App/assets/AppIcon.png App/Icon-60@2x.png App/Icon-60@3x.png \
+                    App/Icon-76@2x.png App/Icon-83.5@2x.png; do
+          [ -f "$icon" ] && cp "$icon" "$APP_DIR/"
+        done
+        for icon in App/assets/*.png; do
           [ -f "$icon" ] && cp "$icon" "$APP_DIR/"
         done
 
         # 配置 App 主程序需要私有 entitlement（写 /var/Managed Preferences、
         # posix_spawn persona 提权重启），由 TrollStore 安装时保留授权。
-        # v1.8.19：对整个 .app 目录 ad-hoc 签名，生成 _CodeSignature/CodeResources
+        # 对整个 .app 目录签名以生成 _CodeSignature/CodeResources
         # （旧流程只签二进制，IPA 内缺包签名清单）。
         codesign --force --sign - --entitlements entitlements.plist \
           --generate-entitlement-der "$APP_DIR"
         codesign -d --entitlements - "$APP_DIR/SIOriginal" || true
 
-        # 打包 IPA
+        # 打 IPA
         rm -f SIOriginal.ipa
         zip -qr SIOriginal.ipa Payload
 
@@ -129,34 +168,21 @@ jobs:
         fi
         echo "== IPA 必须包含包签名清单"
         unzip -l SIOriginal.ipa | grep -q '_CodeSignature/CodeResources'
+        echo "== IPA 必须包含配置 App 主程序"
+        unzip -l SIOriginal.ipa | grep -q 'Payload/SIOriginal.app/SIOriginal'
         ls -l SIOriginal.dylib SIOriginal.ipa
 
-    - name: Static source check
-      run: |
-        set -e
-        # 在花时间编译之前先做静态核查：括号配平 / 原 IMP 判空 / hook 符号配对。
-        # 这些是本项目历史上反复出现过的错误类别（见 README 的 v1.8.12 条目），
-        # 静态阶段就能拦下，比等 clang 报错更快、报错信息也更直白。
-        python3 tools/static_check.py .
-        # 增量语义核查（声明顺序 / TLS key / 配置双分支 / 下限不变量）
-        python3 tools/check_v210.py Tweak/SIOriginal.m
-        # v2.3.0：帧对齐算法验证（整数帧 / 只缩短 / 不足一帧保持原值）
-        python3 tools/test_frame_align.py
-        # v2.5.0：性能不变量核查（启动惰性化 / 配置缓存加锁 / watchdog 成对启停 /
-        #   关联对象合并 / 主线程零 IO）—— 防止性能改动被后续提交悄悄抵消
-        python3 tools/check_v250.py .
-        # v2.5.0：算法层基准（决策次数），未达标即视为性能回退
-        python3 tools/bench_v250.py
-
+    # 产物上传：无论是否打 tag 都上传 artifact，便于手动下载。
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: SIOriginal-Build
+        name: SIOriginal-v3.0.0
         path: |
           SIOriginal.dylib
           SIOriginal.ipa
         if-no-files-found: error
 
+    # tag 推送时额外创建 Release（可直接从 Release 页面下载 IPA）。
     - name: Create Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v2
@@ -164,3 +190,4 @@ jobs:
         files: |
           SIOriginal.dylib
           SIOriginal.ipa
+        generate_release_notes: true

@@ -1,24 +1,37 @@
-# Build artifacts
+# ---- 构建产物 ----
 *.dylib
 *.ipa
+*.deb
 *.o
-*.app/
-Payload/
-build/
-.theos/
-Packages/
-
-# macOS
-.DS_Store
+*.d
+*.a
 *.swp
-*.swo
 
-# Xcode
-*.xcodeproj/xcuserdata/
-*.xcworkspace/xcuserdata/
+# Theos / 编译中间目录
+.theos/
+build/
+packages/
+obj/
+.built/
+
+# ---- Xcode ----
+*.xcuserstate
+xcuserdata/
 DerivedData/
+*.xcworkspace/xcuserdata/
 
-# IDE
+# ---- macOS / Windows ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 编辑器 ----
 .vscode/
 .idea/
-*.sublime-*
+*.code-workspace
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+env/
