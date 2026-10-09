@@ -1,337 +1,246 @@
-# SIOriginal v2.0.6 二进制审计报告
+# ANALYSIS — SIOriginal v3.1 架构分析
 
-审计对象：`SIOriginal.dylib`（498,064 字节）、`SIOriginal.ipa`（109,532 字节）
-审计方式：Mach-O 逐字节结构解析 + 源码静态核查（无编译环境，故未做符号级反汇编）
-
----
-
-## 一、dylib 文件布局
-
-v2.0.6 发布的 dylib 是标准的双架构 FAT 二进制，**两个 slice 均有效**：
-
-```
-偏移        大小         内容
-0x00000     48 B         FAT 头（8B 头 + 2 × 20B fat_arch 条目）
-0x00030     16,336 B     零填充（对齐到 2^14）
-0x04000     238,016 B    slice A — arm64
-0x3DFC0     7,744 B      零填充（slice B 对齐到 2^14 所需）
-0x40000     235,920 B    slice B — arm64e，含 __auth_stubs / __auth_got
-0x79990     —            文件结束（262,144 + 235,920 = 498,064，精确到字节）
-```
-
-正确的 FAT 架构表（大端）：
-
-```
-[0] cputype=0x0100000C (arm64)  subtype=0x0        offset=16,384  size=238,016  align=2^14
-[1] cputype=0x0100000C (arm64e) subtype=0x80000002 offset=262,144 size=235,920  align=2^14
-```
-
-两个 slice 各含 **139 个 `_sio_*` 符号**，功能完全相同（日志文案逐字一致），
-差别仅在 slice B 多了 arm64e 指针认证段。`arm64` 与 `arm64e` 在 139 个功能符号上
-**逐一对应，无一方独有**。
-
-### 更正：本节此前「FAT 第 2 条目畸形」的结论是错的
-
-本报告旧版本声称第 2 条目「声明 x86_64、offset=235,920 指向 ASCII 字符串
-`ppOverride`、是畸形条目」，并据此推断「文件尾部 243,664 字节（48.9%）冗余」。
-**两条都是审计脚本 v1 的解析 bug 造成的误报，产物本身完全健康**：
-
-1. Apple 标准 `struct fat_arch` 就是 **20 字节、无 reserved**（reserved 只存在于
-   `fat_arch_64` 的 32 字节条目）。审计脚本 v1 误按 24 字节步长解析，
-   第 2 条目整体错位 4 字节：arm64e 的 cpusubtype `0x80000002` 被读成 cputype
-   （于是错标为 x86_64）、size `235,920` 被读成 offset。
-2. 偏移 235,920 落在 slice A（16,384..254,400）内部的 `__objc_methname`
-   字符串区 —— 所以"指向 ASCII 文本"是错位解析的必然结果，而非条目损坏。
-3. 「尾部 243,664 字节冗余」同样是误算：把第 2 条目的 size 误读为 14 后，
-   覆盖区间在 254,400 处中断，498,064 − 254,400 = 243,664 被错算成"冗余"。
-   实际两个条目 size 之和 + 头部与对齐空隙 = 文件全长，精确吻合，无冗余。
-
-字节级验证：262,144 + 235,920 = 498,064 = 文件总长，且偏移 262,144 处是合法的
-小端 Mach-O 64 头（cputype/subtype 与 FAT 表声明一致）。
-`tools/audit_dylib.py` 已修正解析，并配 `tools/test_audit_dylib.py` 回归测试。
-
-### 空隙说明
-
-slice A 与 slice B 之间的 7,744 字节零填充是 2^14（16KB）段对齐的必然结果
-（slice A 结束于 254,400，下一个 16KB 边界为 262,144）。现代 iOS arm64 二进制
-普遍使用 16KB 页对齐，属正常现象，不建议为了省这 ~8KB 改用更小对齐。
+> 本文记录 v2.x → v3.0 的**为什么**：每个结构性问题是什么、怎么发现的、
+> v3.0 用什么机制消除、以及残留的已知限制。
+> 与 `OPTIMIZATIONS.md` 的区别：那份讲「优化项与验证」，这份讲「设计决策与取舍」。
 
 ---
 
-## 二、IPA 结构
+## 1. v2.x 的结构性问题（按严重度排序）
 
+### 1.1 三套安装点，互不知道对方存在
+
+**现象**：`SIOriginalInit()`（构造期）装核心两族并顺手装了约 55 个本可延后的 hook；
+`SIO_installiOS16Extras()` 装在哪取决于调用方；列表/按需安装又在第三处。
+
+**后果**：
+- pre-main 交换数远超必要（约 55 次），每次交换都是方法表改动 + 一次
+  `objc_getClass` + `class_getInstanceMethod`。
+- 「开关关了也只是 hook 里判断一下就 return」—— 方法表照改不误，
+  白白承担了交换的启动成本与继承风险。
+- v2.2.0 声称把启动期交换从 53 降到 26，实际仍有 55 次没搬走（人肉清点不可靠）。
+
+**v3.0 的消除机制**：`SIOHookEntry[]` 声明式安装表 + `SIOInstaller` 单一编排。
+每个条目自声明 `stage/gate/minOS/maxOS/needCaps`，编排器不做任何业务判断。
+`gSIOEntryAttempts[]` / `gSIOEntrySkipped[]` / `gSIOEntryFailed[]` 三个计数器
+让「是否真装上了」变成可观测指标，而不是靠人肉清点。
+
+### 1.2 黑名单两套匹配语义
+
+**现象**：动画侧 `SIO_bundleMatches()` 用 `isEqualToString:`（精确）；
+保活侧 `_fbg_isExcluded()` 用 `hasPrefix:`（前缀）。
+
+**后果**（v2.1.0 修的真实 bug）：配置 App 默认写入 `com.tencent.wework`，
+保活侧用前缀匹配会连带排除 `com.tencent.weworkhelper` 等一串无关 App ——
+用户只想排除企业微信，实际排除了一片。
+
+**v3.0 的消除机制**：唯一实现 `SIOBundleMatches()`（精确 + 尾 `*` 前缀，
+即 `com.tencent.wework*` 才做前缀匹配）。保活侧直接复用同一函数，
+不再有第二个判定实现。`check_v300.py` 断言「无重复的前缀匹配实现」。
+
+### 1.3 保活生命周期回调注册在错误的通知中心
+
+**现象**：`UIApplicationDidEnterBackgroundNotification` 注册到
+`CFNotificationCenterGetDarwinNotifyCenter()`。
+
+**后果链**（这是本项目最严重的一次事故）：
 ```
-Payload/SIOriginal.app/
-├── SIOriginal                    373,920 B   主程序
-├── Info.plist                     1,633 B
-├── _CodeSignature/CodeResources    2,874 B
-├── AppIcon.png / Icon-60@2x / Icon-60@3x / Icon-76@2x / Icon-83.5@2x
+Darwin 中心只投递 notify_post() 的名字，NSNotification 名字从不到达
+  → 回调从未触发
+  → gPhysBg 永远 NO
+  → _fbg_startAudio 永不调用（音频断言保活完全不启动）
+  → _fbg_appState 的 `gUseScene && gPhysBg` 恒假（场景伪装也不启动）
+  → _fbg_watchdogFire 首行 `if (!gUseAudio || !gPhysBg) return` 恒 return（自愈轮询也不跑）
 ```
+即「场景伪装 / 音频断言兜底 / 真后台保活」**三个功能从未执行过一行代码**。
 
-| 检查项 | 结果 |
-|---|---|
-| 主程序架构 | FAT，2 条目（arm64 + arm64e，健康；旧报告的"畸形 x86_64 条目"同为步长误解析，offset=177,312 实为 arm64e slice 的 size 被错读为 offset） |
-| 主程序 filetype | 2 = `MH_EXECUTE`，正常 |
-| 最低系统 | iOS 14.0（`minos=0xe0000`），SDK 18.5（`sdk=0x120500`） |
-| `embedded.mobileprovision` | **不存在** |
-| `Frameworks/` 目录 | **不存在** |
-| IPA 内是否含 dylib | **否** |
+**v3.0 的消除机制**：只用 `NSNotificationCenter` 一条生命周期路径，
+并在注释里写明「Darwin 中心只投递 notify_post 的名字，两套系统互不相通」，
+防止后人再次改回。同时移除了两套并存的重复观察者。
 
-### 关键：IPA 与 dylib 无引用关系
+### 1.4 plist 被解析两遍
 
-主程序 23 条 load command 中**没有任何 `LC_LOAD_DYLIB` 指向 `SIOriginal.dylib`**，
-二进制内也搜不到 `SIOriginal.dylib`、`DYLD_INSERT_LIBRARIES`、`dlopen` 字样。
-主程序与 dylib 之间唯一的通信通道是 Darwin 通知
-`com.local.sioriginal.settingschanged`。
+**现象**：动画侧 `SIO_reload()` 读一次，保活侧 `_fbg_loadPref()` 再读一次；
+两边还各自跑一遍 trim + 清洗黑名单。
 
-结论：IPA 是纯配置 App（写入 `/var/Managed Preferences/mobile/com.apple.UIKit.plist`），
-dylib 需由 TrollFools 注入目标 App 生效。二者是**独立交付物**，不存在
-「IPA 内应打包 dylib」的关系。
+**后果**：每次配置读取多一次 `dictionaryWithContentsOfFile:`（含磁盘 IO）；
+更麻烦的是**顺序依赖** —— 若保活侧先跑，`gBlacklistItems` 还是 nil，
+排除表静默变空（黑名单对保活失效）。v2.5.0 为此加了一个「没跑过就自己跑一遍」的兜底，
+但这只是把症状藏起来。
 
-### 签名
+**v3.0 的消除机制**：唯一读盘出口 `SIOPrefSnapshot()`（带 `os_unfair_lock` 缓存），
+保活侧直接复用 `gSIOBlacklistItems` + `SIOAppOverrideLookup()`。
+构造顺序不再影响正确性。`check_v300.py` 断言「plist 读取只在 SIOConfig.m」。
 
-entitlements（主程序）：
+### 1.5 继承污染（v1.8.19 崩溃）
 
-```xml
-<key>get-task-allow</key><true/>
-<key>platform-application</key><true/>
-<key>com.apple.private.security.no-sandbox</key><true/>
-<key>com.apple.private.persona-mgmt</key><true/>
-<key>com.apple.private.security.storage.AppDataContainers</key><true/>
-```
+**现象**：直接 `method_setImplementation(m, newImp)` 而不先尝试 `class_addMethod`。
 
-平台应用级私有授权，配合无 mobileprovision —— TrollStore 式伪签。
-注意主程序**确实带**这些私有授权，这是正确的（配置 App 需要写
-`/var/Managed Preferences` 与提权重启）；`build.sh` 与 CI 均已确保
-**dylib 侧不带任何 entitlement**（`ldid -S` 无参数），这一点当前实现是对的。
+**后果**：若本类没有该方法的自有实现（实现来自父类），
+改的就是**父类**的实现 —— 所有子类都被动改写。
+例如把 `setContentOffset:animated:` 直接换到父类，会让所有 UIView 都进入
+UIScrollView 的判断分支 → 崩溃。
+
+**v3.0 的消除机制**：`SIOExchange()` 内建该防护：
+`class_addMethod` 成功 ⇒ `*orig` 指向**父类**实现；
+失败（本类已有实现）⇒ 才 `method_setImplementation` 并 `*orig = cur`。
+`check_v300.py` 断言「无未标注的裸 method_setImplementation」。
+
+### 1.6 时长下限的反向拉长（v2.1.0 的「假功能」）
+
+**现象**：`d = floor`（无条件把结果设为下限）。
+
+**后果**：比下限更短的微动画会被**抬长**：0.005s → 0.02s，慢 4 倍 ——
+与「加速」语义完全相反。同时导致转场额外倍率被完全抵消
+（0.35 经两级除法落到 0.0058 < floor 0.02，被抬回 0.02，用户调档位看不到变化）。
+
+**v3.0 的消除机制**：下限口径固定为 `min(floor, orig)` ——
+只在原值本就 ≥ 下限时才允许钳制。且顺序不可颠倒：
+必须在下限钳制**之后**做帧对齐，否则下限会把已对齐的值重新抬高。
+`check_v300.py` 与 `test_frame_align.py` 双重断言。
+
+### 1.7 pre-main 的隐性开销
+
+**现象（多个，v2.5.0 集中修）**：
+- 一段 `NSLog` 把 UIKit 初始化与私有框架 `dlopen` 拖进 dyld 期；
+- `_fbg_loadPref()` 二次 `dictionaryWithContentsOfFile:`；
+- 保活 watchdog 在构造期起一个 1.5s 重复定时器并挂 `CommonModes`，
+  而回调首行就是 `if (!gUseAudio || !gPhysBg) return` —— 前台期 100% 空转；
+- `[arg2 description]` 在**调用方**无条件生成（可能数 KB），随后 7 次全串扫描。
+
+**v3.0 的消除机制**：
+- pre-main 收敛到四步（TLS → 平台探测 → 配置 → Boot 档），完整指纹延后输出；
+- watchdog 随前后台生命周期启停；
+- `SIOBgIsBackgroundingDiff` 把下游扫描从「7 次独立全串扫描」降到
+  「1 次定位 + 局部比较」（4 条 foreground 判据都以同一前缀开头）；
+- 昂贵 IO 探测（`stat` 外部路径、`access` 可写性）延后到 `SIOAfterBoot`。
+
+### 1.8 并发崩溃（v2.5.0 的 EXC_BAD_ACCESS）
+
+**现象**：ARC 下给 `__strong` 静态变量赋值会 release 旧值；
+写入方是 Darwin 通知线程，读取方是任意动画线程 ⇒ 悬垂指针。
+
+**v3.0 的消除机制**：`gSIOPrefCache` 用 `os_unfair_lock` 保护；
+磁盘 IO 在锁外做（否则所有动画 hook 会在重载瞬间一起阻塞）；
+重载路径整体走 serial queue。
 
 ---
 
-## 三、源码修复
+## 2. v3.1 的核心抽象
 
-环境限制：当前为 Windows（`win32`，Git Bash），无 Xcode / iOS SDK /
-`ldid` / `codesign`，**无法编译验证**，因此以下改动均经过静态核查与逻辑推演，
-但未经真机运行验证。
+### 2.1 唯一契约：`SIOInternal.h`
 
-### 修复 1：转圈动画缺少缩放标记（真实缺陷）
+把「跨模块共享的一切」集中到一个文件：配置状态、派生量、进程标记、TLS 槽位、
+时长换算引擎（`static inline`）、门控、能力位图、安装表类型、调度器接口、
+配置接口、Toast 接口、保活接口、事务包裹。
 
-`sio_layer_addAnim` 的 `isSpinner` 分支改完时长后**没有调用
-`SIO_markAnimScaled`**，而通用分支的防重复缩放守卫
-`![REDACTED_EMAIL](anim)` 正是依赖这个标记。
+**设计取舍**：时长换算用 `static inline` 放在头文件而不是独立 `.m`。
+理由：这是热路径（每次动画创建都会走），函数调用开销不可接受；
+统一输入为 `gSIOCfg` 保证「全项目只有一份实现」。
 
-`UIActivityIndicatorView` 的 `-setAnimating:` 会把**同一个 CAAnimation 实例**
-反复 `addAnimation:`。没有标记意味着该守卫对这个动画永久失效。
+### 2.2 三档安装栅栏
 
-同时补上原始时长的取值判据：`SIO_getOrigDur` 存的是 App 上一次
-`setDuration:` 传入的值，仅当它与当前 `duration` 一致时才采信，否则用当前值重算。
+| 档位 | 时机 | 内容 | 数量 |
+|---|---|---|---|
+| `Boot` | `__attribute__((constructor))` | 核心两族（CAAnimation / UIView 动画） | 19 |
+| `PostLaunch` | `didFinishLaunching` 后（或 0.35s 超时） | 转场、控件、滚动、长按、SB 护栏 | ~40 |
+| `OnDemand` | `PostLaunch` 之后，且 `gate()` 为真 | 列表、缩放、布局、长按 setter | 0–32 |
 
-```objc
-double cur    = ((CAAnimation *)anim).duration;
-double saved  = SIO_getOrigDur(anim);
-double orig   = (saved > 0.0 && fabs(saved - cur) < 1e-9) ? saved : cur;
-...
-SIO_markAnimScaled(anim);
+**0.35s 超时兜底的必要性**：若某个 App 不投递
+`UIApplicationDidFinishLaunchingNotification`，延后安装会退化为「永不安装」。
+超时兜底把「延后」与「丢失」区分开。
+
+### 2.3 能力位图而非版本号
+
+`SIOCaps` 全部用 `objc_getClass` / `respondsToSelector` / `dlsym` 运行时探测。
+理由：**版本号与 API 可用性不是一一对应关系**（同一个 API 可能在某个小版本被
+改归属，或仅在特定设备上存在）。版本号只作为最后的 fallback，
+且必须配 `@available` 编译守卫（如 `UIWindowScene.windows` 需 iOS 15）。
+
+### 2.4 时长换算的四层结构
+
+```
+SIO_targetDuration          ← 基础：模式分派 + 下限钳制 + 帧对齐
+  ├─ SIO_targetDurationLayer    ← 叠加 LayerBoost（需重做帧对齐）
+  ├─ SIO_targetDurationUIKit    ← 叠加系统系数预除补偿
+  └─ SIO_transitionBase         ← 固定 0.35s 输入 + TransitionBoost
+SIO_targetDelay             ← 延迟同比缩放（0 延迟保持 0）
 ```
 
-**诚实说明**：我最初判断这里存在「逐轮累积加速」的严重 bug，并写了长注释。
-随后用数值模拟逐轮推演，发现**该判断是错的**——`kSIOSpinnerFloor = 0.4` 的钳制
-本已吸收全部漂移（只要 `orig/speed < 0.4`，结果恒为 0.4，与 `orig` 具体值无关；
-不触发钳制时 App 每轮都重新 `setDuration:`，`saved == cur` 恒成立）。
-因此已撤回那段不实注释，只保留「打标」这一项确有价值的改动。
-**教训记录在案**：0.4s 钳制是个吸收器，推断 bug 前应先确认兜底逻辑是否已覆盖。
+**为什么 `SIO_compensatedDivisor` 要「预除」而不是「结果校正」**：
+hook 拦截到的是 App 传入的、**尚未**乘系统系数的值；
+UIKit 会在内部创建动画时再乘一次。因此 hook 侧必须**先除**，
+让 UIKit 乘回来正好等于目标值：`hook 给出 T/c → UIKit 内部再 ×c → 最终 T`。
 
-### 修复 2：注入确认提示的重试退避（体验缺陷）
+### 2.5 系统系数（`UIAnimationDragCoefficient`）的单侧写入设计
 
-`SIO_showInjectToast` 固定 0.6s 重试 5 次，全部挤在头 3 秒内。
-但 `SIO_showToast` 失败的主因是「App 尚未起完 / 无 active scene」，
-属秒级以上事件 —— 0.6s 连打 5 次必然全部落空，等于没有重试。
+v2.5.1 的写法是**双侧写入**：配置 App 写 Managed Preferences，同时 dylib 也向被注入
+App 自己的 `NSUserDefaults` 写一份系数。这带来两个问题：
 
-改为指数退避 `0.5 → 0.75 → 1.1 → 1.7 → 2.5` 秒，累计约 6.5s，
-覆盖真实冷启动窗口，总次数不变（仍为 5 次，不增加打扰）。
+1. **覆盖缺口**：未被注入的 App 拿不到 dylib 写入的那份；而用户开启「全局兜底」
+   的初衷恰恰是覆盖 hook 够不到的地方（SwiftUI 内部动画、私有路径）。
+2. **双写竞争**：两条写入源在同一语义上互相干扰，且 dylib 侧写入发生在每个目标
+   App 的启动路径上（红线 #2 的边界）。
 
-### 修复 3：配置缺失的可观测性
+v3.0 收敛为**单侧写入 + 只读补偿**：
 
-`SIO_reload` 在 plist 不可读时静默 `return` 并回落默认值。用户看到
-「配置没生效」时无从判断是 plist 缺失、路径错、还是权限不足 ——
-而这三者处理方式完全不同。补一条日志说明回落到了默认值及原因。
+| 侧 | 职责 | 位置 |
+|---|---|---|
+| 配置 App | **唯一写入者**。写 `/var/Managed Preferences/mobile/com.apple.UIKit.plist` 的 `UIAnimationDragCoefficient` | `App/main.m` → `WriteConfig(cfg, dragCoeff)`（同一 plist 只写一次） |
+| dylib | **只读者**。读该键 → `c->systemSpeed`，仅用于 `SIO_compensatedDivisor()` 预除补偿 | `Tweak/SIOConfig.m` → `SIOInternal.h` 的 `SIO_targetDurationUIKit()` |
 
-### 未改动但加了防呆注释
-
-`App/main.m` 的 `WriteConfig` 中 `if (cfg[k])` 曾被我误判为 bug
-（以为 `if (id)` 会按 NSNumber 的**值**判真假，导致 `@NO` 写不进 plist）。
-**这是错的**：Objective-C 裸 `id` 条件只判**指针非空**，而 `@NO` 是
-tagged pointer（arm64 上为 `0x4`，非 nil），因此 `@NO` 能正确写入。
-已在源码加注释固化此认知，防止后人误改成值判断而引入真实 bug。
+收益：写入源唯一、覆盖面扩大到全系统（含未被注入的 App）、dylib 启动路径零写入副作用、
+结构上不可能出现「hook 侧再写一份」导致的二次连乘。
 
 ---
 
-## 四、新增工具
+## 3. 已知限制与残留风险
 
-### `tools/static_check.py`
-
-编译前的静态核查，覆盖项目历史上反复出现的三类错误：
-
-- 括号 / 花括号配平（先剥离注释与字符串字面量，避免误计）
-- 原 IMP 判空：识别宏判空、`__builtin_expect`、短路条件内判空、
-  显式布尔判空四种写法（初版只认宏，产生 4 处误报，已修正）
-- hook 符号配对：声明了 `o_xxx` 却从未被赋值
-
-当前结果：**通过**（SIOriginal.m 3033 行、main.m 1410 行均无异常）。
-
-### `tools/audit_dylib.py`
-
-Mach-O 结构审计，逐条目校验 FAT 架构表。已接入 `build.sh` 与
-`.github/workflows/build.yml`，畸形架构条目会直接让构建失败。
-
-修正步长解析后，对 v2.0.6 产物运行的结果（健康）：
-
-```
-[0] arm64      offset=16,384  size=238,016  align=2^14
-[1] arm64e     offset=262,144 size=235,920  align=2^14
-✓ 结构健康：所有 FAT 条目均指向合法 Mach-O，段覆盖自洽。
-```
-
-配套 `tools/test_audit_dylib.py`：用 struct 手工构造 3 个合法样本（双架构 FAT、
-单架构瘦 Mach-O、MH_EXECUTE）与多个畸形样本（offset 越界、size 越界、
-magic 损坏、条目指向 ASCII 区等），断言退出码与关键输出，防止解析器自身回归。
+| 限制 | 说明 | 缓解 |
+|---|---|---|
+| 私有类依赖 | 场景伪装依赖 `FBSWorkspaceScenesClient`；iOS 18 可能改名 | 全部走 `objc_getClass` 探测，拿不到只少一层保护，不崩 |
+| `RootHelper` 在 17.6+/18 失效 | XNU 禁止非 root 二进制 spawn root | `kSIOCapRootHelper` 仅表示「形态上存在」，不作为功能前提 |
+| 列表 hook 的本质风险 | 改写动画时长可能破坏变更状态机 | 默认关 + SpringBoard 硬保护 + 缺键 fail-safe |
+| 内存护栏的还原依赖快照 | 若 `gSIOCfgPristine` 未同步更新，还原会写回旧配置 | 每次 `SIOConfigReload` 后重建快照 |
+| 系统系数需重启生效 | `UIAnimationDragCoefficient` 写入后 UIKit 要下次启动才读 | 属固有特性；hook 路径不受影响，可即时生效 |
+| arm64e 需正确签名 | 单架构 dylib 在 A12+ 上被 dyld 拒绝加载 | CI 强制 `lipo -info` 校验双架构 |
+| 无法在本地（Windows）编译 | 无 clang / iPhoneOS SDK / ldid / zip | 构建走 GitHub Actions（macOS runner） |
 
 ---
 
-## 五、后续建议
+## 4. 从 v2.x 保留下来的「已验证正确」的部分
 
-**加载提速**
+重构的边界是：**只动结构，不动已验证的算法**。以下逻辑逐字保留（仅换位置/换输入源）：
 
-~~旧版本节基于"49% 尾部冗余"的误算给出瘦身建议，已随第一节更正作废。~~
-真实的提速杠杆在 v2.0.7 已落地两条、剩余一条可选：
+- `SIO_framePeriod` / `SIO_alignToFrameBoundary` 的三条安全边界；
+- `SIO_targetDuration` 的模式分派与 `min(floor, orig)` 口径；
+- `SIODurBox`（`double value; BOOL scaled;` 的 POD 盒子）把「原时长」与
+  「已缩放标记」合并进同一个关联对象，减少 `AssociationsManager` 自旋锁竞争；
+- `SIODelegateIsSpinnerCandidate`（16 槽直映缓存）与 `SIOAnimMayBeSpinner`
+  （只做否定的 O(1) 前置筛：属性动画 + 无限重复 + keyPath 含 rotation/transform）；
+- `sio_layer_actionForKey` 的最热路径优化：`key.length > 32` 先否定 →
+  `isKindOfClass` → `fabs(d-0.25) <= 1e-6` 才用预计算的隐式时长经原 IMP 写回；
+- 转圈专属下限 `kSIOSpinnerFloorSec = 0.4`（低于此值会因帧率采样混叠出现频闪/视觉倒转）；
+- `sio_catx_getDur` 命中 `gSIOTxLastSet` 直接原样返回（修双重缩放）；
+- 弹簧参数缩放关系：`stiffness ∝ s²`、`damping/velocity ∝ s`。
 
-1. ✅ 已做（v2.0.7）：dylib 不再链接 AVFoundation / UserNotifications ——
-   链接期依赖会被 dyld 拖进每个注入 App 的冷启动路径；改为运行时惰性解析后，
-   不用保活的 App 启动路径上完全不再加载这两个框架。
-2. ✅ 已做（v2.0.7）：热路径恒等快速路径（gAnimNoop），加速 ×1 时全部
-   CATransaction 包裹点零包裹开销。
-3. 可选（需用户决策）：arm64e 单架构产物可把体积从 ~486KB 降到 ~236KB，
-   代价是放弃 A11 及更早设备（arm64）。A12+ 已占绝对主流，但属兼容性取舍，
-   不默认改。
-
-**功能增强的合理方向**
-
-**功能增强的合理方向**
-
-代码注释里已列出两条线索，值得优先跟进：
-
-- `_gIsWeChat` 特判只覆盖 `com.tencent.xin`，而同类预览放大态问题
-  在其他 App（小红书、淘宝图片预览等）同样存在 —— 可考虑改为
-  「通用放大态探测 + 按 bundle id 灰名单」
-- 注释 [7] 明确列出了**无法用改时长加速**的引擎（SVGA / Lottie /
-  RN Reanimated / Ugen），这些是当前能力边界。若要覆盖需换机制
-  （CADisplayLink 层介入），属独立课题
+**唯一被替换的算法**：`SIO_reduceMotionOn()` 从 v2.x 的私有符号改为
+公开 API `dlsym(RTLD_DEFAULT, "UIAccessibilityIsReduceMotionEnabled")`，
+并加 5 秒 TTL 缓存（避免在动画热路径上反复查询无障碍状态）。
 
 ---
 
-## 六、v2.0.7 变更（源码级，待 GitHub Actions 构建验证）
+## 5. 代码规模对比
 
-- **真 bug 修复**：CATransaction set→get 双重缩放。v2.0.4 的
-  `+animationDuration` getter hook 对已被 setter 缩放（或经
-  `SIO_setTransactionDuration` 原样写入）的值再缩一次。修：`__thread`
-  记录本线程最近写入值 `gTxLastSetDur`，getter 命中即原样返回。
-- **启动提速**：dylib 解除对 AVFoundation / UserNotifications 的链接依赖，
-  音频引擎首次启用时才 `dlopen` + `dlsym`（`SIOAVPlayer`/`SIOAVSession`
-  协议提供编译期签名，枚举值用冻结 ABI 常量内联）；UN 类 `objc_getClass`
-  惰性获取。CI `otool -L` 断言防回退。
-- **热路径**：`gAnimNoop`（加速 ×1 恒等）短路 42 个 CATransaction 包裹点、
-  UIScrollView 滚动 hook、`addAnimation:` 转圈检测链；`setDuration:` 恒等时
-  免关联对象读写；`_fbg_appState` 的 dladdr 判定加 8 槽直映缓存。
-- **新覆盖**：`startAnimationAfterDelay:` 延迟缩放；
-  UIDocumentInteractionController 选项/打开方式菜单。
-- **新功能**：LayoutAccel 开关（默认关）—— `-[UIView layoutIfNeeded]` 包裹，
-  加速 SwiftUI/自动布局隐式动画；配置 App 全局开关 + App 专属覆盖均已落地。
+| | v2.5.0 | v3.0 |
+|---|---|---|
+| Tweak 源码 | 4772 行单文件 | 约 3400 行 / 15 个文件 |
+| 最大单文件 | 4772 行 | 555 行（`SIOBackground.m`） |
+| 安装点 | 3 处 | 1 处（`SIOInstaller`） |
+| 黑名单实现 | 2 套语义 | 1 套 |
+| plist 读取 | 2 处 | 1 处 |
+| pre-main 交换 | 约 55 | 19 |
+| 静态核查项 | 9（v2.5.0） | 14（v3.0）+ 沿用旧项 |
 
-## 八、v2.1.0 变更：致命 bug 修复 + 无损加速引擎
-
-### 8.1 逐行审计发现的问题
-
-对 v2.0.8（3369 行）做逐行审计，定位到 12 处问题，其中 1 处为致命。
-
-| # | 级别 | 问题 | 影响 |
-|---|------|------|------|
-| 1 | **致命** | `UIApplicationDidEnterBackgroundNotification` 被注册到 **Darwin** 通知中心 | NSNotification 名字只经 `NSNotificationCenter` 投递，两套系统互不相通 → `gPhysBg` 恒 `NO` → 音频断言保活/场景伪装/自愈轮询**三个功能全部从未执行** |
-| 2 | 真 bug | 时长下限无条件抬升（`if (d<gFloor) d=gFloor` 与 `case 2: d=gFloor`） | 比下限更短的动画被**拉长**（0.005s → 0.02s，慢 4 倍），凭空造出卡顿 |
-| 3 | 真 bug | 黑名单两套匹配语义（精确 vs 前缀） | `com.tencent.wework` 前缀语义下连带排除一批无关 App |
-| 4 | 真 bug | 自绘 toast 走 `[UIView animateWithDuration:]` 命中自己的 hook | 「设置已生效」提示被二次加速，×20 下 0.0125s，一闪而过 |
-| 5 | 真 bug | 瞬切模式改写 `UIScrollView` 的 `animated:` 语义 | 违反本文件 v1.8.3/v1.8.15 自己写下的禁令；且该hook 不受 ListAccel 门控 |
-| 6 | 性能 | 转圈检测每次 `addAnimation` 做 `NSStringFromClass` + 2× `containsString:` | 稳定堆分配，每秒数十次 |
-| 7 | 性能 | `SIO_saveOrigDur` 用 `@(d)` 装箱 | 显式动画热路径的稳定堆分配 |
-| 8 | 健壮 | 3 个 `pthread_key_create` 不检查返回值 | 任一失败则 `SIO_inXXX` 读到未定义值 |
-| 9 | 假功能 | `SIO_transitionDuration` 里转场倍率压到下限以下时被下限抬回 | 用户调档位看不到变化 |
-| 10 | 覆盖 | `continueAnimationWithTimingParameters:duration:` 未接管 | 链式动画首段加速、续段不加速 |
-| 11 | 覆盖 | `UIWindow setRootViewController:` 未接管 | 换根页面的交叉淡入无加速 |
-| 12 | 语义 | 无障碍意图被覆盖 | 用户开「减弱动态效果」= 明确要求少动效，本项目逆行 |
-
-### 8.2 新增能力
-
-- **速率加速引擎**（`SpeedMode`，默认关）：改 `CAAnimation.speed` / `CALayer.speed`
-  而非 duration。相比压时长有两个结构性优势 ——
-  ① 不存在下限碰撞；② 时长与关键帧时间轴原样保留，
-  弹簧物理积分步长与关键帧插值不失真，不会抽搐/跳变。
-  安全边界：App 显式设 `speed != 1.0`（视频/音频同步）一律透传，只接管默认值 1.0；
-  与时长模式**互斥**（同时生效会得到倍率平方，且双重下限钳制失真）。
-- **辅助功能让位**（默认开）：`dlsym` 惰性解析
-  `UIAccessibilityIsReduceMotionEnabled`，不增加链接依赖。
-- **PA 链式续播 / UIWindow 换根页面** 补齐。
-
-### 8.3 校验工具
-
-新增 `tools/check_v210.py`，做 `static_check.py` 不覆盖的**语义级**核查：
-原IMP 声明/赋值配对、inline 定义先于使用（含前向声明识别）、
-TLS key 创建与判空、配置变量在 `SIO_reload` 两个分支均赋值、
-已删除函数无残留引用、括号配平，以及「下限不得反向拉长动画」这条关键不变量。
-已通过故意注入错误验证有效性。
-
-*本报告基于静态分析生成，未经编译或真机验证。v2.1.0 全部变更建议在
-macOS（GitHub Actions）构建后于真机确认；其中问题 1（保活链路）修复后
-需重点验证后台保活是否真正启动。*
-
-
-## 九、v2.3.0 变更：移除 120Hz，新增帧对齐引擎
-
-### 9.1 移除 ProMotion120
-
-**该功能的实际作用**是改写 App 设定的帧率上限
-（`CADisplayLink.setPreferredFramesPerSecond:` 的 60 → 设备上限、
-`setPreferredFrameRateRange:` 的 maximum/preferred 拓宽）。
-
-**移除理由**：
-1. 不解决「感觉不流畅」的主要成因 —— 卡顿根源是帧时间不稳定，
-   而 120Hz 只是把帧周期从 16.67ms 减到 8.33ms；时长不对齐帧栅格时余数依然存在。
-2. 功耗代价明确 —— 全局 120Hz 让 GPU/CPU 多渲染一倍帧数。
-3. 干预面广 —— 拦的是所有App 的渲染循环，属最侵入式 hook。
-
-**清理完整性**：删除 `gPM120` 开关、`SIO_pmMaxFPS`/`SIO_pmTarget`、
-`sio_DL_setFPS`/`sio_DL_setRange`、`o_dl_*` 原 IMP、`SIOFrameRateRange` 类型、
-两处安装点（常规 + 按需补装）、配置 App 的 UI/默认值/写入白名单/保存逻辑，
-以及 README/ANALYSIS/control 中的相关描述。已用grep 验证无残留。
-
-### 9.2 新增帧对齐引擎（`FrameAlign`，默认开）
-
-**问题机理**：CoreAnimation 按时间在 `0, T, 2T, …` 提交帧，设备每 `P` 秒刷新一帧。
-时长 `D` 不是 `P` 整数倍时，最后一帧显示不足 `P` 即被提交，
-随后空等 `P` 才提交下一帧 —— 这一个「不足一帧 + 空等一帧」的周期即视觉顿挫。
-
-**本项目为何尤其容易制造余数**：加速即时长除以倍率。
-`0.3s ÷ 5 = 0.06s`在 60Hz 下是 3.6 帧，倍率越高余数越大（×20/×50 为常用档）。
-
-**修法**：换算后向下取整到帧边界整数倍。`floor(0.06/0.01667)×0.01667 = 0.05s`。
-
-**三条不变量**（由 `tools/test_frame_align.py` 机器验证）：
-1. 结果必为帧周期的整数倍
-2. 只能缩短、绝不能延长
-3. 时长不足一帧时保持原值（否则 0.005s → 0.0167s，慢 3 倍）
-
-**施加位置**：在 `SIO_targetDuration` 末尾（下限钳制**之后**）。
-顺序不可颠倒 —— 若先对齐再钳制，下限会把已对齐的值重新抬高，对齐白做。
-`SIO_targetDurationLayer` 因额外除了一次 LayerBoost，必须**重做**对齐。
-
-**为什么优于 120Hz**：120Hz 让帧数翻倍但不对齐问题依旧（0.06s 在 120Hz 下是 7.2 帧）。
-帧对齐让时间轴与帧栅格严格咬合，在 60Hz 设备上同样有效。
-
-*本报告基于静态分析生成，未经编译或真机验证。*
+行数只略降（因为新增了内存护栏 / 调度策略 / 能力探测），
+但**结构性重复被消除**，且新增能力都是可独立开关、可独立降级的。

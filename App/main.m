@@ -190,7 +190,7 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d) d = [NSMutableDictionary dictionary];
     if (!d[@"Enabled"])          d[@"Enabled"]          = @YES;
     if (!d[@"Mode"])             d[@"Mode"]             = @0;
-    if (!d[@"Speed"])            d[@"Speed"]            = @5.0;
+    if (!d[@"Speed"])            d[@"Speed"]            = @8.0;
     if (!d[@"SlowFactor"])       d[@"SlowFactor"]       = @2.0;
     if (!d[@"Spring"])           d[@"Spring"]           = @YES;
     if (!d[@"Extra"])            d[@"Extra"]            = @YES;
@@ -200,25 +200,20 @@ static NSMutableDictionary *ReadConfig(void) {
     if (!d[@"FastTap"])          d[@"FastTap"]          = @YES;
     if (!d[@"LongPress"])        d[@"LongPress"]        = @YES;
     if (!d[@"LongPressDuration"])d[@"LongPressDuration"]= @0.30;
-    if (!d[@"Floor"])            d[@"Floor"]            = @0.02;
-    if (!d[@"LayerBoost"])       d[@"LayerBoost"]       = @1.0;
-    if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @1.0;
+    if (!d[@"Floor"])            d[@"Floor"]            = @0.01;
+    if (!d[@"LayerBoost"])       d[@"LayerBoost"]       = @2.0;
+    if (!d[@"TransitionBoost"])  d[@"TransitionBoost"]  = @2.0;
     if (!d[@"Notify"])           d[@"Notify"]           = @YES;
     if (!d[@"LayoutAccel"])      d[@"LayoutAccel"]      = @NO;
     if (!d[@"FrameAlign"])         d[@"FrameAlign"]         = @YES;
-    if (!d[@"TimeScale"])          d[@"TimeScale"]          = @NO;
-    if (!d[@"TimeScaleFactor"]) d[@"TimeScaleFactor"] = @1.5;
-    if (!d[@"TimeScaleSleep"]) d[@"TimeScaleSleep"] = @YES;
-    // v2.7.0：时间源白名单
-    if (!d[@"TimeScaleWhitelistMode"]) d[@"TimeScaleWhitelistMode"] = @NO;
-    if (!d[@"TimeScaleWhitelist"]) d[@"TimeScaleWhitelist"] = @[];
     if (!d[@"SpeedMode"])         d[@"SpeedMode"]         = @NO;
     if (!d[@"RespectReduceMotion"]) d[@"RespectReduceMotion"] = @YES;
+    if (!d[@"MemoryGuard"])      d[@"MemoryGuard"]      = @YES;
+    if (!d[@"SchedulingBoost"])  d[@"SchedulingBoost"]  = @YES;
     if (!d[@"Blacklist"])        d[@"Blacklist"]        = @[ @"com.tencent.wework" ];
     if (!d[@"FUBGEnabled"])      d[@"FUBGEnabled"]      = @YES;
     if (!d[@"FUBGSceneFake"])    d[@"FUBGSceneFake"]    = @YES;
     if (!d[@"FUBGAudioKeep"])    d[@"FUBGAudioKeep"]    = @YES;
-    if (!d[@"FUBGFloatingBall"]) d[@"FUBGFloatingBall"] = @NO;
     if (!d[@"AppOverrides"])     d[@"AppOverrides"]     = @{};
     return d;
 }
@@ -240,14 +235,13 @@ static BOOL WriteConfig(NSMutableDictionary *cfg, NSNumber *dragCoeff) {
                           @"FastScroll", @"FastTap", @"LongPress", @"LongPressDuration",
                           @"Floor", @"LayerBoost", @"TransitionBoost", @"Notify",
                           @"LayoutAccel", @"FrameAlign",
-                          // v2.6.0：时间源加速三键（漏加 = 界面有开关但 dylib 读不到的假功能）
-                          @"TimeScale", @"TimeScaleFactor", @"TimeScaleSleep",
-                          @"TimeScaleWhitelistMode", @"TimeScaleWhitelist",   // v2.7.0：时间源白名单（漏加 = 假功能）
                           // v2.1.0：新增两键。若忘记加入这个白名单，
                           // dylib 侧永远读不到用户设置 —— 又是「界面有开关但无效」的假功能。
                           @"SpeedMode", @"RespectReduceMotion",
+                          // v3.0：内存护栏 / 调度策略。忘记加白名单 = 界面有开关但无效。
+                          @"MemoryGuard", @"SchedulingBoost",
                           @"FUBGEnabled", @"FUBGSceneFake", @"FUBGAudioKeep",
-                          @"FUBGFloatingBall", @"FUBGExcludeApps", @"AppOverrides" ];
+                          @"FUBGExcludeApps", @"AppOverrides" ];
     for (NSString *k in sioKeys) {
         // 注：这里用 `if (cfg[k])` 判断的是**指针非空**（Objective-C 裸 id 条件
         // 语义），不是 NSNumber 的值真伪。@NO / @0 都是 tagged pointer（非 nil），
@@ -263,20 +257,6 @@ static BOOL WriteConfig(NSMutableDictionary *cfg, NSNumber *dragCoeff) {
         else             [merged removeObjectForKey:@"UIAnimationDragCoefficient"];
     }
     BOOL ok = [merged writeToFile:PrefPath atomically:YES];
-    // ============================================================================
-    // v2.7.1[根因修复]：影子副本。
-    // /var/Managed Preferences 需要平台特权，只有本配置器（TrollStore 授权）能读；
-    // 注入的 dylib 跑在微信等普通 App 里，其沙盒读不了该目录 → SIO_prefSnapshot
-    // 拿到 nil → dylib 回落默认值（gEnabled=YES/加速×5/Extra 开）且黑名单失效，
-    // 用户在配置器里的任何修改目标 App 都收不到（v2.7.1 微信双标题/聊天框打不开的根因）。
-    // 同步写一份到 /var/mobile/Library/Preferences（普通 App 沙盒允许读），
-    // dylib 主路径读不到时回退读这里。UIAnimationDragCoefficient 是 UIKit 域专属项，
-    // 不进影子文件。
-    // ============================================================================
-    static NSString *ShadowPath = @"/var/mobile/Library/Preferences/com.local.sioriginal.plist";
-    NSMutableDictionary *shadow = [merged mutableCopy];
-    [shadow removeObjectForKey:@"UIAnimationDragCoefficient"];
-    [shadow writeToFile:ShadowPath atomically:YES];
     // v2.5.0：写成功即让读缓存失效，下一次 ReadConfig 才会真的读盘。
     // 走 SIOInvalidateCfgCache 而不是裸赋值 —— 本函数跑在 IO 队列，
     // 缓存的读取方在主线程，必须串行化（见该函数说明）。
@@ -575,16 +555,12 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UISwitch *_swFastScroll, *_swFastTap, *_swLongPress, *_swZoom, *_swList, *_swNotify, *_swLayout;
     // v2.1.0：新增两个开关（速率引擎 / 辅助功能让位）
     UISwitch *_swSpeedMode, *_swRespectRM, *_swFrameAlign;
-    // v2.6.0：时间源加速（游戏引擎专用，OpenSpeedy 思路移植）
-    UISwitch *_swTimeScale, *_swTimeScaleSleep; UISlider *_sliderTS; UILabel *_sliderTSLabel;
-    // v2.7.0：时间源白名单（主界面文本框 + 模式开关）
-    UISwitch *_swTSWL; UITextView *_tswlText;
-    // v2.7.0：per-app 时间源覆盖
-    UISwitch *_ovTS, *_ovTSSleep, *_ovTSWL; UISlider *_ovTSS; UILabel *_ovTSSLabel;
+    // v3.0：内存与调度策略
+    UISwitch *_swMemGuard, *_swSchedBoost;
     UISegmentedControl *_segLongPress;
     UITextView *_blacklist;
     // 系统
-    UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio, *_swFUBGBall;
+    UISwitch *_swFUBG, *_swFUBGScene, *_swFUBGAudio;
     UISwitch *_swRM, *_swCF, *_swRT;
     UISegmentedControl *_segDrag;
     UILabel *_dragHint;
@@ -723,7 +699,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     [hero addSubview:heroTitle];
 
     UILabel *heroSub = [[UILabel alloc] init];
-    heroSub.text = @"SIOriginal v2.7.1 Max · 动画加速超强版";
+    heroSub.text = @"SIOriginal v3.0 · 疯狂动画加速版";
     heroSub.font = [UIFont systemFontOfSize:12];
     heroSub.textColor = [UIColor colorWithWhite:1.0 alpha:0.7];
     heroSub.translatesAutoresizingMaskIntoConstraints = NO;
@@ -746,9 +722,9 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     presetRow.spacing = 10;
     presetRow.distribution = UIStackViewDistributionFillEqually;
     NSArray *presets = @[
+        @{ @"title": @"疯狂", @"icon": @"flame.fill",  @"color": [UIColor systemRedColor] },
         @{ @"title": @"极速", @"icon": @"bolt.fill",   @"color": [UIColor systemGreenColor] },
         @{ @"title": @"均衡", @"icon": @"scalemass",   @"color": [UIColor systemBlueColor] },
-        @{ @"title": @"保守", @"icon": @"shield.fill",  @"color": [UIColor systemOrangeColor] },
         @{ @"title": @"瞬切", @"icon": @"bolt.horizontal", @"color": [UIColor systemYellowColor] },
     ];
     for (int i = 0; i < 4; i++) {
@@ -843,26 +819,36 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
 - (void)presetTapped:(UIButton *)sender {
     int idx = (int)sender.tag;
     switch (idx) {
-        case 0: // 极速
+        case 0: // 疯狂 —— 全部拉满，肉眼可见的"瞬移"级加速
             _segMode.selectedSegmentIndex = 0;
             _slider.value = 50.0;
+            _segFloor.selectedSegmentIndex = 0;   // 下限 0.005s
+            _segLayer.selectedSegmentIndex = 4;   // 显式动画 ×10
+            _segTrans.selectedSegmentIndex = 3;   // 转场 ×3
+            _swFastScroll.on = YES;
+            _swFastTap.on = YES;
+            _swLongPress.on = YES;
+            _swSpeedMode.on = NO;                 // 时长模式（与速率模式互斥）
+            break;
+        case 1: // 极速
+            _segMode.selectedSegmentIndex = 0;
+            _slider.value = 20.0;
             _segFloor.selectedSegmentIndex = 0;
-            _segLayer.selectedSegmentIndex = 4;
-            _segTrans.selectedSegmentIndex = 3;
+            _segLayer.selectedSegmentIndex = 3;
+            _segTrans.selectedSegmentIndex = 2;
+            _swFastScroll.on = YES;
+            _swFastTap.on = YES;
+            _swSpeedMode.on = NO;
             break;
-        case 1: // 均衡
+        case 2: // 均衡（默认推荐：明显变快但不失真）
             _segMode.selectedSegmentIndex = 0;
-            _slider.value = 5.0;
-            _segFloor.selectedSegmentIndex = 2;
-            _segLayer.selectedSegmentIndex = 1;
-            _segTrans.selectedSegmentIndex = 1;
-            break;
-        case 2: // 保守
-            _segMode.selectedSegmentIndex = 0;
-            _slider.value = 2.0;
-            _segFloor.selectedSegmentIndex = 3;
-            _segLayer.selectedSegmentIndex = 0;
-            _segTrans.selectedSegmentIndex = 0;
+            _slider.value = 8.0;
+            _segFloor.selectedSegmentIndex = 1;
+            _segLayer.selectedSegmentIndex = 2;
+            _segTrans.selectedSegmentIndex = 2;
+            _swFastScroll.on = YES;
+            _swFastTap.on = YES;
+            _swSpeedMode.on = NO;
             break;
         case 3: // 瞬切
             _segMode.selectedSegmentIndex = 2;
@@ -923,34 +909,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     UILabel *faHint = [self label:@"把加速后的动画时长对齐到屏幕每一帧的边界（60Hz 屏为 16.7ms 的整数倍，高刷屏同理按其帧长对齐）。时长不整除帧周期时每帧渲染时刻会漂移，视觉上表现为顿挫。本功能只读取设备刷新率用于时长计算，不会修改或强制任何帧率。" size:12 dim:YES];
     [c2 addRow:[self hintRow:faHint] isLast:NO];
 
-    // v2.6.0：时间源加速（OpenSpeedy 思路移植，游戏引擎专用）。
-    // 与上层动画 hook 是互补的两层：动画 hook 缩放「传给系统的时长参数」，
-    // 本引擎缩放「进程读到的单调时间」—— 覆盖 Unity/Cocos 等按 dt 积算的
-    // 自绘循环。挂钟恒不缩放（证书校验/服务器对账依赖真实时间）；
-    // 后台自动回落 1.0；倍率封顶 2.0。
-    _swTimeScale = [[UISwitch alloc] init];
-    BOOL tsDef = cfg[@"TimeScale"] ? [cfg[@"TimeScale"] boolValue] : NO;
-    _swTimeScale.on = tsDef;
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"时间源加速（游戏引擎）" icon:@"timer" iconColor:SIOMintColor() control:_swTimeScale] isLast:NO];
-    double tsFactor = cfg[@"TimeScaleFactor"] ? [cfg[@"TimeScaleFactor"] doubleValue] : 1.5;
-    if (tsFactor < 1.0 || tsFactor > 5.0) tsFactor = 1.5;   // v2.7.0：上限 5.0（与 dylib 钳制一致）
-    _sliderTSLabel = [self label:[NSString stringWithFormat:@"×%.2f", tsFactor] size:15 dim:YES];
-    _sliderTS = [[UISlider alloc] init];
-    _sliderTS.minimumValue = 1.0; _sliderTS.maximumValue = 5.0;   // v2.7.0：上限 2.0 → 5.0
-    _sliderTS.value = tsFactor;
-    [_sliderTS addTarget:self action:@selector(tsSliderChanged) forControlEvents:UIControlEventValueChanged];
-    [_sliderTS.widthAnchor constraintEqualToConstant:140].active = YES;
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"时间倍率" icon:@"gauge.with.needle" iconColor:SIOMintColor() control:_sliderTS] isLast:NO];
-    _swTimeScaleSleep = [[UISwitch alloc] init];
-    _swTimeScaleSleep.on = cfg[@"TimeScaleSleep"] ? [cfg[@"TimeScaleSleep"] boolValue] : YES;
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"同时缩短引擎休眠（usleep/sleep）" icon:@"zzz" iconColor:SIOMintColor() control:_swTimeScaleSleep] isLast:NO];
-    // v2.7.0：时间源白名单模式（高倍率跑联网 App 前必开 —— 开启后仅名单内 App 生效）
-    _swTSWL = [[UISwitch alloc] init];
-    _swTSWL.on = cfg[@"TimeScaleWhitelistMode"] ? [cfg[@"TimeScaleWhitelistMode"] boolValue] : NO;
-    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"仅白名单内 App 生效" icon:@"checklist" iconColor:[UIColor systemTealColor] control:_swTSWL] isLast:NO];
-    UILabel *tsHint = [self label:@"缩放游戏引擎读到的单调时钟（mach_absolute_time / clock_gettime 等），逻辑帧 dt 变大 → 游戏逻辑加速，vsync 与系统节拍不变。挂钟永不缩放；进后台自动回落 1.0 倍。v2.7.0 倍率上限 5.0 —— 超过 2.0 强烈建议开启白名单模式并在高级页维护名单；联网游戏、音视频 App 慎开（有超时缩短与音画偏移风险）。纯 UI App 无需开启，动画加速已由上方选项覆盖。" size:12 dim:YES];
-    [c2 addRow:[self hintRow:tsHint] isLast:NO];
-
     // v2.1.0[新功能 8]：速率加速引擎。
     // 开关语义与「加速倍率」互斥：开启后不再压缩动画时长，改为提高播放速率。
     // 好处是时长下限不再干扰、关键帧插值与弹簧物理保持原生正确（不抽搐）；
@@ -958,6 +916,21 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _swSpeedMode = [[UISwitch alloc] init];
     _swSpeedMode.on = [cfg[@"SpeedMode"] boolValue];
     [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"速率引擎（无损加速，不改时长）" icon:@"speedometer" iconColor:[UIColor systemTealColor] control:_swSpeedMode] isLast:NO];
+
+    // v3.0：内存护栏。压力/告警时自动逐级降级（先关增强项，再关列表/布局），
+    // 压力解除后按快照还原 —— 不会「降级一次就永久降级」。
+    _swMemGuard = [[UISwitch alloc] init];
+    _swMemGuard.on = cfg[@"MemoryGuard"] ? [cfg[@"MemoryGuard"] boolValue] : YES;
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"内存护栏（压力时自动降级）" icon:@"memorychip" iconColor:[UIColor systemGreenColor] control:_swMemGuard] isLast:NO];
+    UILabel *mgHint = [self label:@"监听系统内存压力与告警。告警时先关显式倍率/列表/布局/缩放，严重时整体旁路（动画恢复原生），压力解除后自动还原。低内存机型与小内存进程收益最明显。" size:12 dim:YES];
+    [c2 addRow:[self hintRow:mgHint] isLast:NO];
+
+    // v3.0：调度策略。内部工作队列用低优先级 QoS，避免与首屏/滚动抢 CPU。
+    _swSchedBoost = [[UISwitch alloc] init];
+    _swSchedBoost.on = cfg[@"SchedulingBoost"] ? [cfg[@"SchedulingBoost"] boolValue] : YES;
+    [c2 addRow:[[SIOSettingRow alloc] initWithTitle:@"调度策略（后台任务避让）" icon:@"cpu" iconColor:[UIColor systemBlueColor] control:_swSchedBoost] isLast:NO];
+    UILabel *schedHint = [self label:@"配置重载、探测等内部工作放到低优先级串行队列（QoS=Utility），不与首屏渲染和滚动抢占 CPU 时间片。关闭后这些工作回到默认优先级。" size:12 dim:YES];
+    [c2 addRow:[self hintRow:schedHint] isLast:NO];
 
     // v2.1.0[新功能 11]：辅助功能让位。
     _swRespectRM = [[UISwitch alloc] init];
@@ -1002,29 +975,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     ]];
     [c4 addRow:blRow isLast:YES];
     [stack addArrangedSubview:c4];
-
-    // v2.7.0：时间源白名单（主入口：每行一个 Bundle ID；per-app 页的「速记」开关可一键加入）
-    [stack addArrangedSubview:[[SIOSectionHeader alloc] initWithTitle:@"时间源白名单（每行一个 Bundle ID；开启「仅白名单内 App 生效」时使用）" subtitle:nil]];
-    SIOCardView *c4b = [[SIOCardView alloc] init];
-    _tswlText = [[UITextView alloc] init];
-    _tswlText.translatesAutoresizingMaskIntoConstraints = NO;
-    _tswlText.font = [UIFont monospacedSystemFontOfSize:13 weight:UIFontWeightRegular];
-    _tswlText.layer.borderColor = [UIColor separatorColor].CGColor;
-    _tswlText.layer.borderWidth = 0.5;
-    _tswlText.layer.cornerRadius = 8;
-    _tswlText.text = [cfg[@"TimeScaleWhitelist"] isKindOfClass:[NSArray class]] ? [cfg[@"TimeScaleWhitelist"] componentsJoinedByString:@"\n"] : @"";
-    [_tswlText.heightAnchor constraintEqualToConstant:100].active = YES;
-    UIView *tswlRow = [[UIView alloc] init];
-    tswlRow.translatesAutoresizingMaskIntoConstraints = NO;
-    [tswlRow addSubview:_tswlText];
-    [NSLayoutConstraint activateConstraints:@[
-        [_tswlText.topAnchor constraintEqualToAnchor:tswlRow.topAnchor constant:12],
-        [_tswlText.leadingAnchor constraintEqualToAnchor:tswlRow.leadingAnchor constant:16],
-        [_tswlText.trailingAnchor constraintEqualToAnchor:tswlRow.trailingAnchor constant:-16],
-        [_tswlText.bottomAnchor constraintEqualToAnchor:tswlRow.bottomAnchor constant:-12],
-    ]];
-    [c4b addRow:tswlRow isLast:YES];
-    [stack addArrangedSubview:c4b];
 }
 
 #pragma mark - 系统 Tab
@@ -1044,10 +994,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _swFUBGAudio = [[UISwitch alloc] init];
     _swFUBGAudio.on = [cfg[@"FUBGAudioKeep"] boolValue];
     [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"音频断言兜底（静音白噪）" icon:@"speaker.wave.2.fill" iconColor:[UIColor systemOrangeColor] control:_swFUBGAudio] isLast:NO];
-    _swFUBGBall = [[UISwitch alloc] init];
-    _swFUBGBall.on = [cfg[@"FUBGFloatingBall"] boolValue];
-    _swFUBGBall.enabled = NO;
-    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"悬浮球（已全局禁用）" icon:@"circle.fill" iconColor:[UIColor systemGrayColor] control:_swFUBGBall] isLast:YES];
     [stack addArrangedSubview:c1];
 
     // 系统动态效果
@@ -1162,20 +1108,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     _ovLongPressDur = [[UISegmentedControl alloc] initWithItems:@[ @"0.20s", @"0.30s", @"0.40s" ]];
     [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"专属长按时长" icon:@"timer" iconColor:[UIColor systemTealColor] control:_ovLongPressDur] isLast:NO];
 
-    // v2.7.0：时间源三件套 + 倍率滑杆（此 App 独立覆盖；值由 onSave 统一写入，同现有模式）
-    _ovTS = [[UISwitch alloc] init]; _ovTS.on = NO;
-    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"时间源加速（此 App 独立设置）" icon:@"timer.circle.fill" iconColor:SIOMintColor() control:_ovTS] isLast:NO];
-    _ovTSS = [[UISlider alloc] init]; _ovTSS.minimumValue = 1.0; _ovTSS.maximumValue = 5.0;
-    [_ovTSS addTarget:self action:@selector(ovTSSliderChanged:) forControlEvents:UIControlEventValueChanged];
-    [_ovTSS.widthAnchor constraintEqualToConstant:140].active = YES;
-    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"时间倍率" icon:@"gauge.with.needle" iconColor:SIOMintColor() control:_ovTSS] isLast:NO];
-    _ovTSSleep = [[UISwitch alloc] init]; _ovTSSleep.on = YES;
-    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"缩短引擎休眠" icon:@"zzz" iconColor:SIOMintColor() control:_ovTSSleep] isLast:NO];
-    // 白名单速记：非 per-app 覆盖，而是把当前 Bundle ID 一键加入/移出全局名单并立即落盘
-    _ovTSWL = [[UISwitch alloc] init]; _ovTSWL.on = NO;
-    [_ovTSWL addTarget:self action:@selector(tsWLToggled:) forControlEvents:UIControlEventValueChanged];
-    [c1 addRow:[[SIOSettingRow alloc] initWithTitle:@"加入时间源白名单（速记）" icon:@"checklist" iconColor:[UIColor systemTealColor] control:_ovTSWL] isLast:NO];
-
     _ovGuard = [self label:@"" size:12 dim:YES];
     _ovGuard.textColor = [UIColor systemRedColor];
     _ovGuard.numberOfLines = 0;
@@ -1279,13 +1211,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     }];
 }
 
-// v2.6.0：时间倍率滑杆（1.00–2.00，两位小数 —— 这个倍率档位需要细颗粒）
-- (void)tsSliderChanged {
-    [self coalesce:@"tsfactor" block:^{
-        _sliderTSLabel.text = [NSString stringWithFormat:@"×%.2f", _sliderTS.value];
-    }];
-}
-
 - (void)floorChanged { [self updateFloorHint]; }
 - (void)updateFloorHint {
     [self coalesce:@"floor" block:^{
@@ -1355,12 +1280,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         _ovFloor.selectedSegmentIndex = FloorIndexForValue([mine[@"Floor"] doubleValue]);
         _ovTrans.selectedSegmentIndex = TransitionBoostIndexForValue([mine[@"TransitionBoost"] doubleValue]);
         _ovLongPressDur.selectedSegmentIndex = LongPressDurationIndexForValue([mine[@"LongPressDuration"] doubleValue]);
-        // v2.7.0：时间源三键（此 App 独立覆盖）
-        _ovTS.on = [mine[@"TimeScale"] boolValue];
-        _ovTSS.value = [mine[@"TimeScaleFactor"] doubleValue];
-        if (_ovTSS.value < 1.0) _ovTSS.value = 1.5;
-        _ovTSSLabel.text = [NSString stringWithFormat:@"×%.2f", _ovTSS.value];
-        _ovTSSleep.on = mine[@"TimeScaleSleep"] ? [mine[@"TimeScaleSleep"] boolValue] : YES;
     } else {
         // v2.0.1：该 Bundle 无专属配置时，控件镜像当前【全局】值作为默认，
         // 避免残留上一个 Bundle 的设置（旧代码切换 Bundle 后显示/保存的都是上个 App 的值）
@@ -1380,12 +1299,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         _ovFloor.selectedSegmentIndex = FloorIndexForValue([cfg[@"Floor"] doubleValue]);
         _ovTrans.selectedSegmentIndex = TransitionBoostIndexForValue([cfg[@"TransitionBoost"] doubleValue]);
         _ovLongPressDur.selectedSegmentIndex = LongPressDurationIndexForValue([cfg[@"LongPressDuration"] doubleValue]);
-        // v2.7.0：无覆盖 → 镜像全局时间源配置（与 v2.0.1 的镜像策略一致）
-        _ovTS.on = [cfg[@"TimeScale"] boolValue];
-        _ovTSS.value = [cfg[@"TimeScaleFactor"] doubleValue];
-        if (_ovTSS.value < 1.0) _ovTSS.value = 1.5;
-        _ovTSSLabel.text = [NSString stringWithFormat:@"×%.2f", _ovTSS.value];
-        _ovTSSleep.on = cfg[@"TimeScaleSleep"] ? [cfg[@"TimeScaleSleep"] boolValue] : YES;
     }
     BOOL guarded = [HardGuardBundles() containsObject:bid];
     if (guarded) {
@@ -1396,37 +1309,12 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         _ovGuard.text = @"";
         _ovList.enabled = YES;
     }
-    // v2.7.0：白名单速记开关镜像当前 App 的名单状态（全局语义，不进 ovControls 门控）
-    _ovTSWL.on = ([cfg[@"TimeScaleWhitelist"] isKindOfClass:[NSArray class]] &&
-                  [cfg[@"TimeScaleWhitelist"] containsObject:bid]);
     [self ovToggled];
     [self ovModeChanged];
 }
 
 - (void)ovSliderChanged {
     _ovSpeedLabel.text = [NSString stringWithFormat:@"×%.1f", _ovSpeed.value];
-}
-
-// v2.7.0：per-app 倍率滑杆（只更新标签；落盘统一走「保存」按钮，与 ovSliderChanged 同策略）
-- (void)ovTSSliderChanged:(UISlider *)s {
-    _ovTSSLabel.text = [NSString stringWithFormat:@"×%.2f", s.value];
-}
-
-// v2.7.0：白名单速记 —— 把当前 Bundle ID 一键加入/移出全局 TimeScaleWhitelist 并立即落盘。
-// 不等总保存（速记语义）；_ovBundle 为空时开关弹回。
-- (void)tsWLToggled:(UISwitch *)sw {
-    NSString *bid = [_ovBundle.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    if (!bid.length) { sw.on = NO; return; }
-    NSMutableDictionary *cfg = ReadConfig();
-    NSMutableArray *wl = [cfg[@"TimeScaleWhitelist"] isKindOfClass:[NSArray class]]
-                         ? [cfg[@"TimeScaleWhitelist"] mutableCopy] : [NSMutableArray array];
-    if (sw.on) {
-        if (![wl containsObject:bid]) [wl addObject:bid];
-    } else {
-        [wl removeObject:bid];
-    }
-    cfg[@"TimeScaleWhitelist"] = [wl copy];
-    WriteConfigOnly(cfg);   // 立即写盘（内部自带缓存失效），dylib 收 Darwin 通知后热重载
 }
 
 - (void)ovModeChanged {
@@ -1441,8 +1329,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     BOOL on = _ovOn.on;
     NSArray *ovControls = @[ _ovMode, _ovSpeed, _ovSpring, _ovExtra,
                              _ovList, _ovZoom, _ovLayout, _ovFastScroll, _ovFastTap,
-                             _ovLongPress, _ovLayer, _ovFloor, _ovTrans, _ovLongPressDur,
-                             _ovTS, _ovTSS, _ovTSSleep ];   // v2.7.0：时间源三件套随「专属配置」门控（_ovTSWL 除外——它是全局速记）
+                             _ovLongPress, _ovLayer, _ovFloor, _ovTrans, _ovLongPressDur ];
     for (UIControl *c in ovControls) {
         c.enabled = on;
         c.alpha = on ? 1.0 : 0.4;
@@ -1472,22 +1359,19 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     if (_swZoom) { cfg[@"ZoomAccel"] = @(_swZoom.on); }
     if (_swLayout) { cfg[@"LayoutAccel"] = @(_swLayout.on); }
     if (_swFrameAlign) { cfg[@"FrameAlign"] = @(_swFrameAlign.on); }
-    // v2.6.0：时间源加速三键落盘
-    if (_swTimeScale) { cfg[@"TimeScale"] = @(_swTimeScale.on); }
-    if (_sliderTS) { cfg[@"TimeScaleFactor"] = @((double)_sliderTS.value); }
-    if (_swTimeScaleSleep) { cfg[@"TimeScaleSleep"] = @(_swTimeScaleSleep.on); }
-    // v2.7.0：白名单模式开关落盘（名单数组在下方 _tswlText 块写入）
-    if (_swTSWL) { cfg[@"TimeScaleWhitelistMode"] = @(_swTSWL.on); }
     // v2.1.0：新开关落盘
     if (_swSpeedMode) { cfg[@"SpeedMode"] = @(_swSpeedMode.on); }
     if (_swRespectRM) { cfg[@"RespectReduceMotion"] = @(_swRespectRM.on); }
+    // v2.5.1：新开关落盘
+    // v3.0：内存护栏 / 调度策略
+    if (_swMemGuard) { cfg[@"MemoryGuard"] = @(_swMemGuard.on); }
+    if (_swSchedBoost) { cfg[@"SchedulingBoost"] = @(_swSchedBoost.on); }
     if (_swList) { cfg[@"ListAccel"] = @(_swList.on); }
     if (_swNotify) { cfg[@"Notify"] = @(_swNotify.on); }
     // 系统 tab
     if (_swFUBG) { cfg[@"FUBGEnabled"] = @(_swFUBG.on); }
     if (_swFUBGScene) { cfg[@"FUBGSceneFake"] = @(_swFUBGScene.on); }
     if (_swFUBGAudio) { cfg[@"FUBGAudioKeep"] = @(_swFUBGAudio.on); }
-    if (_swFUBGBall) { cfg[@"FUBGFloatingBall"] = @(_swFUBGBall.on); }
     // 黑名单
     if (_blacklist) {
         NSMutableArray *bl = [NSMutableArray array];
@@ -1496,15 +1380,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
             if (t.length) [bl addObject:t];
         }
         cfg[@"Blacklist"] = bl;
-    }
-    // v2.7.0：时间源白名单（每行一个 Bundle ID，开启「仅白名单内 App 生效」时使用）
-    if (_tswlText) {
-        NSMutableArray *tswl = [NSMutableArray array];
-        for (NSString *line in [_tswlText.text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
-            NSString *t = [line stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-            if (t.length) [tswl addObject:t];
-        }
-        cfg[@"TimeScaleWhitelist"] = tswl;
     }
     // App 覆盖
     if (_ovBundle) {
@@ -1530,10 +1405,6 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
                 mine[@"LayerBoost"] = @(LayerBoostForIndex((int)_ovLayer.selectedSegmentIndex));
                 mine[@"Floor"] = @(FloorForIndex((int)_ovFloor.selectedSegmentIndex));
                 mine[@"TransitionBoost"] = @(TransitionBoostForIndex((int)_ovTrans.selectedSegmentIndex));
-                // v2.7.0：时间源三键写入此 App 覆盖
-                mine[@"TimeScale"] = @(_ovTS.on);
-                mine[@"TimeScaleFactor"] = @(round(_ovTSS.value * 100) / 100.0);
-                mine[@"TimeScaleSleep"] = @(_ovTSSleep.on);
                 ovAll[bid] = mine;
             } else {
                 // v2.0.1：关闭「为该 App 启用专属配置」必须删除整条覆盖。
@@ -1639,8 +1510,7 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
     NSMutableDictionary *cfg = ReadConfig();
     BOOL prefsOK = [[NSFileManager defaultManager] isWritableFileAtPath:PrefPath];
     BOOL uikitOK = [[NSFileManager defaultManager] fileExistsAtPath:UIKitPath];
-    // v2.7.0：文案写「可写」，检测也改为可写性（旧实现只查存在，文案与行为不符）
-    BOOL axOK = [[NSFileManager defaultManager] isWritableFileAtPath:AxPath];
+    BOOL axOK = [[NSFileManager defaultManager] fileExistsAtPath:AxPath];
     int mode = [cfg[@"Mode"] intValue];
     double floor = [cfg[@"Floor"] doubleValue];
     double layer = [cfg[@"LayerBoost"] doubleValue];
@@ -1653,14 +1523,13 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
                         [cfg[@"LongPress"] boolValue] ? @"开" : @"关"];
     if (mode == 0) engine = [NSString stringWithFormat:@"已启用，加速 ×%g（下限 %.3gs），显式×%g，转场×%g", [cfg[@"Speed"] doubleValue], floor, layer, trans];
     else if (mode == 1) engine = [NSString stringWithFormat:@"已启用，慢放 ×%g（下限 %.3gs）", [cfg[@"SlowFactor"] doubleValue], floor];
-    // v2.7.0：版本号从 Info.plist 动态读取。旧实现硬编码「2.3.0 (build 76)」，
-    // App 升级后自检报告仍显示旧版本（真机截图证实了这个误导显示）。
-    NSDictionary *sioInfo = [[NSBundle mainBundle] infoDictionary];
-    NSString *ver = [NSString stringWithFormat:@"SIOriginal 配置器 %@ (build %@)",
-                     sioInfo[@"CFBundleShortVersionString"] ?: @"?",
-                     sioInfo[@"CFBundleVersion"] ?: @"?"];
+    engine = [engine stringByAppendingFormat:@"，护栏:%@，调度:%@",
+              [cfg[@"MemoryGuard"] boolValue] ? @"开" : @"关",
+              [cfg[@"SchedulingBoost"] boolValue] ? @"开" : @"关"];
+    NSString *sioVer = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
+    NSString *sioBuild = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?";
     _selfCheck.text = [NSString stringWithFormat:
-        @"%@\nBundle ID: com.local.sioriginal\n\n"
+        @"SIOriginal 配置器 %@ (build %@)\nBundle ID: com.local.sioriginal\n\n"
         @"【权限/路径自检】\n"
         @"/var/Managed Preferences/mobile 配置目录：%@\n"
         @"UIKit.plist 存在：%@\n"
@@ -1669,16 +1538,12 @@ typedef NS_ENUM(NSInteger, SIOTabType) {
         @"保活：%@\n\n"
         @"【注入方式提醒】\n"
         @"本 App 只负责写配置并发 Darwin 热重载通知；动画引擎 SIOriginal.dylib 需用 TrollFools 注入目标 App。保存配置后，前台目标 App 顶部会出现 1.5 秒生效提示（可在「手感」页关闭）。",
-        ver,
+        sioVer, sioBuild,
         prefsOK ? @"✅" : @"❌",
         uikitOK ? @"✅" : @"❌",
         axOK ? @"✅" : @"❌",
         engine,
         fubg ? @"开启" : @"关闭"];
-    // v2.7.0：自检结果落地系统日志（此前完全无日志，无法事后排查）。
-    // 用设备控制台 / Console.app 按 SIOConfigurator 过滤即可看到每次自动/手动检测的记录。
-    NSLog(@"[SIOConfigurator] self-check ver=%@ prefsOK=%d uikitOK=%d axOK=%d",
-          ver, prefsOK, uikitOK, axOK);
 }
 
 - (void)onRespring {

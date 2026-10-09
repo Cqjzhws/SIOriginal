@@ -1,5 +1,5 @@
 Package: com.local.sioriginal
 Name: SIOriginal
-Version: 2.7.1
+Version: 3.1.0
 Architecture: iphoneos-arm64
-Description: 动画加速 Tweak v2.7.1：修复微信注入后双标题/聊天框打不开 —— 根因是普通 App 沙盒读不了平台特权的 /var/Managed Preferences，dylib 回落默认值（加速×5 全开 + 黑名单失效），用户在配置器里的修改目标 App 全部收不到。修复：配置双路径读写（配置器每次保存同步写影子副本到 /var/mobile/Library/Preferences/com.local.sioriginal.plist，dylib 主路径读不到时自动回退影子路径）；微信硬保护（时间源缩放与 FUBG 保活在微信进程内一律禁用，无论配置如何，防误操作弄坏微信）；toast 兜底移除（宿主动画时序异常时 completion 不回调导致的「设置已生效」永久残留）。保留 v2.7.0 全部功能。
+Description: 动画加速 Tweak v3.1 —— 疯狂加速精简版。默认即激进档：加速 ×8、时长下限 0.01s、显式动画与转场各再 ×2，导航转场 350ms → 17ms（肉眼可见的瞬时级）。内置四档预设：疯狂(×50 / 下限 0.005s / 增强 ×10)、极速(×20)、均衡(×8，默认)、瞬切。架构：16 个模块，配置/引擎/平台/调度/安装各唯一入口；三档安装栅栏（pre-main 只装核心两族，其余延后，默认关闭项零交换）；能力位图驱动 iOS 11–18 分版本适配（不靠版本号猜 API）；统一时长换算引擎（帧对齐 + 系统系数补偿 + 四条红线不变量：只快不慢）；内存护栏两级降级可还原；调度 QoS 避让；巨魔能力探测与自动降级。本版精简：移除 120Hz 高刷模块；移除悬浮球与全局兜底系数两个无效开关；移除 FastColdStart / LegacyKitMode 两个零消费内部键。

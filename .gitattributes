@@ -1,10 +1,27 @@
-# 统一 LF 行尾：build.sh / CI yml 在 macOS 上执行，CRLF 会导致解释器报错
-*.m       text eol=lf
-*.h       text eol=lf
-*.sh      text eol=lf
-*.yml     text eol=lf
-*.py      text eol=lf
-Makefile  text eol=lf
-control   text eol=lf
-*.md      text eol=lf
-*.plist   text eol=lf
+# Git 行尾策略
+# ---------------------------------------------------------------------------
+# 这个看似细节的问题在 iOS Tweak 工程里是**真的会炸**：
+#   · build.sh / Makefile 若被转成 CRLF，macOS 上的 /bin/sh 会在 shebang 与
+#     每个命令名后带上 \r，报 "command not found" 或 "bad interpreter"。
+#   · .github/workflows/*.yml 若含 CRLF，YAML 解析器可能报错。
+#   · clang 对源码容忍 CRLF，但为了 diff 干净也统一为 LF。
+# 因此：**全部按 LF 存储**（text=auto 会随平台转换，这里显式关掉）。
+# ---------------------------------------------------------------------------
+* text=auto eol=lf
+
+# 显式声明（防止将来有人改回 CRLF）
+*.m      text eol=lf
+*.h      text eol=lf
+*.py     text eol=lf
+*.sh     text eol=lf
+*.yml    text eol=lf
+*.md     text eol=lf
+*.plist  text eol=lf
+Makefile text eol=lf
+control  text eol=lf
+.gitignore text eol=lf
+
+# 二进制资源不做行尾转换
+*.png    binary
+*.jpg    binary
+*.icns   binary
